@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synpo-microscopy"
+version = "0.3.0"
+description = "Desktop workflow for paired-channel 3D microscopy data"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "PySide6>=6.7,<7",
+    "tifffile>=2024.5",
+    "scipy>=1.13,<2",
+    "scikit-image>=0.24,<1",
+    "zarr>=2.18,<3",
+    "numcodecs>=0.12,<0.16",
+    "psutil>=6,<8",
+]
+
+[project.scripts]
+synpo = "synpo.app:main"
+synpo-inspect = "synpo.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"

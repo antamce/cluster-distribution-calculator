@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.test-work/
+*.egg-info/
+build/
+dist/
+Synpo Results/
+*.synpo.json
+*.tif
+*.tiff
+*.zarr/
+.synpo-cache/
+.stage*-benchmark/
+.ui-*-smoke/

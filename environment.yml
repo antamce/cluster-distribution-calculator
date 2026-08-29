@@ -1,0 +1,15 @@
+name: synpo-microscopy
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - libexpat
+  - pyside6>=6.7,<7
+  - tifffile>=2024.5
+  - scipy>=1.13,<2
+  - scikit-image>=0.24,<1
+  - zarr>=2.18,<3
+  - numcodecs>=0.12,<0.16
+  - psutil>=6,<8
+  - pytest>=8

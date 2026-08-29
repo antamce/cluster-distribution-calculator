@@ -1,0 +1,1751 @@
+from __future__ import annotations
+
+import re
+import sys
+from threading import Event
+from pathlib import Path
+
+import numpy as np
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QColor, QImage, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QSplitter,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .calibration import CalibrationStore
+from .importer import scan_batch
+from .models import Calibration, ScanReport, SpecimenPair
+from .project import (
+    create_project_manifest,
+    load_project,
+    relink_project_sources,
+    save_project,
+    verify_project_sources,
+)
+from .preprocessing import (
+    PreprocessingSettings,
+    PreviewResult,
+    ProcessingCancelled,
+    StackStatistics,
+    make_preview,
+    process_project_cache,
+)
+from .detection import (
+    DetectionSettings,
+    DetectionSlice,
+    detect_project,
+    load_detection_slice,
+)
+
+
+ROLE_LABELS = {
+    "protein_clusters": "Protein clusters",
+    "dendrite_spines": "Dendrites and spines",
+}
+
+
+class SliceView(QLabel):
+    def __init__(self, placeholder: str) -> None:
+        super().__init__(placeholder)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(360, 360)
+        self.setStyleSheet("background: #171717; color: #bdbdbd; border: 1px solid #444;")
+        self._image: QImage | None = None
+
+    def show_array(
+        self,
+        array: np.ndarray,
+        low: float,
+        high: float,
+        mask: np.ndarray | None = None,
+    ) -> None:
+        scale = max(1.0, float(high) - float(low))
+        gray = np.clip((np.asarray(array, dtype=np.float32) - low) * 255.0 / scale, 0, 255).astype(np.uint8)
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        if mask is not None:
+            selected = np.asarray(mask, dtype=bool)
+            rgb[selected, 0] = 255
+            rgb[selected, 1] = (rgb[selected, 1].astype(np.uint16) * 35 // 100).astype(np.uint8)
+            rgb[selected, 2] = 210
+        height, width = gray.shape
+        self._image = QImage(
+            rgb.data, width, height, rgb.strides[0], QImage.Format.Format_RGB888
+        ).copy()
+        self._render()
+
+    def _render(self) -> None:
+        if self._image is None:
+            return
+        self.setPixmap(
+            QPixmap.fromImage(self._image).scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def show_detection(
+        self,
+        array: np.ndarray,
+        low: float,
+        high: float,
+        *,
+        dendrites: np.ndarray | None = None,
+        spines: np.ndarray | None = None,
+        clusters: np.ndarray | None = None,
+    ) -> None:
+        scale = max(1.0, float(high) - float(low))
+        gray = np.clip(
+            (np.asarray(array, dtype=np.float32) - low) * 255.0 / scale, 0, 255
+        ).astype(np.uint8)
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        for labels, color in (
+            (dendrites, np.array([35, 220, 70], dtype=np.float32)),
+            (spines, np.array([0, 205, 255], dtype=np.float32)),
+            (clusters, np.array([255, 40, 205], dtype=np.float32)),
+        ):
+            if labels is None:
+                continue
+            mask = np.asarray(labels) > 0
+            rgb[mask] = np.clip(
+                rgb[mask].astype(np.float32) * 0.3 + color * 0.7, 0, 255
+            ).astype(np.uint8)
+        height, width = gray.shape
+        self._image = QImage(
+            rgb.data, width, height, rgb.strides[0], QImage.Format.Format_RGB888
+        ).copy()
+        self._render()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        self._render()
+
+
+class PreviewWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        path: Path,
+        z_index: int,
+        settings: PreprocessingSettings,
+        xy_um_per_pixel: float,
+        z_step_um: float,
+        statistics: StackStatistics | None,
+        cache_key: tuple[object, ...],
+    ) -> None:
+        super().__init__()
+        self.path = path
+        self.z_index = z_index
+        self.settings = settings
+        self.xy_um_per_pixel = xy_um_per_pixel
+        self.z_step_um = z_step_um
+        self.statistics = statistics
+        self.cache_key = cache_key
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit("Preview", 0, 1, f"Reading Z {self.z_index + 1}")
+            result = make_preview(
+                self.path,
+                self.z_index,
+                self.settings,
+                xy_um_per_pixel=self.xy_um_per_pixel,
+                z_step_um=self.z_step_um,
+                statistics=self.statistics,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.progress.emit("Preview", 1, 1, f"Z {self.z_index + 1} ready")
+        self.completed.emit((self.cache_key, result))
+
+
+class BatchPreprocessWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal(str)
+
+    def __init__(self, manifest: dict[str, object], project_path: Path) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        self.cancel_event = Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = process_project_cache(
+                self.manifest,
+                self.project_path,
+                progress=lambda phase, current, total, detail: self.progress.emit(
+                    phase, current, total, detail
+                ),
+                cancel_event=self.cancel_event,
+            )
+        except ProcessingCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
+class DetectionWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal(str)
+    pair_completed = Signal(int, object)
+
+    def __init__(self, manifest: dict[str, object], project_path: Path) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        self.cancel_event = Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = detect_project(
+                self.manifest,
+                self.project_path,
+                progress=lambda phase, current, total, detail: self.progress.emit(
+                    phase, current, total, detail
+                ),
+                pair_completed=lambda index, summary: self.pair_completed.emit(
+                    index, summary
+                ),
+                cancel_event=self.cancel_event,
+            )
+        except ProcessingCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
+class ScanWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, directory: Path) -> None:
+        super().__init__()
+        self.directory = directory
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            report = scan_batch(
+                self.directory,
+                include_checksums=True,
+                progress=lambda phase, current, total, detail: self.progress.emit(
+                    phase, current, total, detail
+                ),
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(report)
+
+
+class VerifyWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        directory: Path,
+        relink: bool,
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.directory = directory
+        self.relink = relink
+
+    @Slot()
+    def run(self) -> None:
+        callback = lambda phase, current, total, detail: self.progress.emit(
+            phase, current, total, detail
+        )
+        try:
+            if self.relink:
+                results = relink_project_sources(
+                    self.manifest, self.directory, progress=callback
+                )
+            else:
+                results = verify_project_sources(
+                    self.manifest,
+                    source_directory=self.directory,
+                    full_checksums=True,
+                    progress=callback,
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(results)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Synpo Microscopy Processor — Stage 3")
+        self.resize(1380, 860)
+
+        self.report: ScanReport | None = None
+        self.manifest: dict[str, object] | None = None
+        self.project_path: Path | None = None
+        self._job_thread: QThread | None = None
+        self._job_worker: QObject | None = None
+        self._job_kind: str | None = None
+        self._preview_statistics: dict[tuple[object, ...], StackStatistics] = {}
+        self._last_preview: PreviewResult | None = None
+        self._last_detection: DetectionSlice | None = None
+        self._preview_requested_while_busy = False
+        self._calibration_store = CalibrationStore()
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(180)
+        self._preview_timer.timeout.connect(self._request_preview)
+
+        self._build_actions()
+        self._build_interface()
+        self._load_presets()
+        self._set_job_running(False)
+
+    def _build_actions(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
+        self.new_action = QAction("New batch", self)
+        self.new_action.triggered.connect(self._new_batch)
+        file_menu.addAction(self.new_action)
+
+        self.open_action = QAction("Open project…", self)
+        self.open_action.triggered.connect(self._open_project)
+        file_menu.addAction(self.open_action)
+
+        self.save_action = QAction("Save project", self)
+        self.save_action.triggered.connect(self._save_project)
+        file_menu.addAction(self.save_action)
+        file_menu.addSeparator()
+
+        self.exit_action = QAction("Exit", self)
+        self.exit_action.triggered.connect(self.close)
+        file_menu.addAction(self.exit_action)
+
+        project_menu = self.menuBar().addMenu("&Project")
+        self.verify_action = QAction("Verify sources", self)
+        self.verify_action.triggered.connect(self._verify_sources)
+        project_menu.addAction(self.verify_action)
+
+        self.relink_action = QAction("Relink source folder…", self)
+        self.relink_action.triggered.connect(self._relink_sources)
+        project_menu.addAction(self.relink_action)
+
+    def _build_interface(self) -> None:
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        self.tabs = QTabWidget()
+        central_layout.addWidget(self.tabs)
+        setup_tab = QWidget()
+        outer = QVBoxLayout(setup_tab)
+
+        locations = QGroupBox("Batch locations")
+        locations_form = QFormLayout(locations)
+        self.source_edit = QLineEdit()
+        source_row = QHBoxLayout()
+        source_row.addWidget(self.source_edit, 1)
+        source_browse = QPushButton("Browse…")
+        source_browse.clicked.connect(self._browse_source)
+        source_row.addWidget(source_browse)
+        self.scan_button = QPushButton("Scan and validate")
+        self.scan_button.clicked.connect(self._scan_source)
+        source_row.addWidget(self.scan_button)
+        locations_form.addRow("TIFF folder:", source_row)
+
+        self.output_edit = QLineEdit()
+        output_row = QHBoxLayout()
+        output_row.addWidget(self.output_edit, 1)
+        output_browse = QPushButton("Browse…")
+        output_browse.clicked.connect(self._browse_output)
+        output_row.addWidget(output_browse)
+        locations_form.addRow("Output folder:", output_row)
+        outer.addWidget(locations)
+
+        settings_row = QHBoxLayout()
+        channel_group = QGroupBox("Channel roles (confirm for this batch)")
+        channel_form = QFormLayout(channel_group)
+        self.channel_a_role = self._role_combo("protein_clusters")
+        self.channel_b_role = self._role_combo("dendrite_spines")
+        channel_form.addRow("ChanA:", self.channel_a_role)
+        channel_form.addRow("ChanB:", self.channel_b_role)
+        settings_row.addWidget(channel_group)
+
+        calibration_group = QGroupBox("Physical calibration (confirm for this batch)")
+        calibration_form = QFormLayout(calibration_group)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setEditable(True)
+        self.preset_combo.currentTextChanged.connect(self._preset_selected)
+        calibration_form.addRow("Named preset:", self.preset_combo)
+        self.xy_spin = QDoubleSpinBox()
+        self.xy_spin.setDecimals(7)
+        self.xy_spin.setRange(0.0000001, 1000.0)
+        self.xy_spin.setValue(0.0462584)
+        self.xy_spin.setSuffix(" µm/pixel")
+        calibration_form.addRow("X/Y pixel size:", self.xy_spin)
+        self.z_spin = QDoubleSpinBox()
+        self.z_spin.setDecimals(7)
+        self.z_spin.setRange(0.0000001, 1000.0)
+        self.z_spin.setValue(0.5)
+        self.z_spin.setSuffix(" µm")
+        calibration_form.addRow("Z step:", self.z_spin)
+        save_preset = QPushButton("Save/update preset")
+        save_preset.clicked.connect(self._save_preset)
+        calibration_form.addRow("", save_preset)
+        settings_row.addWidget(calibration_group)
+        outer.addLayout(settings_row)
+
+        self.summary_label = QLabel("Select a folder and scan it to begin.")
+        self.summary_label.setWordWrap(True)
+        outer.addWidget(self.summary_label)
+
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(
+            ["Status", "Experimental group", "Specimen", "ChanA", "ChanB", "Shape (Z × Y × X)", "Type", "Issues"]
+        )
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        self.table.setAlternatingRowColors(True)
+        outer.addWidget(self.table, 1)
+
+        progress_row = QHBoxLayout()
+        self.progress_label = QLabel("")
+        progress_row.addWidget(self.progress_label, 1)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimumWidth(320)
+        self.progress_bar.setVisible(False)
+        progress_row.addWidget(self.progress_bar)
+        self.save_button = QPushButton("Save project…")
+        self.save_button.clicked.connect(self._save_project)
+        progress_row.addWidget(self.save_button)
+        outer.addLayout(progress_row)
+
+        self.tabs.addTab(setup_tab, "1. Batch setup")
+        self._build_preprocessing_tab()
+        self._build_detection_tab()
+        self.tabs.setTabEnabled(1, False)
+        self.tabs.setTabEnabled(2, False)
+        self.setCentralWidget(central)
+
+    def _build_preprocessing_tab(self) -> None:
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+
+        selection = QGroupBox("Representative preview")
+        selection_layout = QHBoxLayout(selection)
+        self.preprocess_specimen = QComboBox()
+        self.preprocess_specimen.currentIndexChanged.connect(
+            self._preprocess_specimen_changed
+        )
+        selection_layout.addWidget(QLabel("Specimen:"))
+        selection_layout.addWidget(self.preprocess_specimen, 2)
+        self.preprocess_channel = QComboBox()
+        self.preprocess_channel.addItem("ChanA", "ChanA")
+        self.preprocess_channel.addItem("ChanB", "ChanB")
+        self.preprocess_channel.currentIndexChanged.connect(
+            self._preprocess_channel_changed
+        )
+        selection_layout.addWidget(QLabel("Channel:"))
+        selection_layout.addWidget(self.preprocess_channel)
+        self.representative_check = QCheckBox("Use as representative specimen")
+        selection_layout.addWidget(self.representative_check)
+        outer.addWidget(selection)
+
+        controls = QGroupBox("Adaptive preprocessing settings for this channel")
+        controls_layout = QHBoxLayout(controls)
+        self.background_spin = QDoubleSpinBox()
+        self.background_spin.setRange(0.0, 99.9)
+        self.background_spin.setDecimals(1)
+        self.background_spin.setSuffix(" %")
+        controls_layout.addWidget(QLabel("Background percentile:"))
+        controls_layout.addWidget(self.background_spin)
+        self.sigma_xy_spin = QDoubleSpinBox()
+        self.sigma_xy_spin.setRange(0.0, 5.0)
+        self.sigma_xy_spin.setDecimals(3)
+        self.sigma_xy_spin.setSingleStep(0.01)
+        self.sigma_xy_spin.setSuffix(" µm")
+        controls_layout.addWidget(QLabel("Gaussian XY:"))
+        controls_layout.addWidget(self.sigma_xy_spin)
+        self.sigma_z_spin = QDoubleSpinBox()
+        self.sigma_z_spin.setRange(0.0, 5.0)
+        self.sigma_z_spin.setDecimals(3)
+        self.sigma_z_spin.setSingleStep(0.05)
+        self.sigma_z_spin.setSuffix(" µm")
+        controls_layout.addWidget(QLabel("Gaussian Z:"))
+        controls_layout.addWidget(self.sigma_z_spin)
+        self.sensitivity_spin = QDoubleSpinBox()
+        self.sensitivity_spin.setRange(0.1, 3.0)
+        self.sensitivity_spin.setDecimals(2)
+        self.sensitivity_spin.setSingleStep(0.05)
+        self.sensitivity_spin.setToolTip(
+            "Higher values retain more candidate voxels; 1.00 uses the adaptive threshold."
+        )
+        controls_layout.addWidget(QLabel("Threshold sensitivity:"))
+        controls_layout.addWidget(self.sensitivity_spin)
+        self.apply_preprocessing_button = QPushButton("Apply channel settings")
+        self.apply_preprocessing_button.clicked.connect(
+            self._apply_preprocessing_settings
+        )
+        controls_layout.addWidget(self.apply_preprocessing_button)
+        outer.addWidget(controls)
+
+        navigation = QHBoxLayout()
+        self.z_label = QLabel("Z: —")
+        navigation.addWidget(self.z_label)
+        self.z_slider = QSlider(Qt.Orientation.Horizontal)
+        self.z_slider.setRange(0, 0)
+        self.z_slider.valueChanged.connect(self._z_changed)
+        navigation.addWidget(self.z_slider, 1)
+        self.contrast_low = QSpinBox()
+        self.contrast_low.setRange(0, 65535)
+        self.contrast_low.setValue(0)
+        self.contrast_low.valueChanged.connect(self._render_preview)
+        navigation.addWidget(QLabel("Black:"))
+        navigation.addWidget(self.contrast_low)
+        self.contrast_high = QSpinBox()
+        self.contrast_high.setRange(1, 65535)
+        self.contrast_high.setValue(65535)
+        self.contrast_high.valueChanged.connect(self._render_preview)
+        navigation.addWidget(QLabel("White:"))
+        navigation.addWidget(self.contrast_high)
+        auto_contrast = QPushButton("Auto contrast")
+        auto_contrast.clicked.connect(self._auto_contrast)
+        navigation.addWidget(auto_contrast)
+        self.threshold_overlay = QCheckBox("Threshold overlay")
+        self.threshold_overlay.setChecked(True)
+        self.threshold_overlay.toggled.connect(self._render_preview)
+        navigation.addWidget(self.threshold_overlay)
+        refresh = QPushButton("Refresh preview")
+        refresh.clicked.connect(self._request_preview)
+        navigation.addWidget(refresh)
+        outer.addLayout(navigation)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        raw_container = QWidget()
+        raw_layout = QVBoxLayout(raw_container)
+        raw_layout.setContentsMargins(0, 0, 0, 0)
+        raw_layout.addWidget(
+            QLabel("Original 16-bit slice (measurements remain tied to this data)")
+        )
+        self.raw_view = SliceView("Choose a specimen to load a slice")
+        raw_scroll = QScrollArea()
+        raw_scroll.setWidgetResizable(True)
+        raw_scroll.setWidget(self.raw_view)
+        raw_layout.addWidget(raw_scroll, 1)
+        splitter.addWidget(raw_container)
+
+        processed_container = QWidget()
+        processed_layout = QVBoxLayout(processed_container)
+        processed_layout.setContentsMargins(0, 0, 0, 0)
+        processed_layout.addWidget(
+            QLabel("Background-subtracted and smoothed detection image")
+        )
+        self.processed_view = SliceView("Processed preview")
+        processed_scroll = QScrollArea()
+        processed_scroll.setWidgetResizable(True)
+        processed_scroll.setWidget(self.processed_view)
+        processed_layout.addWidget(processed_scroll, 1)
+        splitter.addWidget(processed_container)
+        splitter.setSizes([680, 680])
+        outer.addWidget(splitter, 1)
+
+        batch_row = QHBoxLayout()
+        self.preprocessing_status = QLabel(
+            "Save or open a project, tune representative specimens, then preprocess the batch."
+        )
+        self.preprocessing_status.setWordWrap(True)
+        batch_row.addWidget(self.preprocessing_status, 1)
+        self.run_preprocessing_button = QPushButton(
+            "Preprocess entire batch / resume"
+        )
+        self.run_preprocessing_button.clicked.connect(self._run_batch_preprocessing)
+        batch_row.addWidget(self.run_preprocessing_button)
+        self.cancel_preprocessing_button = QPushButton("Cancel after current slice")
+        self.cancel_preprocessing_button.clicked.connect(
+            self._cancel_batch_preprocessing
+        )
+        self.cancel_preprocessing_button.setEnabled(False)
+        batch_row.addWidget(self.cancel_preprocessing_button)
+        outer.addLayout(batch_row)
+
+        tab.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.tabs.addTab(tab, "2. Preprocessing")
+
+    def _build_detection_tab(self) -> None:
+        tab = QWidget()
+        outer = QHBoxLayout(tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        outer.addWidget(splitter)
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        side_scroll.setMinimumWidth(370)
+        side_scroll.setMaximumWidth(470)
+        side_panel = QWidget()
+        side_layout = QVBoxLayout(side_panel)
+
+        view_group = QGroupBox("Specimen and display")
+        view_form = QFormLayout(view_group)
+        view_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        view_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.detection_specimen = QComboBox()
+        self.detection_specimen.currentIndexChanged.connect(
+            self._detection_specimen_changed
+        )
+        view_form.addRow("Specimen:", self.detection_specimen)
+        self.detection_background_channel = QComboBox()
+        self.detection_background_channel.addItem("ChanB", "ChanB")
+        self.detection_background_channel.addItem("ChanA", "ChanA")
+        self.detection_background_channel.currentIndexChanged.connect(
+            self._load_detection_view
+        )
+        view_form.addRow("Image background:", self.detection_background_channel)
+        self.detection_black = QSpinBox()
+        self.detection_black.setRange(0, 65535)
+        self.detection_black.valueChanged.connect(self._render_detection_view)
+        view_form.addRow("Black level:", self.detection_black)
+        self.detection_white = QSpinBox()
+        self.detection_white.setRange(1, 65535)
+        self.detection_white.setValue(65535)
+        self.detection_white.valueChanged.connect(self._render_detection_view)
+        view_form.addRow("White level:", self.detection_white)
+        detection_auto = QPushButton("Set contrast automatically")
+        detection_auto.setMinimumHeight(32)
+        detection_auto.clicked.connect(self._auto_detection_contrast)
+        view_form.addRow(detection_auto)
+        side_layout.addWidget(view_group)
+
+        overlay_group = QGroupBox("Colored overlays")
+        overlay_layout = QVBoxLayout(overlay_group)
+        self.show_dendrites = QCheckBox("Dendrite shafts — green")
+        self.show_dendrites.setChecked(True)
+        self.show_dendrites.toggled.connect(self._render_detection_view)
+        overlay_layout.addWidget(self.show_dendrites)
+        self.show_spines = QCheckBox("Spine candidates — cyan")
+        self.show_spines.setChecked(True)
+        self.show_spines.toggled.connect(self._render_detection_view)
+        overlay_layout.addWidget(self.show_spines)
+        self.show_clusters = QCheckBox("Protein-cluster candidates — magenta")
+        self.show_clusters.setChecked(True)
+        self.show_clusters.toggled.connect(self._render_detection_view)
+        overlay_layout.addWidget(self.show_clusters)
+        side_layout.addWidget(overlay_group)
+
+        settings_group = QGroupBox("Primary candidate detection settings")
+        settings_layout = QFormLayout(settings_group)
+        settings_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        settings_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.dendrite_detection_sensitivity = QDoubleSpinBox()
+        self.dendrite_detection_sensitivity.setRange(0.25, 3.0)
+        self.dendrite_detection_sensitivity.setDecimals(2)
+        self.dendrite_detection_sensitivity.setSingleStep(0.05)
+        self.dendrite_detection_sensitivity.setToolTip(
+            "Higher values retain more dendrite/spine signal."
+        )
+        settings_layout.addRow(
+            "Dendrite/spine sensitivity:", self.dendrite_detection_sensitivity
+        )
+        self.cluster_detection_sensitivity = QDoubleSpinBox()
+        self.cluster_detection_sensitivity.setRange(0.25, 3.0)
+        self.cluster_detection_sensitivity.setDecimals(2)
+        self.cluster_detection_sensitivity.setSingleStep(0.05)
+        self.cluster_detection_sensitivity.setToolTip(
+            "Higher values retain more protein-cluster candidates."
+        )
+        settings_layout.addRow(
+            "Protein-cluster sensitivity:", self.cluster_detection_sensitivity
+        )
+        self.spine_branch_length = QDoubleSpinBox()
+        self.spine_branch_length.setRange(0.5, 10.0)
+        self.spine_branch_length.setDecimals(2)
+        self.spine_branch_length.setSuffix(" µm")
+        settings_layout.addRow("Maximum terminal branch:", self.spine_branch_length)
+        self.minimum_dendrite_length = QDoubleSpinBox()
+        self.minimum_dendrite_length.setRange(0.5, 1000.0)
+        self.minimum_dendrite_length.setDecimals(1)
+        self.minimum_dendrite_length.setSuffix(" µm")
+        settings_layout.addRow("Minimum dendrite length:", self.minimum_dendrite_length)
+        self.minimum_spine_pixels = QSpinBox()
+        self.minimum_spine_pixels.setRange(1, 10000)
+        settings_layout.addRow(
+            "Minimum spine projection area (pixels):", self.minimum_spine_pixels
+        )
+        self.minimum_cluster_voxels = QSpinBox()
+        self.minimum_cluster_voxels.setRange(1, 1000000)
+        settings_layout.addRow(
+            "Minimum protein-cluster volume (voxels):", self.minimum_cluster_voxels
+        )
+        self.apply_detection_button = QPushButton("Save these detection settings")
+        self.apply_detection_button.setMinimumHeight(34)
+        self.apply_detection_button.clicked.connect(self._apply_detection_settings)
+        settings_layout.addRow(self.apply_detection_button)
+        side_layout.addWidget(settings_group)
+
+        results_group = QGroupBox("Detection status")
+        results_layout = QVBoxLayout(results_group)
+        self.detection_counts = QLabel("No completed detection for this specimen.")
+        self.detection_counts.setWordWrap(True)
+        results_layout.addWidget(self.detection_counts)
+        self.detection_status = QLabel(
+            "Detection can start when at least one specimen pair has completed preprocessing."
+        )
+        self.detection_status.setWordWrap(True)
+        results_layout.addWidget(self.detection_status)
+        self.run_detection_button = QPushButton(
+            "Run automatic detection or resume the batch"
+        )
+        self.run_detection_button.setMinimumHeight(38)
+        self.run_detection_button.clicked.connect(self._run_detection)
+        results_layout.addWidget(self.run_detection_button)
+        self.cancel_detection_button = QPushButton(
+            "Cancel safely after the current step"
+        )
+        self.cancel_detection_button.setMinimumHeight(34)
+        self.cancel_detection_button.clicked.connect(self._cancel_detection)
+        self.cancel_detection_button.setEnabled(False)
+        results_layout.addWidget(self.cancel_detection_button)
+        side_layout.addWidget(results_group)
+        side_layout.addStretch(1)
+        side_scroll.setWidget(side_panel)
+        splitter.addWidget(side_scroll)
+
+        viewer_panel = QWidget()
+        viewer_layout = QVBoxLayout(viewer_panel)
+        z_row = QHBoxLayout()
+        self.detection_z_label = QLabel("Z: —")
+        self.detection_z_label.setMinimumWidth(72)
+        z_row.addWidget(self.detection_z_label)
+        self.detection_z_slider = QSlider(Qt.Orientation.Horizontal)
+        self.detection_z_slider.setRange(0, 0)
+        self.detection_z_slider.valueChanged.connect(self._detection_z_changed)
+        z_row.addWidget(self.detection_z_slider, 1)
+        viewer_layout.addLayout(z_row)
+
+        self.detection_view = SliceView("Run detection to inspect candidate masks")
+        detection_scroll = QScrollArea()
+        detection_scroll.setWidgetResizable(True)
+        detection_scroll.setWidget(self.detection_view)
+        viewer_layout.addWidget(detection_scroll, 1)
+        splitter.addWidget(viewer_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([410, 970])
+
+        self.tabs.addTab(tab, "3. Automatic detection")
+
+    def _role_combo(self, selected: str) -> QComboBox:
+        combo = QComboBox()
+        for value, label in ROLE_LABELS.items():
+            combo.addItem(label, value)
+        combo.setCurrentIndex(combo.findData(selected))
+        return combo
+
+    def _load_presets(self) -> None:
+        try:
+            presets = self._calibration_store.load()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Calibration presets", str(exc))
+            presets = {}
+        current = self.preset_combo.currentText()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for name, calibration in presets.items():
+            self.preset_combo.addItem(name, calibration)
+        self.preset_combo.setEditText(current)
+        self.preset_combo.blockSignals(False)
+
+    def _preset_selected(self, name: str) -> None:
+        index = self.preset_combo.findText(name)
+        if index < 0:
+            return
+        calibration = self.preset_combo.itemData(index)
+        if isinstance(calibration, Calibration):
+            self.xy_spin.setValue(calibration.xy_um_per_pixel)
+            self.z_spin.setValue(calibration.z_step_um)
+
+    def _current_calibration(self) -> Calibration:
+        calibration = Calibration(
+            preset_name=self.preset_combo.currentText().strip(),
+            xy_um_per_pixel=self.xy_spin.value(),
+            z_step_um=self.z_spin.value(),
+        )
+        calibration.validate()
+        return calibration
+
+    def _save_preset(self) -> None:
+        try:
+            calibration = self._current_calibration()
+            self._calibration_store.save_preset(calibration)
+            self._load_presets()
+            self.preset_combo.setCurrentText(calibration.preset_name)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot save preset", str(exc))
+
+    def _browse_source(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "Select TIFF folder", self.source_edit.text())
+        if directory:
+            self.source_edit.setText(directory)
+            if not self.output_edit.text():
+                self.output_edit.setText(str(Path(directory) / "Synpo Results"))
+
+    def _browse_output(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "Select output folder", self.output_edit.text())
+        if directory:
+            self.output_edit.setText(directory)
+
+    def _prepare_preprocessing_tab(self) -> None:
+        if self.manifest is None:
+            self.tabs.setTabEnabled(1, False)
+            return
+        self.tabs.setTabEnabled(1, True)
+        if self._job_thread is None:
+            self.run_preprocessing_button.setEnabled(True)
+            self.apply_preprocessing_button.setEnabled(True)
+        current = self.preprocess_specimen.currentData()
+        self.preprocess_specimen.blockSignals(True)
+        self.preprocess_specimen.clear()
+        for index, specimen in enumerate(self.manifest["specimens"]):
+            self.preprocess_specimen.addItem(
+                f"{specimen['experimental_group']} — {specimen['specimen_id']}", index
+            )
+        if current is not None:
+            found = self.preprocess_specimen.findData(current)
+            self.preprocess_specimen.setCurrentIndex(max(0, found))
+        self.preprocess_specimen.blockSignals(False)
+        roles = self.manifest["channel_roles"]
+        for index in range(self.preprocess_channel.count()):
+            channel = str(self.preprocess_channel.itemData(index))
+            self.preprocess_channel.setItemText(
+                index, f"{channel} — {ROLE_LABELS[str(roles[channel])]}"
+            )
+        self._preprocess_specimen_changed()
+        completed = sum(
+            specimen["checkpoints"]["preprocessing"].get("state") == "complete"
+            for specimen in self.manifest["specimens"]
+        )
+        cache_path = self.manifest.get("cache", {}).get("path")
+        self.preprocessing_status.setText(
+            f"Preprocessing checkpoints: {completed}/{len(self.manifest['specimens'])} pairs complete."
+            + (f" Cache: {cache_path}" if cache_path else "")
+        )
+
+    def _selected_specimen_index(self) -> int:
+        value = self.preprocess_specimen.currentData()
+        if value is None:
+            raise ValueError("Select a specimen.")
+        return int(value)
+
+    def _selected_preprocess_channel(self) -> str:
+        value = self.preprocess_channel.currentData()
+        if value not in {"ChanA", "ChanB"}:
+            raise ValueError("Select a channel.")
+        return str(value)
+
+    def _preprocess_specimen_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.preprocess_specimen.currentData() is None:
+            return
+        index = self._selected_specimen_index()
+        channel = self._selected_preprocess_channel()
+        shape = self.manifest["specimens"][index]["channels"][channel]["metadata"]["shape"]
+        z_count = 1 if len(shape) == 2 else int(shape[0])
+        representatives = set(
+            int(value)
+            for value in self.manifest["preprocessing"].get(
+                "representative_specimens", []
+            )
+        )
+        self.representative_check.setChecked(index in representatives)
+        self.z_slider.blockSignals(True)
+        self.z_slider.setRange(0, max(0, z_count - 1))
+        self.z_slider.setValue(max(0, (z_count - 1) // 2))
+        self.z_slider.blockSignals(False)
+        self.z_label.setText(f"Z: {self.z_slider.value() + 1}/{z_count}")
+        self._last_preview = None
+        self._load_channel_settings()
+        self._preview_timer.start()
+
+    def _preprocess_channel_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None:
+            return
+        self._last_preview = None
+        self._load_channel_settings()
+        self._preprocess_specimen_changed()
+
+    def _load_channel_settings(self) -> None:
+        if self.manifest is None:
+            return
+        channel = self._selected_preprocess_channel()
+        settings = PreprocessingSettings.from_dict(
+            self.manifest["preprocessing"]["settings_by_channel"][channel]
+        )
+        for widget, value in (
+            (self.background_spin, settings.background_percentile),
+            (self.sigma_xy_spin, settings.gaussian_sigma_xy_um),
+            (self.sigma_z_spin, settings.gaussian_sigma_z_um),
+            (self.sensitivity_spin, settings.threshold_sensitivity),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+
+    def _current_preprocessing_settings(self) -> PreprocessingSettings:
+        settings = PreprocessingSettings(
+            background_percentile=self.background_spin.value(),
+            gaussian_sigma_xy_um=self.sigma_xy_spin.value(),
+            gaussian_sigma_z_um=self.sigma_z_spin.value(),
+            threshold_sensitivity=self.sensitivity_spin.value(),
+        )
+        settings.validate()
+        return settings
+
+    def _apply_preprocessing_settings(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            QMessageBox.information(self, "No project", "Save or open a project first.")
+            return
+        try:
+            channel = self._selected_preprocess_channel()
+            index = self._selected_specimen_index()
+            settings = self._current_preprocessing_settings()
+            self.manifest["preprocessing"]["settings_by_channel"][channel] = settings.to_dict()
+            representatives = {
+                int(value)
+                for value in self.manifest["preprocessing"].get(
+                    "representative_specimens", []
+                )
+            }
+            if self.representative_check.isChecked():
+                representatives.add(index)
+            else:
+                representatives.discard(index)
+            self.manifest["preprocessing"]["representative_specimens"] = sorted(
+                representatives
+            )
+            save_project(self.project_path, self.manifest)
+            self._last_preview = None
+            self.preprocessing_status.setText(
+                f"Saved {channel} settings. Previewing with the updated parameters."
+            )
+            self._request_preview()
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot apply settings", str(exc))
+
+    def _preview_cache_key(self) -> tuple[object, ...]:
+        settings = self._current_preprocessing_settings()
+        return (
+            self._selected_specimen_index(),
+            self._selected_preprocess_channel(),
+            settings.background_percentile,
+            settings.gaussian_sigma_xy_um,
+            settings.gaussian_sigma_z_um,
+            settings.threshold_sensitivity,
+        )
+
+    def _z_changed(self, value: int) -> None:
+        total = self.z_slider.maximum() + 1
+        self.z_label.setText(f"Z: {value + 1}/{total}")
+        self._preview_timer.start()
+
+    def _request_preview(self) -> None:
+        if self.manifest is None:
+            return
+        if self._job_thread is not None:
+            if self._job_kind == "preview":
+                self._preview_requested_while_busy = True
+            return
+        try:
+            index = self._selected_specimen_index()
+            channel = self._selected_preprocess_channel()
+            settings = self._current_preprocessing_settings()
+            calibration = self.manifest["calibration"]
+            filename = self.manifest["specimens"][index]["channels"][channel]["filename"]
+            path = Path(str(self.manifest["source_directory"])) / str(filename)
+            key = self._preview_cache_key()
+            worker = PreviewWorker(
+                path,
+                self.z_slider.value(),
+                settings,
+                float(calibration["xy_um_per_pixel"]),
+                float(calibration["z_step_um"]),
+                self._preview_statistics.get(key),
+                key,
+            )
+            worker.completed.connect(self._preview_completed)
+            self._start_worker(worker, "preview")
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot preview", str(exc))
+
+    @Slot(object)
+    def _preview_completed(self, payload: tuple[tuple[object, ...], PreviewResult]) -> None:
+        key, result = payload
+        sensitivity = float(key[-1])
+        self._preview_statistics[key] = StackStatistics(
+            background=result.background,
+            otsu_threshold=result.threshold * sensitivity,
+            applied_threshold=result.threshold,
+            raw_low=result.raw_low,
+            raw_high=result.raw_high,
+        )
+        expected = self._preview_cache_key()
+        if key != expected or result.z_index != self.z_slider.value():
+            self._preview_requested_while_busy = True
+            return
+        self._last_preview = result
+        self._auto_contrast()
+        self.preprocessing_status.setText(
+            f"Background {result.background:.1f}; suggested threshold "
+            f"{result.threshold:.1f}. Magenta voxels pass the detection threshold."
+        )
+
+    def _auto_contrast(self) -> None:
+        if self._last_preview is None:
+            return
+        low = int(max(0, min(65534, round(self._last_preview.raw_low))))
+        high = int(max(low + 1, min(65535, round(self._last_preview.raw_high))))
+        self.contrast_low.blockSignals(True)
+        self.contrast_high.blockSignals(True)
+        self.contrast_low.setValue(low)
+        self.contrast_high.setValue(high)
+        self.contrast_low.blockSignals(False)
+        self.contrast_high.blockSignals(False)
+        self._render_preview()
+
+    def _render_preview(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self._last_preview is None:
+            return
+        low = self.contrast_low.value()
+        high = max(low + 1, self.contrast_high.value())
+        self.raw_view.show_array(self._last_preview.raw, low, high)
+        processed_low = max(0.0, low - self._last_preview.background)
+        processed_high = max(processed_low + 1.0, high - self._last_preview.background)
+        mask = (
+            self._last_preview.processed >= self._last_preview.threshold
+            if self.threshold_overlay.isChecked()
+            else None
+        )
+        self.processed_view.show_array(
+            self._last_preview.processed, processed_low, processed_high, mask
+        )
+
+    def _run_batch_preprocessing(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            QMessageBox.information(self, "No project", "Save or open a project first.")
+            return
+        try:
+            self._sync_manifest_edits()
+            channel = self._selected_preprocess_channel()
+            self.manifest["preprocessing"]["settings_by_channel"][channel] = (
+                self._current_preprocessing_settings().to_dict()
+            )
+            save_project(self.project_path, self.manifest)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot start preprocessing", str(exc))
+            return
+        worker = BatchPreprocessWorker(self.manifest, self.project_path)
+        worker.completed.connect(self._batch_preprocessing_completed)
+        worker.cancelled.connect(self._batch_preprocessing_cancelled)
+        self._start_worker(worker, "preprocess")
+
+    def _cancel_batch_preprocessing(self) -> None:
+        if isinstance(self._job_worker, BatchPreprocessWorker):
+            self._job_worker.cancel()
+            self.cancel_preprocessing_button.setEnabled(False)
+            self.preprocessing_status.setText(
+                "Cancellation requested; finishing the current slice safely."
+            )
+
+    @Slot(object)
+    def _batch_preprocessing_completed(self, result: dict[str, object]) -> None:
+        elapsed = float(result["elapsed_seconds"])
+        self.preprocessing_status.setText(
+            f"Batch preprocessing complete in {elapsed / 60:.1f} min. "
+            f"Compressed cache: {result['cache_path']}"
+        )
+        self._prepare_preprocessing_tab()
+        self._prepare_detection_tab()
+
+    @Slot(str)
+    def _batch_preprocessing_cancelled(self, message: str) -> None:
+        self.preprocessing_status.setText(message)
+        if self.project_path is not None and self.manifest is not None:
+            save_project(self.project_path, self.manifest)
+
+    def _prepare_detection_tab(self) -> None:
+        if self.manifest is None:
+            self.tabs.setTabEnabled(2, False)
+            return
+        self.tabs.setTabEnabled(2, True)
+        settings = DetectionSettings.from_dict(
+            self.manifest["detection"]["settings"]
+        )
+        for widget, value in (
+            (self.dendrite_detection_sensitivity, settings.dendrite_sensitivity),
+            (self.cluster_detection_sensitivity, settings.cluster_sensitivity),
+            (self.spine_branch_length, settings.spine_branch_length_um),
+            (self.minimum_dendrite_length, settings.minimum_dendrite_length_um),
+            (self.minimum_spine_pixels, settings.minimum_spine_projection_pixels),
+            (self.minimum_cluster_voxels, settings.minimum_cluster_voxels),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+
+        current = self.detection_specimen.currentData()
+        self.detection_specimen.blockSignals(True)
+        self.detection_specimen.clear()
+        for index, specimen in enumerate(self.manifest["specimens"]):
+            state = specimen["checkpoints"]["detection"].get("state", "not_started")
+            self.detection_specimen.addItem(
+                f"{specimen['experimental_group']} — {specimen['specimen_id']} [{state}]",
+                index,
+            )
+        if current is not None:
+            found = self.detection_specimen.findData(current)
+            self.detection_specimen.setCurrentIndex(max(0, found))
+        self.detection_specimen.blockSignals(False)
+
+        dendrite_channel = next(
+            channel
+            for channel, role in self.manifest["channel_roles"].items()
+            if role == "dendrite_spines"
+        )
+        self.detection_background_channel.setCurrentIndex(
+            self.detection_background_channel.findData(dendrite_channel)
+        )
+        eligible = sum(
+            specimen["checkpoints"]["preprocessing"].get("state") == "complete"
+            for specimen in self.manifest["specimens"]
+        )
+        complete = sum(
+            specimen["checkpoints"]["detection"].get("state") == "complete"
+            for specimen in self.manifest["specimens"]
+        )
+        self.detection_status.setText(
+            f"Detection checkpoints: {complete}/{len(self.manifest['specimens'])} complete; "
+            f"{eligible} pair(s) currently eligible. Automatic candidates remain unreviewed."
+        )
+        if self._job_thread is None:
+            self.apply_detection_button.setEnabled(True)
+            self.run_detection_button.setEnabled(eligible > 0)
+        self._detection_specimen_changed()
+
+    def _current_detection_settings(self) -> DetectionSettings:
+        settings = DetectionSettings(
+            dendrite_sensitivity=self.dendrite_detection_sensitivity.value(),
+            cluster_sensitivity=self.cluster_detection_sensitivity.value(),
+            spine_branch_length_um=self.spine_branch_length.value(),
+            minimum_dendrite_length_um=self.minimum_dendrite_length.value(),
+            minimum_spine_projection_pixels=self.minimum_spine_pixels.value(),
+            minimum_cluster_voxels=self.minimum_cluster_voxels.value(),
+        )
+        settings.validate()
+        return settings
+
+    def _apply_detection_settings(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            QMessageBox.information(self, "No project", "Save or open a project first.")
+            return
+        try:
+            self.manifest["detection"]["settings"] = (
+                self._current_detection_settings().to_dict()
+            )
+            save_project(self.project_path, self.manifest)
+            self.detection_status.setText(
+                "Detection settings saved. Running again will replace stale automatic masks."
+            )
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot save detection settings", str(exc))
+
+    def _run_detection(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            QMessageBox.information(self, "No project", "Save or open a project first.")
+            return
+        try:
+            self._sync_manifest_edits()
+            self.manifest["detection"]["settings"] = (
+                self._current_detection_settings().to_dict()
+            )
+            save_project(self.project_path, self.manifest)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot start detection", str(exc))
+            return
+        worker = DetectionWorker(self.manifest, self.project_path)
+        worker.pair_completed.connect(self._detection_pair_completed)
+        worker.completed.connect(self._detection_completed)
+        worker.cancelled.connect(self._detection_cancelled)
+        self._start_worker(worker, "detection")
+
+    def _cancel_detection(self) -> None:
+        if isinstance(self._job_worker, DetectionWorker):
+            self._job_worker.cancel()
+            self.cancel_detection_button.setEnabled(False)
+            self.detection_status.setText(
+                "Cancellation requested. The current safe step will finish first."
+            )
+
+    @Slot(int, object)
+    def _detection_pair_completed(
+        self, specimen_index: int, summary: dict[str, object]
+    ) -> None:
+        self.detection_status.setText(
+            f"Completed pair {specimen_index + 1}: {summary['dendrite_count']} dendrite "
+            f"field(s), {summary['spine_count']} spine candidates, "
+            f"{summary['cluster_count']} cluster candidates. Detection continues in background."
+        )
+        row = self.detection_specimen.findData(specimen_index)
+        if row >= 0:
+            specimen = self.manifest["specimens"][specimen_index]
+            self.detection_specimen.setItemText(
+                row,
+                f"{specimen['experimental_group']} — {specimen['specimen_id']} [complete]",
+            )
+        if self.detection_specimen.currentData() == specimen_index:
+            self._detection_specimen_changed()
+
+    @Slot(object)
+    def _detection_completed(self, result: dict[str, object]) -> None:
+        self.detection_status.setText(
+            f"Automatic detection complete for {result['eligible_pairs']} pair(s) in "
+            f"{float(result['elapsed_seconds']) / 60:.1f} min. All candidates are awaiting review."
+        )
+        self._prepare_detection_tab()
+
+    @Slot(str)
+    def _detection_cancelled(self, message: str) -> None:
+        self.detection_status.setText(message)
+        if self.project_path is not None and self.manifest is not None:
+            save_project(self.project_path, self.manifest)
+
+    def _detection_specimen_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.detection_specimen.currentData() is None:
+            return
+        index = int(self.detection_specimen.currentData())
+        channel = str(self.detection_background_channel.currentData() or "ChanB")
+        shape = self.manifest["specimens"][index]["channels"][channel]["metadata"]["shape"]
+        z_count = 1 if len(shape) == 2 else int(shape[0])
+        self.detection_z_slider.blockSignals(True)
+        self.detection_z_slider.setRange(0, max(0, z_count - 1))
+        self.detection_z_slider.setValue(max(0, (z_count - 1) // 2))
+        self.detection_z_slider.blockSignals(False)
+        self.detection_z_label.setText(
+            f"Z: {self.detection_z_slider.value() + 1}/{z_count}"
+        )
+        checkpoint = self.manifest["specimens"][index]["checkpoints"]["detection"]
+        summary = checkpoint.get("summary", {})
+        if checkpoint.get("state") == "complete":
+            self.detection_counts.setText(
+                f"{summary.get('dendrite_count', 0)} dendrites | "
+                f"{summary.get('spine_count', 0)} spines "
+                f"({summary.get('flagged_spine_count', 0)} flagged) | "
+                f"{summary.get('cluster_count', 0)} clusters "
+                f"({summary.get('flagged_cluster_count', 0)} flagged)"
+            )
+            self._load_detection_view()
+        else:
+            self._last_detection = None
+            self.detection_counts.setText("No completed detection for this specimen.")
+            self.detection_view.setText("Detection is not complete for this specimen.")
+
+    def _detection_z_changed(self, value: int) -> None:
+        self.detection_z_label.setText(
+            f"Z: {value + 1}/{self.detection_z_slider.maximum() + 1}"
+        )
+        self._load_detection_view()
+
+    def _load_detection_view(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.detection_specimen.currentData() is None:
+            return
+        index = int(self.detection_specimen.currentData())
+        checkpoint = self.manifest["specimens"][index]["checkpoints"]["detection"]
+        if checkpoint.get("state") != "complete":
+            return
+        try:
+            self._last_detection = load_detection_slice(
+                self.manifest,
+                index,
+                self.detection_z_slider.value(),
+                str(self.detection_background_channel.currentData()),
+            )
+            self._auto_detection_contrast()
+        except (OSError, ValueError, KeyError, IndexError) as exc:
+            self.detection_view.setText(f"Cannot load detection slice: {exc}")
+
+    def _auto_detection_contrast(self) -> None:
+        if self._last_detection is None:
+            return
+        low, high = np.percentile(self._last_detection.raw, (0.5, 99.8))
+        low_value = int(max(0, min(65534, round(float(low)))))
+        high_value = int(max(low_value + 1, min(65535, round(float(high)))))
+        self.detection_black.blockSignals(True)
+        self.detection_white.blockSignals(True)
+        self.detection_black.setValue(low_value)
+        self.detection_white.setValue(high_value)
+        self.detection_black.blockSignals(False)
+        self.detection_white.blockSignals(False)
+        self._render_detection_view()
+
+    def _render_detection_view(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self._last_detection is None:
+            return
+        self.detection_view.show_detection(
+            self._last_detection.raw,
+            self.detection_black.value(),
+            max(self.detection_black.value() + 1, self.detection_white.value()),
+            dendrites=(
+                self._last_detection.dendrites if self.show_dendrites.isChecked() else None
+            ),
+            spines=self._last_detection.spines if self.show_spines.isChecked() else None,
+            clusters=(
+                self._last_detection.clusters if self.show_clusters.isChecked() else None
+            ),
+        )
+
+    def _scan_source(self) -> None:
+        directory = Path(self.source_edit.text().strip())
+        if not directory.is_dir():
+            QMessageBox.warning(self, "Invalid folder", "Select an existing TIFF folder.")
+            return
+        if not self.output_edit.text().strip():
+            self.output_edit.setText(str(directory / "Synpo Results"))
+        self.report = None
+        self.manifest = None
+        self.project_path = None
+        self.tabs.setTabEnabled(1, False)
+        self.tabs.setTabEnabled(2, False)
+        worker = ScanWorker(directory)
+        worker.completed.connect(self._scan_completed)
+        self._start_worker(worker, "scan")
+
+    def _start_worker(self, worker: QObject, kind: str) -> None:
+        if self._job_thread is not None:
+            QMessageBox.information(self, "Work in progress", "Wait for the current operation to finish.")
+            return
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._update_progress)
+        worker.failed.connect(self._job_failed)
+        worker.failed.connect(thread.quit)
+        worker.completed.connect(thread.quit)
+        if isinstance(worker, (BatchPreprocessWorker, DetectionWorker)):
+            worker.cancelled.connect(thread.quit)
+        thread.finished.connect(self._worker_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._job_thread = thread
+        self._job_worker = worker
+        self._job_kind = kind
+        self._set_job_running(True)
+        thread.start()
+
+    @Slot(str, int, int, str)
+    def _update_progress(self, phase: str, current: int, total: int, detail: str) -> None:
+        self.progress_bar.setRange(0, max(1, total))
+        self.progress_bar.setValue(current)
+        self.progress_label.setText(f"{phase}: {detail}")
+
+    @Slot(str)
+    def _job_failed(self, message: str) -> None:
+        if self._job_kind == "preprocess" and self.manifest is not None:
+            self.preprocessing_status.setText(
+                "Preprocessing stopped with an error. Completed cache slices remain resumable."
+            )
+            if self.project_path is not None:
+                save_project(self.project_path, self.manifest)
+        elif self._job_kind == "detection" and self.manifest is not None:
+            self.detection_status.setText(
+                "Detection stopped with an error. Completed specimen checkpoints remain usable."
+            )
+            if self.project_path is not None:
+                save_project(self.project_path, self.manifest)
+        QMessageBox.critical(self, "Operation failed", message)
+
+    @Slot()
+    def _worker_finished(self) -> None:
+        finished_kind = self._job_kind
+        if self._job_worker is not None:
+            self._job_worker.deleteLater()
+        self._job_worker = None
+        self._job_thread = None
+        self._job_kind = None
+        self._set_job_running(False)
+        if finished_kind == "preview" and self._preview_requested_while_busy:
+            self._preview_requested_while_busy = False
+            self._preview_timer.start()
+
+    @Slot(object)
+    def _scan_completed(self, report: ScanReport) -> None:
+        self.report = report
+        self._populate_scan_table(report)
+        warnings = self._report_issue_count(report, "warning")
+        self.summary_label.setText(
+            f"Found {len(report.pairs)} specimen pair(s). "
+            f"Errors: {report.error_count}; warnings: {warnings}. "
+            "Experimental group and specimen labels may be edited before saving."
+        )
+        self.progress_label.setText("Scan complete")
+
+    @staticmethod
+    def _report_issue_count(report: ScanReport, severity: str) -> int:
+        issues = list(report.issues)
+        for pair in report.pairs:
+            issues.extend(pair.issues)
+            for channel_file in pair.channels.values():
+                issues.extend(channel_file.issues)
+        return sum(issue.severity == severity for issue in issues)
+
+    def _populate_scan_table(self, report: ScanReport) -> None:
+        self.table.setRowCount(len(report.pairs))
+        for row, pair in enumerate(report.pairs):
+            issues = list(pair.issues)
+            for channel_file in pair.channels.values():
+                issues.extend(channel_file.issues)
+            issue_text = "; ".join(issue.message for issue in issues)
+            values = [
+                "Ready" if pair.valid else "Error",
+                pair.experimental_group,
+                pair.specimen_id,
+                pair.channels.get("ChanA").filename if "ChanA" in pair.channels else "—",
+                pair.channels.get("ChanB").filename if "ChanB" in pair.channels else "—",
+                pair.shape_text,
+                pair.dtype_text,
+                issue_text,
+            ]
+            for column, value in enumerate(values):
+                editable = column in {1, 2}
+                self._set_table_item(row, column, value, editable=editable)
+            self.table.item(row, 0).setBackground(
+                QColor("#dff3e4") if pair.valid else QColor("#f8d7da")
+            )
+
+    def _set_table_item(self, row: int, column: int, value: str, *, editable: bool = False) -> None:
+        item = QTableWidgetItem(value)
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if editable:
+            flags |= Qt.ItemFlag.ItemIsEditable
+        item.setFlags(flags)
+        self.table.setItem(row, column, item)
+
+    def _sync_scan_edits(self) -> None:
+        if self.report is None:
+            return
+        for row, pair in enumerate(self.report.pairs):
+            group = self.table.item(row, 1).text().strip()
+            specimen = self.table.item(row, 2).text().strip()
+            if not group or not specimen:
+                raise ValueError("Experimental group and specimen labels cannot be empty.")
+            pair.experimental_group = group
+            pair.specimen_id = specimen
+
+    def _sync_manifest_edits(self) -> None:
+        if self.manifest is None:
+            return
+        if not self.output_edit.text().strip():
+            raise ValueError("Select an output folder.")
+        seen: set[tuple[str, str]] = set()
+        for row, specimen_data in enumerate(self.manifest["specimens"]):
+            group = self.table.item(row, 1).text().strip()
+            specimen = self.table.item(row, 2).text().strip()
+            if not group or not specimen:
+                raise ValueError("Experimental group and specimen labels cannot be empty.")
+            key = (group.casefold(), specimen.casefold())
+            if key in seen:
+                raise ValueError(f"Duplicate group/specimen label: {group} / {specimen}")
+            seen.add(key)
+            specimen_data["experimental_group"] = group
+            specimen_data["specimen_id"] = specimen
+        self.manifest["source_directory"] = self.source_edit.text().strip()
+        self.manifest["output_directory"] = str(Path(self.output_edit.text().strip()).resolve())
+        self.manifest["channel_roles"] = self._current_roles()
+        self.manifest["calibration"] = self._current_calibration().to_dict()
+
+    def _current_roles(self) -> dict[str, str]:
+        roles = {
+            "ChanA": str(self.channel_a_role.currentData()),
+            "ChanB": str(self.channel_b_role.currentData()),
+        }
+        if len(set(roles.values())) != 2:
+            raise ValueError("ChanA and ChanB must have different roles.")
+        return roles
+
+    def _save_project(self) -> None:
+        try:
+            if self.report is not None:
+                self._sync_scan_edits()
+                output = Path(self.output_edit.text().strip())
+                if not self.output_edit.text().strip():
+                    raise ValueError("Select an output folder.")
+                manifest = create_project_manifest(
+                    self.report,
+                    output_directory=output,
+                    channel_roles=self._current_roles(),
+                    calibration=self._current_calibration(),
+                )
+                if self.project_path is None:
+                    safe_prefix = re.sub(r"[^A-Za-z0-9._-]+", "-", str(manifest["batch_prefix"])).strip("-")
+                    suggested = output / f"{safe_prefix or 'batch'}.synpo.json"
+                    selected, _ = QFileDialog.getSaveFileName(
+                        self,
+                        "Save Synpo project",
+                        str(suggested),
+                        "Synpo project (*.synpo.json)",
+                    )
+                    if not selected:
+                        return
+                    self.project_path = Path(selected)
+                self.manifest = manifest
+                self.report = None
+            elif self.manifest is not None:
+                self._sync_manifest_edits()
+            else:
+                raise ValueError("Scan a batch or open a project before saving.")
+
+            if self.project_path is None:
+                raise ValueError("No project filename was selected.")
+            self.project_path = save_project(self.project_path, self.manifest)
+            self._prepare_preprocessing_tab()
+            self._prepare_detection_tab()
+            self.statusBar().showMessage(f"Saved {self.project_path}", 8000)
+            self.setWindowTitle(f"Synpo Microscopy Processor — {self.project_path.name}")
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot save project", str(exc))
+
+    def _open_project(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Synpo project",
+            "",
+            "Synpo project (*.synpo.json);;JSON files (*.json)",
+        )
+        if not selected:
+            return
+        try:
+            manifest = load_project(selected)
+            quick_results = verify_project_sources(manifest, full_checksums=False)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Cannot open project", str(exc))
+            return
+        self.report = None
+        self.manifest = manifest
+        self.project_path = Path(selected).resolve()
+        self._populate_manifest(manifest)
+        self._prepare_preprocessing_tab()
+        self._prepare_detection_tab()
+        missing = sum(item["status"] != "ok" for item in quick_results)
+        if missing:
+            self.summary_label.setText(
+                f"Project opened, but {missing} source file(s) are missing or changed. "
+                "Use Project → Relink source folder."
+            )
+        else:
+            self.summary_label.setText(
+                "Project opened. Source filenames and sizes match; use Verify sources "
+                "for full SHA-256 verification."
+            )
+        self.setWindowTitle(f"Synpo Microscopy Processor — {self.project_path.name}")
+
+    def _populate_manifest(self, manifest: dict[str, object]) -> None:
+        self.source_edit.setText(str(manifest["source_directory"]))
+        self.output_edit.setText(str(manifest["output_directory"]))
+        roles = manifest["channel_roles"]
+        self.channel_a_role.setCurrentIndex(self.channel_a_role.findData(roles["ChanA"]))
+        self.channel_b_role.setCurrentIndex(self.channel_b_role.findData(roles["ChanB"]))
+        calibration = Calibration.from_dict(manifest["calibration"])
+        self.preset_combo.setCurrentText(calibration.preset_name)
+        self.xy_spin.setValue(calibration.xy_um_per_pixel)
+        self.z_spin.setValue(calibration.z_step_um)
+
+        specimens = manifest["specimens"]
+        self.table.setRowCount(len(specimens))
+        for row, specimen in enumerate(specimens):
+            channel_a = specimen["channels"]["ChanA"]
+            channel_b = specimen["channels"]["ChanB"]
+            metadata_a = channel_a["metadata"]
+            metadata_b = channel_b["metadata"]
+            same_shape = metadata_a["shape"] == metadata_b["shape"]
+            values = [
+                "Saved",
+                specimen["experimental_group"],
+                specimen["specimen_id"],
+                channel_a["filename"],
+                channel_b["filename"],
+                " × ".join(str(value) for value in metadata_a["shape"]) if same_shape else "mismatch",
+                metadata_a["dtype"],
+                "",
+            ]
+            for column, value in enumerate(values):
+                self._set_table_item(row, column, str(value), editable=column in {1, 2})
+
+    def _verify_sources(self) -> None:
+        if self.manifest is None:
+            QMessageBox.information(self, "No project", "Open or save a project first.")
+            return
+        worker = VerifyWorker(
+            self.manifest,
+            Path(str(self.manifest["source_directory"])),
+            False,
+        )
+        worker.completed.connect(lambda results: self._verification_completed(results, False))
+        self._start_worker(worker, "verify")
+
+    def _relink_sources(self) -> None:
+        if self.manifest is None:
+            QMessageBox.information(self, "No project", "Open or save a project first.")
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select the relocated TIFF folder", str(self.manifest["source_directory"])
+        )
+        if not directory:
+            return
+        worker = VerifyWorker(self.manifest, Path(directory), True)
+        worker.completed.connect(lambda results: self._verification_completed(results, True))
+        self._start_worker(worker, "relink")
+
+    @Slot(object)
+    def _verification_completed(self, results: list[dict[str, str]], relink: bool) -> None:
+        failures = [item for item in results if item["status"] != "ok"]
+        if failures:
+            details = "\n".join(
+                f"{item['filename']}: {item['detail']}" for item in failures[:12]
+            )
+            if len(failures) > 12:
+                details += f"\n…and {len(failures) - 12} more"
+            QMessageBox.warning(
+                self,
+                "Source verification failed",
+                f"{len(failures)} of {len(results)} file(s) did not match.\n\n{details}",
+            )
+        else:
+            if relink:
+                self.source_edit.setText(str(self.manifest["source_directory"]))
+                if self.project_path is not None:
+                    save_project(self.project_path, self.manifest)
+                message = "All checksums match. The project source folder was relinked and saved."
+            else:
+                message = "All source files passed full SHA-256 verification."
+            QMessageBox.information(self, "Source verification", message)
+        self.progress_label.setText("Verification complete")
+
+    def _new_batch(self) -> None:
+        if self._job_thread is not None:
+            return
+        self.report = None
+        self.manifest = None
+        self.project_path = None
+        self._last_preview = None
+        self._preview_statistics.clear()
+        self.tabs.setTabEnabled(1, False)
+        self.tabs.setTabEnabled(2, False)
+        self.source_edit.clear()
+        self.output_edit.clear()
+        self.table.setRowCount(0)
+        self.summary_label.setText("Select a folder and scan it to begin.")
+        self.setWindowTitle("Synpo Microscopy Processor — Stage 3")
+
+    def _set_job_running(self, running: bool) -> None:
+        self.progress_bar.setVisible(running)
+        for widget in (self.scan_button, self.save_button):
+            widget.setEnabled(not running)
+        for action in (
+            self.new_action,
+            self.open_action,
+            self.save_action,
+            self.verify_action,
+            self.relink_action,
+        ):
+            action.setEnabled(not running)
+        if hasattr(self, "run_preprocessing_button"):
+            self.run_preprocessing_button.setEnabled(not running and self.manifest is not None)
+            self.apply_preprocessing_button.setEnabled(not running and self.manifest is not None)
+            self.cancel_preprocessing_button.setEnabled(
+                running and self._job_kind == "preprocess"
+            )
+        if hasattr(self, "run_detection_button"):
+            eligible = bool(
+                self.manifest
+                and any(
+                    specimen["checkpoints"]["preprocessing"].get("state")
+                    == "complete"
+                    for specimen in self.manifest["specimens"]
+                )
+            )
+            self.run_detection_button.setEnabled(not running and eligible)
+            self.apply_detection_button.setEnabled(
+                not running and self.manifest is not None
+            )
+            self.cancel_detection_button.setEnabled(
+                running and self._job_kind == "detection"
+            )
+        if not running and not self.progress_label.text():
+            self.progress_label.setText("Ready")
+
+
+def main() -> int:
+    application = QApplication(sys.argv)
+    application.setApplicationName("Synpo Microscopy Processor")
+    application.setOrganizationName("Synpo")
+    window = MainWindow()
+    window.show()
+    return application.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
