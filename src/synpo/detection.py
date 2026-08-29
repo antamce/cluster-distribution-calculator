@@ -670,6 +670,10 @@ def detect_project(
                 "summary": summary.to_dict(),
             }
         )
+        if not summary.skipped:
+            specimen["checkpoints"].setdefault("measurements", {}).update(
+                {"state": "not_started", "updated_at": time.time()}
+            )
         save_project(project_path, manifest)
         summaries.append(summary.to_dict())
         if summary.skipped and progress:

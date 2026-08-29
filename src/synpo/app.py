@@ -78,6 +78,14 @@ from .visualization import (
     context_signature,
     generate_context_volume,
 )
+from .measurements import (
+    ClusterTrimPreview,
+    MeasurementSettings,
+    cluster_end_comparison_rows,
+    load_cluster_trim_preview,
+    load_measurement_result,
+    measure_project,
+)
 
 
 ROLE_LABELS = {
@@ -1247,6 +1255,71 @@ class DetectionWorker(QObject):
         self.completed.emit(result)
 
 
+class MeasurementWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal(str)
+
+    def __init__(self, manifest: dict[str, object], project_path: Path) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        self.cancel_event = Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = measure_project(
+                self.manifest,
+                self.project_path,
+                progress=lambda phase, current, total, detail: self.progress.emit(
+                    phase, current, total, detail
+                ),
+                cancel_event=self.cancel_event,
+            )
+        except ProcessingCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
+class ClusterTrimPreviewWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self, manifest: dict[str, object], specimen_index: int, cluster_id: int
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.specimen_index = specimen_index
+        self.cluster_id = cluster_id
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            preview = load_cluster_trim_preview(
+                self.manifest,
+                self.specimen_index,
+                self.cluster_id,
+                progress=lambda phase, current, total, detail: self.progress.emit(
+                    phase, current, total, detail
+                ),
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(preview)
+
+
 class ReviewWorker(QObject):
     progress = Signal(str, int, int, str)
     completed = Signal(object)
@@ -1406,7 +1479,7 @@ class VerifyWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Synpo Microscopy Processor — Stage 4")
+        self.setWindowTitle("Synpo Microscopy Processor — Stage 5")
         self.resize(1380, 860)
 
         self.report: ScanReport | None = None
@@ -1420,6 +1493,7 @@ class MainWindow(QMainWindow):
         self._last_detection: DetectionSlice | None = None
         self._last_review: ReviewSlice | None = None
         self._last_review_context: ContextVolume | None = None
+        self._last_trim_preview: ClusterTrimPreview | None = None
         self._review_thread: QThread | None = None
         self._review_worker: ReviewWorker | None = None
         self._review_refresh_pending = False
@@ -1564,9 +1638,11 @@ class MainWindow(QMainWindow):
         self._build_preprocessing_tab()
         self._build_detection_tab()
         self._build_review_tab()
+        self._build_measurements_tab()
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
+        self.tabs.setTabEnabled(4, False)
         self.setCentralWidget(central)
 
     def _build_preprocessing_tab(self) -> None:
@@ -2108,6 +2184,157 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, "4. Review and correction")
         self._review_tool_changed()
 
+    def _build_measurements_tab(self) -> None:
+        tab = QWidget()
+        outer = QHBoxLayout(tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        outer.addWidget(splitter)
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        side_scroll.setMinimumWidth(390)
+        side_scroll.setMaximumWidth(500)
+        side_panel = QWidget()
+        side_layout = QVBoxLayout(side_panel)
+
+        settings_group = QGroupBox("Association and volume settings")
+        settings_form = QFormLayout(settings_group)
+        settings_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.measurement_overlap = QDoubleSpinBox()
+        self.measurement_overlap.setRange(0.0, 100.0)
+        self.measurement_overlap.setDecimals(1)
+        self.measurement_overlap.setValue(80.0)
+        self.measurement_overlap.setSuffix("%")
+        self.measurement_overlap.setToolTip(
+            "Minimum fraction of a retained cluster that must overlap one spine."
+        )
+        settings_form.addRow("Minimum cluster/spine overlap:", self.measurement_overlap)
+        self.measurement_end_method = QComboBox()
+        self.measurement_end_method.addItem("No end trimming", "untrimmed")
+        self.measurement_end_method.addItem(
+            "Fixed slices from larger terminal end", "fixed"
+        )
+        self.measurement_end_method.addItem(
+            "Adaptive oversized terminal slices", "adaptive"
+        )
+        self.measurement_end_method.currentIndexChanged.connect(
+            self._measurement_method_changed
+        )
+        settings_form.addRow("Blurry cluster-end method:", self.measurement_end_method)
+        self.measurement_fixed_slices = QSpinBox()
+        self.measurement_fixed_slices.setRange(0, 20)
+        self.measurement_fixed_slices.setValue(3)
+        self.measurement_fixed_slices.setSuffix(" slices")
+        settings_form.addRow("Fixed slices removed:", self.measurement_fixed_slices)
+        self.measurement_area_factor = QDoubleSpinBox()
+        self.measurement_area_factor.setRange(1.0, 10.0)
+        self.measurement_area_factor.setDecimals(2)
+        self.measurement_area_factor.setSingleStep(0.1)
+        self.measurement_area_factor.setValue(1.8)
+        self.measurement_area_factor.setSuffix("× stable area")
+        settings_form.addRow("Adaptive oversized threshold:", self.measurement_area_factor)
+        self.measurement_min_slices = QSpinBox()
+        self.measurement_min_slices.setRange(1, 20)
+        self.measurement_min_slices.setValue(2)
+        self.measurement_min_slices.setSuffix(" slices")
+        settings_form.addRow("Always retain at least:", self.measurement_min_slices)
+        self.save_measurement_settings_button = QPushButton(
+            "Save these measurement settings"
+        )
+        self.save_measurement_settings_button.clicked.connect(
+            self._save_measurement_settings
+        )
+        settings_form.addRow(self.save_measurement_settings_button)
+        side_layout.addWidget(settings_group)
+
+        run_group = QGroupBox("Batch measurement")
+        run_layout = QVBoxLayout(run_group)
+        self.measurement_status = QLabel(
+            "Detected specimens can be measured with automatic or corrected masks."
+        )
+        self.measurement_status.setWordWrap(True)
+        run_layout.addWidget(self.measurement_status)
+        self.run_measurements_button = QPushButton(
+            "Calculate measurements for entire batch / resume"
+        )
+        self.run_measurements_button.setMinimumHeight(38)
+        self.run_measurements_button.clicked.connect(self._run_measurements)
+        run_layout.addWidget(self.run_measurements_button)
+        self.cancel_measurements_button = QPushButton(
+            "Cancel safely after the current slice"
+        )
+        self.cancel_measurements_button.clicked.connect(self._cancel_measurements)
+        self.cancel_measurements_button.setEnabled(False)
+        run_layout.addWidget(self.cancel_measurements_button)
+        side_layout.addWidget(run_group)
+
+        inspect_group = QGroupBox("Inspect saved measurements")
+        inspect_form = QFormLayout(inspect_group)
+        self.measurement_specimen = QComboBox()
+        self.measurement_specimen.currentIndexChanged.connect(
+            self._measurement_specimen_changed
+        )
+        inspect_form.addRow("Specimen:", self.measurement_specimen)
+        self.measurement_table_level = QComboBox()
+        self.measurement_table_level.addItem("Specimen", "specimen_rows")
+        self.measurement_table_level.addItem("Dendrites", "dendrite_rows")
+        self.measurement_table_level.addItem("Spines", "spine_rows")
+        self.measurement_table_level.addItem("Clusters and spine sums", "cluster_rows")
+        self.measurement_table_level.addItem(
+            "Compare cluster-end methods", "cluster_end_comparison"
+        )
+        self.measurement_table_level.currentIndexChanged.connect(
+            self._populate_measurement_table
+        )
+        inspect_form.addRow("Table:", self.measurement_table_level)
+        self.measurement_cluster = QComboBox()
+        inspect_form.addRow("Cluster illustration:", self.measurement_cluster)
+        self.load_trim_preview_button = QPushButton(
+            "Show counted and discarded voxels"
+        )
+        self.load_trim_preview_button.clicked.connect(self._load_trim_preview)
+        inspect_form.addRow(self.load_trim_preview_button)
+        side_layout.addWidget(inspect_group)
+
+        pending = QLabel(
+            "Protein-distribution fields are retained as pending values until their "
+            "scientific definition is approved. No statistical tests are performed."
+        )
+        pending.setWordWrap(True)
+        side_layout.addWidget(pending)
+        side_layout.addStretch(1)
+        side_scroll.setWidget(side_panel)
+        splitter.addWidget(side_scroll)
+
+        result_panel = QWidget()
+        result_layout = QVBoxLayout(result_panel)
+        self.measurement_summary = QLabel("No saved measurement result selected.")
+        self.measurement_summary.setWordWrap(True)
+        result_layout.addWidget(self.measurement_summary)
+        self.measurement_table = QTableWidget(0, 0)
+        self.measurement_table.setAlternatingRowColors(True)
+        self.measurement_table.verticalHeader().setVisible(False)
+        result_layout.addWidget(self.measurement_table, 1)
+        self.trim_preview_label = QLabel(
+            "Cluster-end illustration: green voxels are counted; magenta voxels are discarded."
+        )
+        self.trim_preview_label.setWordWrap(True)
+        result_layout.addWidget(self.trim_preview_label)
+        self.trim_preview_view = SliceView(
+            "Run measurements, select a cluster, then generate its voxel illustration"
+        )
+        self.trim_preview_view.setMinimumSize(420, 300)
+        result_layout.addWidget(self.trim_preview_view, 1)
+        splitter.addWidget(result_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([430, 950])
+        self.tabs.addTab(tab, "5. Measurements")
+        self._measurement_method_changed()
+
     def _role_combo(self, selected: str) -> QComboBox:
         combo = QComboBox()
         for value, label in ROLE_LABELS.items():
@@ -2438,6 +2665,7 @@ class MainWindow(QMainWindow):
         self._prepare_preprocessing_tab()
         self._prepare_detection_tab()
         self._prepare_review_tab()
+        self._prepare_measurements_tab()
 
     @Slot(str)
     def _batch_preprocessing_cancelled(self, message: str) -> None:
@@ -2579,6 +2807,7 @@ class MainWindow(QMainWindow):
         if self.detection_specimen.currentData() == specimen_index:
             self._detection_specimen_changed()
         self._prepare_review_tab()
+        self._prepare_measurements_tab()
 
     @Slot(object)
     def _detection_completed(self, result: dict[str, object]) -> None:
@@ -2588,6 +2817,7 @@ class MainWindow(QMainWindow):
         )
         self._prepare_detection_tab()
         self._prepare_review_tab()
+        self._prepare_measurements_tab()
 
     @Slot(str)
     def _detection_cancelled(self, message: str) -> None:
@@ -2724,6 +2954,249 @@ class MainWindow(QMainWindow):
             self._last_review = None
             self.review_view.setText("Waiting for automatic detection to finish a specimen.")
         self._set_review_busy(self._review_thread is not None)
+
+    def _current_measurement_settings(self) -> MeasurementSettings:
+        return MeasurementSettings(
+            minimum_cluster_spine_overlap_percent=self.measurement_overlap.value(),
+            cluster_end_method=str(self.measurement_end_method.currentData()),  # type: ignore[arg-type]
+            fixed_end_slices=self.measurement_fixed_slices.value(),
+            adaptive_area_factor=self.measurement_area_factor.value(),
+            minimum_retained_slices=self.measurement_min_slices.value(),
+        )
+
+    def _measurement_method_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        method = self.measurement_end_method.currentData()
+        self.measurement_fixed_slices.setEnabled(method == "fixed")
+        self.measurement_area_factor.setEnabled(method == "adaptive")
+
+    def _prepare_measurements_tab(self) -> None:
+        if self.manifest is None:
+            self.tabs.setTabEnabled(4, False)
+            return
+        detected = [
+            index
+            for index, specimen in enumerate(self.manifest["specimens"])
+            if specimen["checkpoints"]["detection"].get("state") == "complete"
+        ]
+        self.tabs.setTabEnabled(4, bool(detected))
+        settings = MeasurementSettings.from_dict(
+            self.manifest["measurements"]["settings"]
+        )
+        controls = (
+            self.measurement_overlap,
+            self.measurement_fixed_slices,
+            self.measurement_area_factor,
+            self.measurement_min_slices,
+        )
+        for control in controls:
+            control.blockSignals(True)
+        self.measurement_end_method.blockSignals(True)
+        self.measurement_overlap.setValue(
+            settings.minimum_cluster_spine_overlap_percent
+        )
+        self.measurement_end_method.setCurrentIndex(
+            self.measurement_end_method.findData(settings.cluster_end_method)
+        )
+        self.measurement_fixed_slices.setValue(settings.fixed_end_slices)
+        self.measurement_area_factor.setValue(settings.adaptive_area_factor)
+        self.measurement_min_slices.setValue(settings.minimum_retained_slices)
+        self.measurement_end_method.blockSignals(False)
+        for control in controls:
+            control.blockSignals(False)
+        self._measurement_method_changed()
+
+        current = self.measurement_specimen.currentData()
+        self.measurement_specimen.blockSignals(True)
+        self.measurement_specimen.clear()
+        complete = 0
+        for index in detected:
+            specimen = self.manifest["specimens"][index]
+            checkpoint = specimen["checkpoints"].get("measurements", {})
+            state = str(checkpoint.get("state", "not_started"))
+            complete += state == "complete"
+            self.measurement_specimen.addItem(
+                f"{specimen['experimental_group']} — {specimen['specimen_id']} [{state}]",
+                index,
+            )
+        if current is not None:
+            found = self.measurement_specimen.findData(current)
+            self.measurement_specimen.setCurrentIndex(max(0, found))
+        self.measurement_specimen.blockSignals(False)
+        self.measurement_status.setText(
+            f"{len(detected)} detected specimen(s); {complete} measurement checkpoint(s) complete."
+        )
+        if detected:
+            self._measurement_specimen_changed()
+
+    def _save_measurement_settings(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        try:
+            settings = self._current_measurement_settings()
+            self.manifest["measurements"]["settings"] = settings.to_dict()
+            for specimen in self.manifest["specimens"]:
+                checkpoint = specimen["checkpoints"].setdefault("measurements", {})
+                checkpoint["state"] = "not_started"
+            save_project(self.project_path, self.manifest)
+            self._prepare_measurements_tab()
+            self.measurement_status.setText(
+                "Measurement settings saved. Existing results will be recomputed or resumed by signature."
+            )
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot save measurement settings", str(exc))
+
+    def _run_measurements(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        try:
+            settings = self._current_measurement_settings()
+            self.manifest["measurements"]["settings"] = settings.to_dict()
+            save_project(self.project_path, self.manifest)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot start measurements", str(exc))
+            return
+        worker = MeasurementWorker(self.manifest, self.project_path)
+        worker.completed.connect(self._measurements_completed)
+        worker.cancelled.connect(self._measurements_cancelled)
+        self._start_worker(worker, "measurements")
+
+    def _cancel_measurements(self) -> None:
+        if isinstance(self._job_worker, MeasurementWorker):
+            self._job_worker.cancel()
+            self.measurement_status.setText(
+                "Cancellation requested; finishing the current safe slice."
+            )
+
+    @Slot(object)
+    def _measurements_completed(self, result: dict[str, object]) -> None:
+        summaries = result.get("summaries", [])
+        self.measurement_status.setText(
+            f"Measurement batch complete: {len(summaries)} specimen checkpoint(s) ready."
+        )
+        self._prepare_measurements_tab()
+
+    @Slot(str)
+    def _measurements_cancelled(self, message: str) -> None:
+        self.measurement_status.setText(message)
+        if self.manifest is not None and self.project_path is not None:
+            save_project(self.project_path, self.manifest)
+        self._prepare_measurements_tab()
+
+    def _measurement_specimen_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self._last_trim_preview = None
+        self.measurement_cluster.clear()
+        value = self.measurement_specimen.currentData()
+        if self.manifest is None or value is None:
+            return
+        specimen_index = int(value)
+        checkpoint = self.manifest["specimens"][specimen_index]["checkpoints"].get(
+            "measurements", {}
+        )
+        if checkpoint.get("state") != "complete":
+            self.measurement_summary.setText(
+                "This specimen has not been measured with the current saved settings."
+            )
+            self.measurement_table.setRowCount(0)
+            self.measurement_table.setColumnCount(0)
+            return
+        try:
+            result = load_measurement_result(self.manifest, specimen_index)
+        except (OSError, ValueError, KeyError) as exc:
+            self.measurement_summary.setText(f"Cannot load measurements: {exc}")
+            return
+        specimen_row = result["specimen_rows"][0]
+        source = "corrected" if result.get("corrected_masks") else "automatic"
+        self.measurement_summary.setText(
+            f"{specimen_row['dendrite_count']} dendrite(s), "
+            f"{specimen_row['spine_count']} spine(s), "
+            f"{specimen_row['included_cluster_count']} included cluster(s) | "
+            f"{source} masks | overlap threshold "
+            f"{result['settings']['minimum_cluster_spine_overlap_percent']:.1f}%."
+        )
+        for cluster_id, details in result.get("cluster_trim_details", {}).items():
+            self.measurement_cluster.addItem(
+                f"Cluster {cluster_id}: {len(details.get('discarded_z_slices', []))} discarded Z slice(s)",
+                int(cluster_id),
+            )
+        self._populate_measurement_table()
+
+    def _populate_measurement_table(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.measurement_specimen.currentData() is None:
+            return
+        specimen_index = int(self.measurement_specimen.currentData())
+        try:
+            result = load_measurement_result(self.manifest, specimen_index)
+        except (OSError, ValueError, KeyError):
+            return
+        key = str(self.measurement_table_level.currentData())
+        rows = (
+            cluster_end_comparison_rows(result)
+            if key == "cluster_end_comparison"
+            else list(result.get(key, []))
+        )
+        columns = list(rows[0].keys()) if rows else []
+        self.measurement_table.setColumnCount(len(columns))
+        self.measurement_table.setHorizontalHeaderLabels(
+            [column.replace("_", " ") for column in columns]
+        )
+        self.measurement_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for column_index, column in enumerate(columns):
+                value = row.get(column)
+                if value is None:
+                    text_value = "pending" if "distribution" in column else "—"
+                elif isinstance(value, bool):
+                    text_value = "yes" if value else "no"
+                elif isinstance(value, float):
+                    text_value = f"{value:.6g}"
+                elif isinstance(value, list):
+                    text_value = ", ".join(str(item + 1) for item in value) or "none"
+                else:
+                    text_value = str(value)
+                self.measurement_table.setItem(
+                    row_index, column_index, QTableWidgetItem(text_value)
+                )
+        header = self.measurement_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+
+    def _load_trim_preview(self) -> None:
+        if (
+            self.manifest is None
+            or self.measurement_specimen.currentData() is None
+            or self.measurement_cluster.currentData() is None
+        ):
+            QMessageBox.information(
+                self, "No cluster selected", "Select a measured specimen and cluster first."
+            )
+            return
+        worker = ClusterTrimPreviewWorker(
+            self.manifest,
+            int(self.measurement_specimen.currentData()),
+            int(self.measurement_cluster.currentData()),
+        )
+        worker.completed.connect(self._trim_preview_completed)
+        self._start_worker(worker, "trim_preview")
+
+    @Slot(object)
+    def _trim_preview_completed(self, preview: ClusterTrimPreview) -> None:
+        self._last_trim_preview = preview
+        low, high = np.percentile(preview.raw_projection, (0.5, 99.8))
+        black = int(max(0, min(65534, round(float(low)))))
+        white = int(max(black + 1, min(65535, round(float(high)))))
+        self.trim_preview_view.show_detection(
+            preview.raw_projection,
+            black,
+            white,
+            dendrites=preview.counted_projection,
+            spines=None,
+            clusters=preview.discarded_projection,
+        )
+        retained = ", ".join(str(value + 1) for value in preview.retained_z_slices)
+        discarded = ", ".join(str(value + 1) for value in preview.discarded_z_slices)
+        self.trim_preview_label.setText(
+            f"Cluster {preview.cluster_id}: green = counted voxels (Z {retained or 'none'}); "
+            f"magenta = discarded terminal voxels (Z {discarded or 'none'})."
+        )
 
     def _selected_review_specimen(self) -> int:
         value = self.review_specimen.currentData()
@@ -3036,6 +3509,7 @@ class MainWindow(QMainWindow):
             self._prepare_review_tab()
         else:
             self._refresh_review_specimen_label()
+        self._prepare_measurements_tab()
 
     def _set_review_busy(self, busy: bool) -> None:
         has_specimen = self.review_specimen.count() > 0
@@ -3426,6 +3900,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
+        self.tabs.setTabEnabled(4, False)
         worker = ScanWorker(directory)
         worker.completed.connect(self._scan_completed)
         self._start_worker(worker, "scan")
@@ -3441,7 +3916,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._job_failed)
         worker.failed.connect(thread.quit)
         worker.completed.connect(thread.quit)
-        if isinstance(worker, (BatchPreprocessWorker, DetectionWorker)):
+        if isinstance(worker, (BatchPreprocessWorker, DetectionWorker, MeasurementWorker)):
             worker.cancelled.connect(thread.quit)
         thread.finished.connect(self._worker_finished)
         thread.finished.connect(thread.deleteLater)
@@ -3471,6 +3946,10 @@ class MainWindow(QMainWindow):
             )
             if self.project_path is not None:
                 save_project(self.project_path, self.manifest)
+        elif self._job_kind in {"measurements", "trim_preview"}:
+            self.measurement_status.setText(
+                "Measurement operation stopped with an error; completed checkpoints remain usable."
+            )
         QMessageBox.critical(self, "Operation failed", message)
 
     @Slot()
@@ -3624,6 +4103,7 @@ class MainWindow(QMainWindow):
             self._prepare_preprocessing_tab()
             self._prepare_detection_tab()
             self._prepare_review_tab()
+            self._prepare_measurements_tab()
             self.statusBar().showMessage(f"Saved {self.project_path}", 8000)
             self.setWindowTitle(f"Synpo Microscopy Processor — {self.project_path.name}")
         except (ValueError, OSError) as exc:
@@ -3659,6 +4139,7 @@ class MainWindow(QMainWindow):
         self._prepare_preprocessing_tab()
         self._prepare_detection_tab()
         self._prepare_review_tab()
+        self._prepare_measurements_tab()
         missing = sum(item["status"] != "ok" for item in quick_results)
         if missing:
             self.summary_label.setText(
@@ -3774,11 +4255,12 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
+        self.tabs.setTabEnabled(4, False)
         self.source_edit.clear()
         self.output_edit.clear()
         self.table.setRowCount(0)
         self.summary_label.setText("Select a folder and scan it to begin.")
-        self.setWindowTitle("Synpo Microscopy Processor — Stage 4")
+        self.setWindowTitle("Synpo Microscopy Processor — Stage 5")
 
     def _set_job_running(self, running: bool) -> None:
         self.progress_bar.setVisible(running)
@@ -3813,6 +4295,23 @@ class MainWindow(QMainWindow):
             )
             self.cancel_detection_button.setEnabled(
                 running and self._job_kind == "detection"
+            )
+        if hasattr(self, "run_measurements_button"):
+            eligible = bool(
+                self.manifest
+                and any(
+                    specimen["checkpoints"]["detection"].get("state")
+                    == "complete"
+                    for specimen in self.manifest["specimens"]
+                )
+            )
+            self.run_measurements_button.setEnabled(not running and eligible)
+            self.save_measurement_settings_button.setEnabled(
+                not running and self.manifest is not None
+            )
+            self.load_trim_preview_button.setEnabled(not running and eligible)
+            self.cancel_measurements_button.setEnabled(
+                running and self._job_kind == "measurements"
             )
         if not running and not self.progress_label.text():
             self.progress_label.setText("Ready")

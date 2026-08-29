@@ -7,8 +7,8 @@ review. Raw TIFFs are never modified or copied.
 
 ## Current project status
 
-The current version is `0.4.0`. Stages 1–4 are user-approved. Stage 4 interactive
-review, local resegmentation, and 3D visualization are complete. See
+The current version is `0.5.0`. Stages 1–4 are user-approved. Stage 5 measurements
+and spine/cluster association are implemented and ready for user testing. See
 [HANDOFF.md](HANDOFF.md) for architecture, scientific constraints, benchmarks, and
 the remaining roadmap.
 
@@ -153,7 +153,7 @@ different settings, stale corrections are ignored and the specimen returns to th
 review queue.
 
 Projection/3D generation streams one Z slice at a time, enforces the 80% RAM
-ceiling, and limits the interactive rendering to 60,000 sampled surface points
+ceiling, and adaptively limits the interactive rendering to 60,000 surface faces
 inside the selected rectangle. The projection window can independently hide
 dendrites, spines, or clusters. The 3D tab has independent color pickers for all
 three object classes plus a reset button, and the chosen publication colors are
@@ -165,6 +165,28 @@ default to 75%, spines to 60%, and protein clusters remain fixed at 100% opacity
 The Qt renderer performs its rotations with bounded element-wise array operations;
 it does not call a native BLAS matrix routine from the paint event. This avoids a
 Windows DLL delay-load failure observed on the development laptop.
+
+## Stage 5: association and measurements
+
+Open **5. Measurements** after automatic detection. Corrected dendrite/spine masks
+are used when a compatible review checkpoint exists; otherwise the immutable
+automatic masks are measured. The configurable minimum cluster/spine overlap is
+80% by default. Each cluster is assigned to the spine with its greatest overlap,
+and only the overlapping portion contributes to cluster volume.
+
+Cluster-end volume can be left untrimmed, trimmed by a fixed number of slices from
+the larger terminal end, or trimmed adaptively when consecutive terminal slice
+areas exceed the stable-area threshold. The comparison table reports candidate
+volumes from fixed and adaptive approaches side by side. For the saved method, the
+cluster illustration overlays counted voxels in green and discarded terminal
+voxels in magenta on the original 16-bit protein-channel maximum projection.
+
+The resumable batch produces compressed per-specimen raw rows for specimens,
+dendrites, spines, individual included clusters, and per-spine cluster sums.
+Current metrics include calibrated volumes, approximate skeleton length, spine
+density, inclusion percentage, and summed cluster/spine volume ratios. Protein
+distribution columns are deliberately marked pending until their scientific
+definition is approved. Final workbook/CSV export remains a later stage.
 
 ## Tests and command-line validation
 

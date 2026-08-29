@@ -671,6 +671,9 @@ def apply_review_action(
             "detection_signature": group.attrs["detection_signature"],
         }
     )
+    specimen["checkpoints"].setdefault("measurements", {}).update(
+        {"state": "not_started", "updated_at": time.time()}
+    )
     save_project(project_path, manifest)
     return ReviewResult(
         specimen_index=specimen_index,
@@ -725,6 +728,9 @@ def undo_last_review_action(
     checkpoint = specimen["checkpoints"]["review"]
     checkpoint["updated_at"] = time.time()
     checkpoint["edit_count"] = max(0, int(checkpoint.get("edit_count", 1)) - 1)
+    specimen["checkpoints"].setdefault("measurements", {}).update(
+        {"state": "not_started", "updated_at": time.time()}
+    )
     specimen["review"]["state"] = "in_progress"
     save_project(project_path, manifest)
     return ReviewResult(

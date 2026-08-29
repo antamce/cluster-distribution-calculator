@@ -56,6 +56,19 @@ def default_review_manifest() -> dict[str, object]:
     }
 
 
+def default_measurements_manifest() -> dict[str, object]:
+    return {
+        "algorithm_version": 1,
+        "settings": {
+            "minimum_cluster_spine_overlap_percent": 80.0,
+            "cluster_end_method": "adaptive",
+            "fixed_end_slices": 3,
+            "adaptive_area_factor": 1.8,
+            "minimum_retained_slices": 2,
+        },
+    }
+
+
 def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     """Add newly introduced fields without invalidating Stage 1 projects."""
     application = manifest.setdefault("application", {"name": "Synpo"})
@@ -68,6 +81,7 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     manifest.setdefault("preprocessing", default_preprocessing_manifest())
     manifest.setdefault("detection", default_detection_manifest())
     manifest.setdefault("review_settings", default_review_manifest())
+    manifest.setdefault("measurements", default_measurements_manifest())
     cache = manifest.setdefault("cache", {})
     if cache.get("format") == "pending_stage_2":
         cache["format"] = "zarr-v2-blosc-zstd"
@@ -102,6 +116,15 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
             review_checkpoint.setdefault("state", "not_started")
             review_checkpoint.setdefault("updated_at", None)
             review_checkpoint.setdefault("edit_count", 0)
+        measurement_checkpoint = checkpoints.setdefault("measurements", {})
+        if isinstance(measurement_checkpoint, str):
+            checkpoints["measurements"] = {
+                "state": measurement_checkpoint,
+                "updated_at": None,
+            }
+        else:
+            measurement_checkpoint.setdefault("state", "not_started")
+            measurement_checkpoint.setdefault("updated_at", None)
         review = specimen.setdefault(
             "review", {"state": "needs_attention", "comment": "", "history": []}
         )
@@ -184,6 +207,7 @@ def create_project_manifest(
         "preprocessing": default_preprocessing_manifest(),
         "detection": default_detection_manifest(),
         "review_settings": default_review_manifest(),
+        "measurements": default_measurements_manifest(),
         "cache": {"format": "zarr-v2-blosc-zstd", "path": None, "deletion_eligible": False},
         "specimens": specimens,
     }

@@ -3,7 +3,7 @@
 ## Current state
 
 Synpo is a Python/PySide6 desktop application for paired-channel, registered 3D
-microscopy TIFF stacks. Version `0.4.0` implements:
+microscopy TIFF stacks. Version `0.5.0` implements:
 
 - Stage 1: batch import, filename parsing, pairing, validation, calibration,
   project manifests, fingerprints, reopening, verification, and relinking;
@@ -13,11 +13,14 @@ microscopy TIFF stacks. Version `0.4.0` implements:
 - Stage 4: optional specimen review, drawn hints, local 3D resegmentation,
   add/exclude/split/merge/boundary actions, object flags, undo, and automatic
   per-specimen checkpoints, plus shared orthogonal maxima and rotatable 3D context
-  in both Detection and Review (user-approved).
+  in both Detection and Review (user-approved);
+- Stage 5: resumable spine/cluster association and raw specimen-, dendrite-, spine-,
+  and cluster-level measurement tables, with cluster-end method comparison and a
+  counted/discarded-voxel illustration (awaiting user testing and approval).
 
 All settings and actions except the Z slider are in scrollable side panels. Do not
-skip the staged approval process: let the user test Stage 4 and wait for approval
-before beginning the next stage.
+skip the staged approval process: let the user test Stage 5 and wait for approval
+before beginning export work.
 
 ## Running and testing
 
@@ -40,8 +43,8 @@ $env:PYTHONPATH = (Resolve-Path "src").Path
 conda run -n synpo-microscopy python -m unittest discover -s tests -v
 ```
 
-Current result: 13 tests pass. An offscreen GUI construction smoke test also passes
-with four workflow tabs. The supplied full-resolution pair previously benchmarked
+Current result: 15 tests pass. An offscreen GUI construction smoke test also passes
+with five workflow tabs. The supplied full-resolution pair previously benchmarked
 at 0.18 seconds for preprocessing preview, 6.54 seconds per preprocessed channel,
 and 22.88 seconds for automatic detection. An unchanged detection checkpoint opens
 in about 0.019 seconds.
@@ -67,7 +70,7 @@ in about 0.019 seconds.
 - Preprocessing target: under one minute per channel.
 - Detection target: under three minutes per pair.
 - Long operations keep the UI responsive and show progress or ETA.
-- Preprocessing, detection, and review have automatic per-pair checkpoints.
+- Preprocessing, detection, review, and measurements have automatic per-pair checkpoints.
 - Detection intentionally keeps extra candidates and flags uncertain objects.
 - Fields can contain multiple/crossing dendrites. Cell identity is irrelevant.
   Axons and soma portions must be excludable by hints.
@@ -79,7 +82,7 @@ in about 0.019 seconds.
 
 ## Architecture and storage
 
-- `src/synpo/app.py`: PySide6 application, independent background workers, four
+- `src/synpo/app.py`: PySide6 application, independent background workers, five
   workflow tabs, preview/detection viewers, and drawable review canvas.
 - `src/synpo/importer.py`: filename parsing, TIFF inspection, pairing, fingerprints.
 - `src/synpo/project.py`: schema-1 manifest migration, serialized atomic saves,
@@ -91,10 +94,13 @@ in about 0.019 seconds.
 - `src/synpo/review.py`: editable mask initialization, hint interpretation, local
   correction, object statuses, compressed undo patches, and checkpoints.
 - `src/synpo/visualization.py`: slice-streamed XY/XZ/YZ maximum projections,
-  physical calibration, label projections, bounded 3D surface-point sampling, and
+  physical calibration, label projections, bounded interpolated 3D meshes, and
   visualization RAM checks.
-- `tests/`: importer, project, preprocessing, detection, review, checkpoint,
-  migration, and resume coverage.
+- `src/synpo/measurements.py`: slice-streamed volume counts, cluster-end trimming,
+  80%-default spine association, dendrite/spine assignment, calibrated raw metrics,
+  compressed per-specimen results, resume signatures, and illustration loading.
+- `tests/`: importer, project, preprocessing, detection, review, measurement,
+  checkpoint, migration, and resume coverage.
 
 Keep project manifests at schema version 1 and extend them through
 `migrate_manifest` for backward compatibility.
@@ -103,7 +109,8 @@ Keep project manifests at schema version 1 and extend them through
 <output>/.synpo-cache/<project-id>/
 ├── preprocessed.zarr
 ├── detection.zarr
-└── review.zarr
+├── review.zarr
+└── measurements/
 ```
 
 Automatic and corrected label volumes are separate. Review groups carry the source
@@ -147,29 +154,42 @@ changed detection result. Raw TIFFs are never changed or copied.
   uses element-wise float32 coordinate arithmetic instead. The exact visible
   detection-worker, area-selection, and first-paint workflow passed after this fix.
 
+## Stage 5 behavior
+
+- A cluster is assigned to the single spine with greatest voxel overlap and is
+  included only when retained-cluster overlap meets the configurable threshold
+  (80% default). Only voxels inside that spine contribute to its measured volume.
+- Cluster rows preserve every included individual cluster and add a per-spine sum
+  row. Distribution fields remain explicit null/pending values.
+- End handling offers untrimmed, fixed terminal-slice removal, and adaptive removal
+  of consecutive oversized terminal slices. The larger terminal end is inferred
+  from endpoint areas; at least two slices are retained by default.
+- The comparison table shows fixed versus adaptive candidate volume for every
+  cluster. The illustration uses original uint16 protein intensity, with counted
+  voxels green and discarded voxels magenta.
+- Results are gzip-compressed under the project cache and checkpointed after every
+  specimen. Signatures include masks, settings, and calibration.
+
 ## Pending stages and decisions
 
-After Stage 4 approval, remaining work includes:
+After Stage 5 approval, remaining work includes:
 
-1. Spine/cluster association with configurable minimum overlap, default 80%; first
-   count only the cluster portion inside the spine.
-2. Compare two ways to discard blurry slices at one cluster end and illustrate the
-   voxels counted by the second method.
-3. Metrics:
+1. Confirm the fixed-versus-adaptive cluster-end behavior on representative data.
+2. Confirm the implemented metrics and define protein distribution:
    - spine: volume, cluster presence, summed cluster-volume/spine-volume ratio,
      protein distribution;
    - cluster inside a spine: volume and distribution relative to the spine;
    - dendrite: spine density per µm, mean spine volume, inclusion percentage, mean
      summed inclusion/spine ratio, mean cluster volume, protein distribution;
    - specimen: averages of requested lower-level metrics.
-4. Protein-distribution definitions await user clarification.
-5. Export one Excel workbook with raw specimen/spine/cluster rows, master sheets,
+3. Protein-distribution definitions await user clarification.
+4. Export one Excel workbook with raw specimen/spine/cluster rows, master sheets,
    compact group summaries (counts, means, variability, inclusion percentages),
    CSV copies, reproducible settings/masks, ImageJ ROI ZIPs, and saved snapshots.
-6. Keep cache compressed and temporary; offer deletion only after verified export.
-7. Optionally add an in-app annotation/training utility after the main app. It must
+5. Keep cache compressed and temporary; offer deletion only after verified export.
+6. Optionally add an in-app annotation/training utility after the main app. It must
    not depend on Fiji; the user can provide up to two annotated pairs.
-8. Statistics remain out of scope. Synpo calculates and exports labeled metrics;
+7. Statistics remain out of scope. Synpo calculates and exports labeled metrics;
    statistical analysis occurs elsewhere.
 
 The current target is Windows with Anaconda and a desktop shortcut. Keep the design
