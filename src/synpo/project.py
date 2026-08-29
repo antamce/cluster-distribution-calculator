@@ -5,6 +5,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 
 from . import __version__
 from .importer import fingerprint_file
@@ -12,6 +13,7 @@ from .models import Calibration, ProgressCallback, ScanReport
 
 
 SCHEMA_VERSION = 1
+_PROJECT_SAVE_LOCK = RLock()
 
 
 def default_preprocessing_manifest() -> dict[str, object]:
@@ -45,11 +47,27 @@ def default_detection_manifest() -> dict[str, object]:
     }
 
 
+def default_review_manifest() -> dict[str, object]:
+    return {
+        "algorithm_version": 1,
+        "local_margin_um": 1.0,
+        "z_radius_slices": 2,
+        "maximum_undo_actions": 100,
+    }
+
+
 def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     """Add newly introduced fields without invalidating Stage 1 projects."""
+    application = manifest.setdefault("application", {"name": "Synpo"})
+    application.setdefault(
+        "created_with_version", application.get("version", __version__)
+    )
+    application["name"] = "Synpo"
+    application["version"] = __version__
     manifest.setdefault("resource_policy", {"maximum_ram_fraction": 0.8})
     manifest.setdefault("preprocessing", default_preprocessing_manifest())
     manifest.setdefault("detection", default_detection_manifest())
+    manifest.setdefault("review_settings", default_review_manifest())
     cache = manifest.setdefault("cache", {})
     if cache.get("format") == "pending_stage_2":
         cache["format"] = "zarr-v2-blosc-zstd"
@@ -73,6 +91,28 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
                 "updated_at": None,
             }
         checkpoints.setdefault("review", "not_started")
+        review_checkpoint = checkpoints.get("review", "not_started")
+        if isinstance(review_checkpoint, str):
+            checkpoints["review"] = {
+                "state": review_checkpoint,
+                "updated_at": None,
+                "edit_count": 0,
+            }
+        else:
+            review_checkpoint.setdefault("state", "not_started")
+            review_checkpoint.setdefault("updated_at", None)
+            review_checkpoint.setdefault("edit_count", 0)
+        review = specimen.setdefault(
+            "review", {"state": "needs_attention", "comment": "", "history": []}
+        )
+        review.setdefault("state", "needs_attention")
+        review.setdefault("comment", "")
+        review.setdefault("history", [])
+        object_status = review.setdefault(
+            "object_status", {"dendrite": {}, "spine": {}}
+        )
+        object_status.setdefault("dendrite", {})
+        object_status.setdefault("spine", {})
     return manifest
 
 
@@ -143,6 +183,7 @@ def create_project_manifest(
         "resource_policy": {"maximum_ram_fraction": 0.8},
         "preprocessing": default_preprocessing_manifest(),
         "detection": default_detection_manifest(),
+        "review_settings": default_review_manifest(),
         "cache": {"format": "zarr-v2-blosc-zstd", "path": None, "deletion_eligible": False},
         "specimens": specimens,
     }
@@ -150,16 +191,19 @@ def create_project_manifest(
 
 
 def save_project(path: str | Path, manifest: dict[str, object]) -> Path:
-    migrate_manifest(manifest)
-    destination = Path(path).expanduser().resolve()
-    if destination.suffix.lower() != ".json" or not destination.name.lower().endswith(".synpo.json"):
-        destination = destination.with_name(destination.stem + ".synpo.json")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    manifest["updated_at"] = _utc_now()
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    os.replace(temporary, destination)
-    return destination
+    with _PROJECT_SAVE_LOCK:
+        migrate_manifest(manifest)
+        destination = Path(path).expanduser().resolve()
+        if destination.suffix.lower() != ".json" or not destination.name.lower().endswith(
+            ".synpo.json"
+        ):
+            destination = destination.with_name(destination.stem + ".synpo.json")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        manifest["updated_at"] = _utc_now()
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.replace(temporary, destination)
+        return destination
 
 
 def load_project(path: str | Path) -> dict[str, object]:

@@ -3,20 +3,21 @@
 ## Current state
 
 Synpo is a Python/PySide6 desktop application for paired-channel, registered 3D
-microscopy TIFF stacks. Version `0.3.0` implements and has user approval for:
+microscopy TIFF stacks. Version `0.4.0` implements:
 
 - Stage 1: batch import, filename parsing, pairing, validation, calibration,
   project manifests, fingerprints, reopening, verification, and relinking;
 - Stage 2: adaptive preprocessing previews and resumable compressed batch caching;
 - Stage 3: automatic dendrite-shaft, spine-candidate, and protein-cluster-candidate
-  detection with a slice viewer and colored overlays.
+  detection with a slice viewer and overlays (user-approved);
+- Stage 4: optional specimen review, drawn hints, local 3D resegmentation,
+  add/exclude/split/merge/boundary actions, object flags, undo, and automatic
+  per-specimen checkpoints, plus shared orthogonal maxima and rotatable 3D context
+  in both Detection and Review (user-approved).
 
-The user specifically approved the current detection/segmentation quality. The
-latest UI change places all Automatic Detection settings and actions in a
-scrollable side panel. Only the Z slider remains over the image.
-
-Stage 4 has not started. Do not skip the staged approval process: complete a stage,
-let the user test it, and wait for approval before beginning the next stage.
+All settings and actions except the Z slider are in scrollable side panels. Do not
+skip the staged approval process: let the user test Stage 4 and wait for approval
+before beginning the next stage.
 
 ## Running and testing
 
@@ -24,24 +25,26 @@ The dedicated environment is `synpo-microscopy`; do not modify the user's separa
 `synpo` environment.
 
 ```powershell
-conda env update -f environment.yml --prune
+conda env update -n synpo-microscopy -f environment.yml --prune
 launch_synpo.bat
 ```
 
-The launcher calls the dedicated environment's Python executable directly, so it
-also works when `conda` is absent from `PATH`.
+The launcher locates Miniconda or Anaconda by absolute path and uses `conda run`
+for the dedicated environment, so it works when `conda` is absent from `PATH` and
+sets up native DLL lookup consistently.
 
 Run tests from the repository root:
 
 ```powershell
 $env:PYTHONPATH = (Resolve-Path "src").Path
-& "$env:USERPROFILE\miniconda3\envs\synpo-microscopy\python.exe" -m pytest
+conda run -n synpo-microscopy python -m unittest discover -s tests -v
 ```
 
-Current result: 11 tests pass. The supplied full-resolution pair benchmarked at
-0.18 seconds for preprocessing preview, 6.54 seconds per preprocessed channel, and
-22.88 seconds for automatic detection of the pair. Unchanged detection checkpoints
-reopen in about 0.019 seconds.
+Current result: 13 tests pass. An offscreen GUI construction smoke test also passes
+with four workflow tabs. The supplied full-resolution pair previously benchmarked
+at 0.18 seconds for preprocessing preview, 6.54 seconds per preprocessed channel,
+and 22.88 seconds for automatic detection. An unchanged detection checkpoint opens
+in about 0.019 seconds.
 
 ## Input contract
 
@@ -49,109 +52,125 @@ reopen in about 0.019 seconds.
 - Pair names differ only in `ChanA` versus `ChanB`.
 - Schema:
   `<batch_prefix>_<experimental_group>_<specimen_id>_<ChanA|ChanB>_registered.tif`.
-- A folder uses one filename schema and one channel-role assignment.
-- The supplied data use ChanA for protein clusters and ChanB for dendrites/spines.
-- Typical data are uint16, 2048 × 2048, and 40–100 Z slices, with about 100 pairs
+- One folder uses one filename schema and one channel-role assignment.
+- Supplied data use ChanA for protein clusters and ChanB for dendrites/spines.
+- Typical stacks are uint16, 2048 × 2048, and 40–100 Z slices, with about 100 pairs
   per batch.
 - Stacks are already XY-registered and paired dimensions must be identical.
-- Calibration must be entered/confirmed for every batch because embedded TIFF
-  calibration may be wrong. The example preset is XY `0.0462584 µm/pixel` and Z
-  `0.5 µm`.
+- Calibration is entered and confirmed per batch because embedded metadata may be
+  wrong. The example is XY `0.0462584 µm/pixel`, Z `0.5 µm`.
 
-## Important scientific and workflow requirements
+## Scientific and workflow requirements
 
-- Intensity measurements must always use original uint16 voxels, never processed
-  cache values.
+- Intensity measurements always use original uint16 voxels, never processed data.
 - The app must use no more than 80% of device RAM.
 - Preprocessing target: under one minute per channel.
 - Detection target: under three minutes per pair.
-- Long operations must keep the interface responsive and show progress/ETA.
-- Preprocessing, detection, and review require automatic per-pair checkpoints.
-- Detection deliberately keeps extra candidates for later exclusion and flags
-  uncertain objects.
-- Dendritic fields may contain multiple or crossing dendrites. Cell identity is
-  irrelevant. Axons and soma portions must ultimately be excludable by user hints.
+- Long operations keep the UI responsive and show progress or ETA.
+- Preprocessing, detection, and review have automatic per-pair checkpoints.
+- Detection intentionally keeps extra candidates and flags uncertain objects.
+- Fields can contain multiple/crossing dendrites. Cell identity is irrelevant.
+  Axons and soma portions must be excludable by hints.
 - Spine volume includes the neck up to the shaft. Filopodia are not automatically
   discarded. Closely touching spines should be separate objects.
-- Manual edits apply only to the current specimen and trigger local resegmentation;
-  drawings are hints, not final masks.
-- Manual actions requested for the review stage include add, remove/exclude, split,
-  merge, and boundary correction. Protein clusters do not need drawing hints.
-- Correction should become usable after the first two detected pairs while later
-  pairs continue automatically.
+- Edits apply only to the current specimen and drawings are hints, not final masks.
+- Protein clusters have no drawing correction tools.
+- Review becomes available as completed pairs arrive while detection continues.
 
-## Architecture and important files
+## Architecture and storage
 
-- `src/synpo/app.py`: PySide6 application, background workers, three workflow tabs,
-  preview and detection viewers.
-- `src/synpo/importer.py`: filename parsing, TIFF metadata inspection, pairing, and
-  source fingerprints.
-- `src/synpo/project.py`: schema-1 JSON manifests, backward-compatible field
-  migration, atomic saves, verification, and relinking.
+- `src/synpo/app.py`: PySide6 application, independent background workers, four
+  workflow tabs, preview/detection viewers, and drawable review canvas.
+- `src/synpo/importer.py`: filename parsing, TIFF inspection, pairing, fingerprints.
+- `src/synpo/project.py`: schema-1 manifest migration, serialized atomic saves,
+  source verification, and relinking.
 - `src/synpo/preprocessing.py`: adaptive background/Otsu estimation, physical-unit
-  Gaussian filtering, slice-at-a-time processing, RAM guard, Zarr cache, resume.
-- `src/synpo/detection.py`: projection/skeleton-based shaft and spine separation,
-  3D candidate label volumes, cluster components, flags, signatures, and pair
-  checkpoints.
-- `tests/`: importer, project, preprocessing, detection, checkpoint, migration, and
-  resume coverage.
+  Gaussian filtering, slice processing, RAM guard, Zarr cache, and resume.
+- `src/synpo/detection.py`: projection/skeleton shaft and spine separation, 3D
+  labels, cluster components, flags, signatures, and checkpoints.
+- `src/synpo/review.py`: editable mask initialization, hint interpretation, local
+  correction, object statuses, compressed undo patches, and checkpoints.
+- `src/synpo/visualization.py`: slice-streamed XY/XZ/YZ maximum projections,
+  physical calibration, label projections, bounded 3D surface-point sampling, and
+  visualization RAM checks.
+- `tests/`: importer, project, preprocessing, detection, review, checkpoint,
+  migration, and resume coverage.
 
-Project manifests remain schema version 1 and are extended through
-`migrate_manifest`. Preserve backward compatibility with Stage 1/2 projects.
-
-Preprocessed arrays are stored below:
+Keep project manifests at schema version 1 and extend them through
+`migrate_manifest` for backward compatibility.
 
 ```text
-<output>/.synpo-cache/<project-id>/preprocessed.zarr
+<output>/.synpo-cache/<project-id>/
+├── preprocessed.zarr
+├── detection.zarr
+└── review.zarr
 ```
 
-Detection label volumes are stored in `detection.zarr` beside that cache. Cache
-groups carry settings/source signatures. Stale automatic results are replaced;
-matching complete groups are reused. Raw TIFFs are never changed or copied.
+Automatic and corrected label volumes are separate. Review groups carry the source
+detection signature; stale corrections are ignored and review state resets after a
+changed detection result. Raw TIFFs are never changed or copied.
 
-## Stage 3 behavior
+## Stage 4 behavior
 
-- Higher sensitivity retains more candidates.
-- Dendrite masks are green, spine candidates cyan, and protein clusters magenta.
-- Every automatic object begins as unreviewed.
-- Additional flags cover possible filopodia, possible dendrite ends/edge objects,
-  and weak/small clusters.
-- A completed pair becomes viewable while later pairs continue detection.
-- The user liked the current automatic segmentation, so retain current defaults
-  unless evaluation on additional data justifies a change.
+- The queue gains each detected specimen immediately; its review worker can run
+  concurrently with detection of other specimens.
+- Dendrite/spine hints support add, exclude, exclude-as-filopodium, split, merge,
+  expand, trim, accept, and flag-needs-attention.
+- The main Review canvas can switch between a Z slice and a drawable XY maximum.
+  Projection hints search object labels through Z and infer a local Z plane from
+  label overlap or strongest nearby processed signal. The slider remains a
+  reference Z position in projection mode.
+- Add and expand use processed dendrite-channel signal in a bounded 3D neighborhood.
+  Other actions interpret hints against existing 3D object labels.
+- Every applied action stores an undo record and atomically saves the checkpoint.
+  Undo restores both label data and previous object status.
+- Review may be completed with no edits. Any subsequent correction changes it back
+  to in-progress. Comments are per specimen.
+- Corrected display still uses original 16-bit TIFF intensity as its background.
+- Detection and Review each expose buttons for XY/XZ/YZ maxima and the rotatable
+  3D object viewer. Projection crosshairs are linked and update the main Z slice.
+- Orthogonal displays respect physical XY/Z calibration. The native Qt 3D renderer
+  uses marching cubes to build closed, interpolated triangular surfaces between Z
+  layers, then draws depth-sorted shaded faces without OpenGL. It supports
+  rotate/zoom/reset, adaptively limits mesh complexity, and can save PNG snapshots.
+  Dendrites and spines have adjustable 5%–100% surface opacity, defaulting to 75%
+  and 60%; clusters remain fixed at 100% so inclusions remain visible. Separate
+  class color pickers and reset controls let users choose publication appearance
+  before saving a snapshot. A `0.20×`–`5.00×` Z-layer display multiplier
+  changes only the 3D view and snapshot; `1.00×` preserves calibrated spacing and
+  no multiplier affects masks, calibration, or measurements.
+- The 3D button no longer attempts a full-field render. It first opens an XY maximum
+  area-selection dialog; the user drags a rectangle and only that cropped XY region
+  is sampled through Z and rendered. This is the laptop-safe path.
+- A Windows fatal exception in the first 3D paint was traced to NumPy matrix
+  multiplication entering a native BLAS/MKL delay-load path. Renderer rotation now
+  uses element-wise float32 coordinate arithmetic instead. The exact visible
+  detection-worker, area-selection, and first-paint workflow passed after this fix.
 
 ## Pending stages and decisions
 
-The next expected stage is interactive review/correction with local
-resegmentation. Later work must also cover:
+After Stage 4 approval, remaining work includes:
 
-1. Review queue, user hint drawing, add/remove/split/merge, per-object flags,
-   optional filopodia exclusion, and per-specimen review checkpoints.
-2. Max projection, linked XZ/YZ views, optional rotatable 3D rendering, and saved
-   3D snapshots.
-3. Spine/cluster association with a configurable minimum overlap percentage,
-   default 80%. Initially count only the cluster portion inside the spine.
-4. A comparison of two approaches for discarding the blurry slices at one end of
-   clusters, including an illustration of voxels counted by the second approach.
-5. Metrics:
+1. Spine/cluster association with configurable minimum overlap, default 80%; first
+   count only the cluster portion inside the spine.
+2. Compare two ways to discard blurry slices at one cluster end and illustrate the
+   voxels counted by the second method.
+3. Metrics:
    - spine: volume, cluster presence, summed cluster-volume/spine-volume ratio,
-     and protein distribution;
+     protein distribution;
    - cluster inside a spine: volume and distribution relative to the spine;
-   - dendrite: spine density per µm, mean spine volume, inclusion percentage,
-     mean summed inclusion/spine ratio, mean cluster volume, and protein
-     distribution;
-   - specimen: averages of the requested lower-level metrics.
-6. Protein-distribution definitions are intentionally pending user clarification.
-7. Export one Excel workbook with raw specimen/spine/cluster sheets, master sheets,
-   and compact group summaries containing counts, means, variability, and inclusion
-   percentages; also export CSV copies, reproducible settings/masks, ImageJ-compatible
-   ROI ZIPs, and manually requested snapshots.
-8. Keep the project cache compressed and temporary. Offer deletion only after final
-   export has been verified.
-9. An optional in-app annotation/training utility may be added after the main app;
-   it must not depend on Fiji. The user can provide up to two annotated pairs.
-10. Statistics are out of scope: the app calculates and exports clearly labeled
-    metrics, while statistical analysis happens elsewhere.
+   - dendrite: spine density per µm, mean spine volume, inclusion percentage, mean
+     summed inclusion/spine ratio, mean cluster volume, protein distribution;
+   - specimen: averages of requested lower-level metrics.
+4. Protein-distribution definitions await user clarification.
+5. Export one Excel workbook with raw specimen/spine/cluster rows, master sheets,
+   compact group summaries (counts, means, variability, inclusion percentages),
+   CSV copies, reproducible settings/masks, ImageJ ROI ZIPs, and saved snapshots.
+6. Keep cache compressed and temporary; offer deletion only after verified export.
+7. Optionally add an in-app annotation/training utility after the main app. It must
+   not depend on Fiji; the user can provide up to two annotated pairs.
+8. Statistics remain out of scope. Synpo calculates and exports labeled metrics;
+   statistical analysis occurs elsewhere.
 
-The current target is Windows with a reproducible Anaconda environment and desktop
-shortcut. Keep the design portable enough for a future macOS version.
+The current target is Windows with Anaconda and a desktop shortcut. Keep the design
+portable for a later macOS version.

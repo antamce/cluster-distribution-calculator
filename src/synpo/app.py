@@ -6,16 +6,19 @@ from threading import Event
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QImage, QPixmap
+from PySide6.QtCore import QObject, QPoint, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -60,12 +64,50 @@ from .detection import (
     detect_project,
     load_detection_slice,
 )
+from .review import (
+    ReviewAction,
+    ReviewSlice,
+    apply_review_action,
+    load_review_slice,
+    set_specimen_review_state,
+    undo_last_review_action,
+)
+from .visualization import (
+    ContextVolume,
+    ProjectionData,
+    context_signature,
+    generate_context_volume,
+)
 
 
 ROLE_LABELS = {
     "protein_clusters": "Protein clusters",
     "dendrite_spines": "Dendrites and spines",
 }
+
+VOLUME_KIND_LABELS = ("Dendrites", "Spines", "Protein clusters")
+VOLUME_DEFAULT_COLORS = (QColor(55, 220, 85), QColor(35, 195, 245), QColor(245, 55, 200))
+VOLUME_DEFAULT_OPACITIES = (0.75, 0.60, 1.0)
+
+
+def _label_colors(labels: np.ndarray, kind: int) -> np.ndarray:
+    values = np.asarray(labels, dtype=np.uint64)
+    hashed = values * np.uint64(2654435761 + kind * 7919)
+    variation = ((hashed >> np.uint64(16)) & np.uint64(63)).astype(np.uint8)
+    colors = np.zeros((*values.shape, 3), dtype=np.uint8)
+    if kind == 0:
+        colors[..., 0] = 25 + variation // 2
+        colors[..., 1] = 170 + variation
+        colors[..., 2] = 45 + variation // 3
+    elif kind == 1:
+        colors[..., 0] = variation
+        colors[..., 1] = 170 + variation
+        colors[..., 2] = 210 + variation // 2
+    else:
+        colors[..., 0] = 205 + variation // 2
+        colors[..., 1] = 30 + variation
+        colors[..., 2] = 165 + variation
+    return colors
 
 
 class SliceView(QLabel):
@@ -143,6 +185,949 @@ class SliceView(QLabel):
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
         self._render()
+
+
+class ReviewCanvas(SliceView):
+    hint_changed = Signal(int)
+
+    def __init__(self, placeholder: str) -> None:
+        super().__init__(placeholder)
+        self._base_image: QImage | None = None
+        self._strokes: list[list[tuple[int, int]]] = []
+        self._drawing = False
+        self._brush_radius = 4
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def set_brush_radius(self, radius: int) -> None:
+        self._brush_radius = max(1, int(radius))
+        self._draw_hints()
+
+    def clear_hint(self) -> None:
+        self._strokes.clear()
+        self._drawing = False
+        self._draw_hints()
+        self.hint_changed.emit(0)
+
+    def undo_stroke(self) -> None:
+        if self._strokes:
+            self._strokes.pop()
+            self._draw_hints()
+            self.hint_changed.emit(len(self.hint_points()))
+
+    def hint_points(self) -> tuple[tuple[int, int], ...]:
+        return tuple(point for stroke in self._strokes for point in stroke)
+
+    def show_detection(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        super().show_detection(*args, **kwargs)
+        self._base_image = self._image.copy() if self._image is not None else None
+        self._draw_hints()
+
+    def _image_position(self, position) -> tuple[int, int] | None:  # type: ignore[no-untyped-def]
+        if self._base_image is None or self.pixmap() is None:
+            return None
+        pixmap = self.pixmap()
+        left = (self.width() - pixmap.width()) / 2.0
+        top = (self.height() - pixmap.height()) / 2.0
+        if not (
+            left <= position.x() < left + pixmap.width()
+            and top <= position.y() < top + pixmap.height()
+        ):
+            return None
+        x = int((position.x() - left) * self._base_image.width() / pixmap.width())
+        y = int((position.y() - top) * self._base_image.height() / pixmap.height())
+        return (
+            min(self._base_image.width() - 1, max(0, x)),
+            min(self._base_image.height() - 1, max(0, y)),
+        )
+
+    def _append_to_stroke(self, point: tuple[int, int]) -> None:
+        stroke = self._strokes[-1]
+        if not stroke:
+            stroke.append(point)
+            return
+        x0, y0 = stroke[-1]
+        x1, y1 = point
+        distance = max(abs(x1 - x0), abs(y1 - y0))
+        steps = max(1, int(distance / max(1, self._brush_radius)))
+        for step in range(1, steps + 1):
+            sample = (
+                round(x0 + (x1 - x0) * step / steps),
+                round(y0 + (y1 - y0) * step / steps),
+            )
+            if sample != stroke[-1]:
+                stroke.append(sample)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() == Qt.MouseButton.LeftButton:
+            point = self._image_position(event.position())
+            if point is not None:
+                self._strokes.append([])
+                self._append_to_stroke(point)
+                self._drawing = True
+                self._draw_hints()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._drawing:
+            point = self._image_position(event.position())
+            if point is not None:
+                self._append_to_stroke(point)
+                self._draw_hints()
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._drawing and event.button() == Qt.MouseButton.LeftButton:
+            point = self._image_position(event.position())
+            if point is not None:
+                self._append_to_stroke(point)
+            self._drawing = False
+            self._draw_hints()
+            self.hint_changed.emit(len(self.hint_points()))
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _draw_hints(self) -> None:
+        if self._base_image is None:
+            return
+        image = self._base_image.copy()
+        painter = QPainter(image)
+        pen = QPen(
+            QColor(255, 220, 0, 230),
+            self._brush_radius * 2 + 1,
+            Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.RoundCap,
+            Qt.PenJoinStyle.RoundJoin,
+        )
+        painter.setPen(pen)
+        for stroke in self._strokes:
+            if len(stroke) == 1:
+                painter.drawPoint(QPoint(*stroke[0]))
+            for start, end in zip(stroke, stroke[1:]):
+                painter.drawLine(QPoint(*start), QPoint(*end))
+        painter.end()
+        self._image = image
+        self._render()
+
+
+class ProjectionView(SliceView):
+    coordinate_selected = Signal(str, int, int)
+    selection_changed = Signal(object)
+
+    def __init__(self, axis: str) -> None:
+        super().__init__(f"{axis} maximum projection")
+        self.axis = axis
+        self._projection: ProjectionData | None = None
+        self._crosshair = (0, 0, 0)
+        self._display_aspect = 1.0
+        self._visible_kinds = (True, True, True)
+        self._selection_enabled = False
+        self._selection_start: tuple[int, int] | None = None
+        self._selection_end: tuple[int, int] | None = None
+        self._selecting = False
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def set_projection(
+        self,
+        projection: ProjectionData,
+        crosshair: tuple[int, int, int],
+        *,
+        xy_um_per_pixel: float,
+        z_step_um: float,
+    ) -> None:
+        self._projection = projection
+        self._crosshair = crosshair
+        height, width = projection.raw.shape
+        if self.axis == "XY":
+            self._display_aspect = width / max(1, height)
+        else:
+            self._display_aspect = (width * xy_um_per_pixel) / max(
+                xy_um_per_pixel, height * z_step_um
+            )
+        self._render_projection()
+
+    def set_crosshair(self, crosshair: tuple[int, int, int]) -> None:
+        self._crosshair = crosshair
+        self._render_projection()
+
+    def set_visible_kinds(self, visible: tuple[bool, bool, bool]) -> None:
+        self._visible_kinds = visible
+        self._render_projection()
+
+    def enable_rectangle_selection(self, enabled: bool = True) -> None:
+        self._selection_enabled = enabled
+        self._selection_start = None
+        self._selection_end = None
+        self._selecting = False
+        self._render_projection()
+
+    def selected_rectangle(self) -> tuple[int, int, int, int] | None:
+        if self._selection_start is None or self._selection_end is None:
+            return None
+        x0, y0 = self._selection_start
+        x1, y1 = self._selection_end
+        left, right = sorted((x0, x1))
+        top, bottom = sorted((y0, y1))
+        return left, top, right + 1, bottom + 1
+
+    def _render_projection(self) -> None:
+        if self._projection is None:
+            return
+        raw = self._projection.raw
+        low, high = np.percentile(raw, (0.5, 99.8))
+        scale = max(1.0, float(high) - float(low))
+        gray = np.clip(
+            (raw.astype(np.float32) - float(low)) * 255.0 / scale, 0, 255
+        ).astype(np.uint8)
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        for kind, labels in enumerate(
+            (
+                self._projection.dendrites,
+                self._projection.spines,
+                self._projection.clusters,
+            )
+        ):
+            if not self._visible_kinds[kind]:
+                continue
+            mask = labels > 0
+            if np.any(mask):
+                colors = _label_colors(labels, kind)
+                rgb[mask] = np.clip(
+                    rgb[mask].astype(np.float32) * 0.25
+                    + colors[mask].astype(np.float32) * 0.75,
+                    0,
+                    255,
+                ).astype(np.uint8)
+        height, width = gray.shape
+        image = QImage(
+            rgb.data, width, height, rgb.strides[0], QImage.Format.Format_RGB888
+        ).copy()
+        painter = QPainter(image)
+        painter.setPen(QPen(QColor(255, 230, 30, 220), 1))
+        x, y, z = self._crosshair
+        if self.axis == "XY":
+            horizontal, vertical = y, x
+        elif self.axis == "XZ":
+            horizontal, vertical = z, x
+        else:
+            horizontal, vertical = z, y
+        painter.drawLine(0, horizontal, width - 1, horizontal)
+        painter.drawLine(vertical, 0, vertical, height - 1)
+        if self._selection_start is not None and self._selection_end is not None:
+            x0, y0 = self._selection_start
+            x1, y1 = self._selection_end
+            painter.setPen(QPen(QColor(255, 145, 20, 255), 3))
+            painter.drawRect(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+        painter.end()
+        self._image = image
+        self._render()
+
+    def _render(self) -> None:
+        if self._image is None:
+            return
+        available_width = max(1, self.width())
+        available_height = max(1, self.height())
+        if available_width / available_height > self._display_aspect:
+            target_height = available_height
+            target_width = max(1, round(target_height * self._display_aspect))
+        else:
+            target_width = available_width
+            target_height = max(1, round(target_width / self._display_aspect))
+        self.setPixmap(
+            QPixmap.fromImage(self._image).scaled(
+                target_width,
+                target_height,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _event_image_coordinate(self, event) -> tuple[int, int] | None:  # type: ignore[no-untyped-def]
+        if self._image is None or self.pixmap() is None:
+            return None
+        pixmap = self.pixmap()
+        left = (self.width() - pixmap.width()) / 2.0
+        top = (self.height() - pixmap.height()) / 2.0
+        position = event.position()
+        if not (
+            left <= position.x() < left + pixmap.width()
+            and top <= position.y() < top + pixmap.height()
+        ):
+            return None
+        column = int((position.x() - left) * self._image.width() / pixmap.width())
+        row = int((position.y() - top) * self._image.height() / pixmap.height())
+        return column, row
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        coordinate = self._event_image_coordinate(event)
+        if coordinate is None:
+            return
+        if self._selection_enabled:
+            self._selection_start = coordinate
+            self._selection_end = coordinate
+            self._selecting = True
+            self._render_projection()
+            event.accept()
+            return
+        column, row = coordinate
+        self.coordinate_selected.emit(self.axis, column, row)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._selection_enabled and self._selecting:
+            coordinate = self._event_image_coordinate(event)
+            if coordinate is not None:
+                self._selection_end = coordinate
+                self._render_projection()
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._selection_enabled and self._selecting:
+            coordinate = self._event_image_coordinate(event)
+            if coordinate is not None:
+                self._selection_end = coordinate
+            self._selecting = False
+            self._render_projection()
+            self.selection_changed.emit(self.selected_rectangle())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class Volume3DView(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumSize(600, 520)
+        self.setStyleSheet("background: #111; color: white;")
+        self._volume: ContextVolume | None = None
+        self._yaw = -35.0
+        self._pitch = 25.0
+        self._zoom = 1.0
+        self._last_mouse = None
+        self._visible_kinds = (True, True, True)
+        self._kind_colors = tuple(QColor(color) for color in VOLUME_DEFAULT_COLORS)
+        self._kind_opacities = list(VOLUME_DEFAULT_OPACITIES)
+        self._z_spacing_factor = 1.0
+
+    def set_volume(self, volume: ContextVolume) -> None:
+        self._volume = volume
+        self._yaw = -35.0
+        self._pitch = 25.0
+        self._zoom = 1.0
+        self.update()
+
+    def set_visible_kinds(self, visible: tuple[bool, bool, bool]) -> None:
+        self._visible_kinds = visible
+        self.update()
+
+    def kind_color(self, kind: int) -> QColor:
+        return QColor(self._kind_colors[kind])
+
+    def set_kind_color(self, kind: int, color: QColor) -> None:
+        colors = list(self._kind_colors)
+        colors[kind] = QColor(color)
+        self._kind_colors = tuple(colors)
+        self.update()
+
+    def reset_kind_colors(self) -> None:
+        self._kind_colors = tuple(QColor(color) for color in VOLUME_DEFAULT_COLORS)
+        self.update()
+
+    def set_kind_opacity(self, kind: int, opacity: float) -> None:
+        self._kind_opacities[kind] = max(0.05, min(1.0, float(opacity)))
+        self.update()
+
+    def kind_opacity(self, kind: int) -> float:
+        return self._kind_opacities[kind]
+
+    def set_z_spacing_factor(self, factor: float) -> None:
+        self._z_spacing_factor = max(0.2, min(5.0, float(factor)))
+        self.update()
+
+    def z_spacing_factor(self) -> float:
+        return self._z_spacing_factor
+
+    def _rotate_coordinates(
+        self, points: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, float, float, float, float]:
+        points = points.astype(np.float32, copy=False)
+        centered = points - (points.min(axis=0) + points.max(axis=0)) / 2.0
+        centered[:, 2] *= self._z_spacing_factor
+        yaw = np.deg2rad(self._yaw)
+        pitch = np.deg2rad(self._pitch)
+        cos_yaw = np.float32(np.cos(yaw))
+        sin_yaw = np.float32(np.sin(yaw))
+        cos_pitch = np.float32(np.cos(pitch))
+        sin_pitch = np.float32(np.sin(pitch))
+        yaw_x = centered[:, 0] * cos_yaw - centered[:, 1] * sin_yaw
+        yaw_y = centered[:, 0] * sin_yaw + centered[:, 1] * cos_yaw
+        rotated = np.empty_like(centered)
+        rotated[:, 0] = yaw_x
+        rotated[:, 1] = yaw_y * cos_pitch - centered[:, 2] * sin_pitch
+        rotated[:, 2] = yaw_y * sin_pitch + centered[:, 2] * cos_pitch
+        return rotated, centered, cos_yaw, sin_yaw, cos_pitch, sin_pitch
+
+    def _render_mesh_image(self, render_width: int, render_height: int) -> QImage:
+        assert self._volume is not None
+        vertices = self._volume.mesh_vertices_um
+        faces = self._volume.mesh_faces
+        rotated, centered, _cy, _sy, _cp, _sp = self._rotate_coordinates(vertices)
+        span = max(1e-6, float(np.ptp(centered, axis=0).max()))
+        scale = min(render_width, render_height) * 0.78 * self._zoom / span
+        screen_x = np.rint(rotated[:, 0] * scale + render_width / 2).astype(np.int32)
+        screen_y = np.rint(-rotated[:, 1] * scale + render_height / 2).astype(np.int32)
+
+        first = rotated[faces[:, 0]]
+        edge_a = rotated[faces[:, 1]] - first
+        edge_b = rotated[faces[:, 2]] - first
+        normal_x = edge_a[:, 1] * edge_b[:, 2] - edge_a[:, 2] * edge_b[:, 1]
+        normal_y = edge_a[:, 2] * edge_b[:, 0] - edge_a[:, 0] * edge_b[:, 2]
+        normal_z = edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0]
+        normal_length = np.sqrt(
+            normal_x * normal_x + normal_y * normal_y + normal_z * normal_z
+        )
+        lighting = 0.42 + 0.58 * np.abs(normal_z) / np.maximum(normal_length, 1e-6)
+        face_depth = (
+            rotated[faces[:, 0], 2]
+            + rotated[faces[:, 1], 2]
+            + rotated[faces[:, 2], 2]
+        ) / 3.0
+
+        image = QImage(
+            render_width,
+            render_height,
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        image.fill(QColor("#111111"))
+        compositor = QPainter(image)
+        compositor.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        for kind in range(3):
+            if not self._visible_kinds[kind]:
+                continue
+            selected = np.flatnonzero(self._volume.mesh_face_kinds == kind)
+            if not len(selected):
+                continue
+            selected = selected[np.argsort(face_depth[selected])]
+            layer = QImage(
+                render_width,
+                render_height,
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            layer.fill(Qt.GlobalColor.transparent)
+            layer_painter = QPainter(layer)
+            layer_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            layer_painter.setPen(Qt.PenStyle.NoPen)
+            base = self._kind_colors[kind]
+            shade_cache: dict[int, QColor] = {}
+            for face_index in selected:
+                triangle = faces[face_index]
+                xs = screen_x[triangle]
+                ys = screen_y[triangle]
+                if (
+                    xs.max() < 0
+                    or xs.min() >= render_width
+                    or ys.max() < 0
+                    or ys.min() >= render_height
+                ):
+                    continue
+                shade = int(np.clip(round(float(lighting[face_index]) * 31), 0, 31))
+                color = shade_cache.get(shade)
+                if color is None:
+                    factor = shade / 31.0
+                    color = QColor(
+                        round(base.red() * factor),
+                        round(base.green() * factor),
+                        round(base.blue() * factor),
+                    )
+                    shade_cache[shade] = color
+                layer_painter.setBrush(color)
+                layer_painter.drawPolygon(
+                    QPolygon(
+                        [
+                            QPoint(int(xs[0]), int(ys[0])),
+                            QPoint(int(xs[1]), int(ys[1])),
+                            QPoint(int(xs[2]), int(ys[2])),
+                        ]
+                    )
+                )
+            layer_painter.end()
+            compositor.setOpacity(self._kind_opacities[kind])
+            compositor.drawImage(0, 0, layer)
+            compositor.setOpacity(1.0)
+        compositor.end()
+        return image
+
+    def _point_radius(
+        self,
+        scale: float,
+        cos_yaw: float,
+        sin_yaw: float,
+        cos_pitch: float,
+        sin_pitch: float,
+    ) -> int:
+        if self._volume is None:
+            return 2
+        xy = self._volume.xy_um_per_pixel
+        z = self._volume.z_step_um * self._z_spacing_factor
+        horizontal_extent = (
+            0.5 * xy * scale * (abs(cos_yaw) + abs(sin_yaw))
+        )
+        vertical_extent = 0.5 * scale * (
+            xy * (abs(sin_yaw) + abs(cos_yaw)) * abs(cos_pitch)
+            + z * abs(sin_pitch)
+        )
+        return max(2, min(12, int(np.ceil(max(horizontal_extent, vertical_extent)))))
+
+    def _rasterize_solid_objects(
+        self,
+        screen_x: np.ndarray,
+        screen_y: np.ndarray,
+        depth: np.ndarray,
+        visible: np.ndarray,
+        render_width: int,
+        render_height: int,
+        point_radius: int,
+    ) -> np.ndarray:
+        canvas = np.full(
+            (render_height, render_width, 3), 17.0, dtype=np.float32
+        )
+        if self._volume is None or not np.any(visible):
+            return canvas.astype(np.uint8)
+        visible_depth = depth[visible]
+        depth_low = float(visible_depth.min())
+        depth_span = max(1e-6, float(visible_depth.max()) - depth_low)
+        kinds = self._volume.point_kinds
+        offsets = [
+            (dy, dx)
+            for dy in range(-point_radius, point_radius + 1)
+            for dx in range(-point_radius, point_radius + 1)
+            if dx * dx + dy * dy <= point_radius * point_radius
+        ]
+        canvas_pixels = canvas.reshape(-1, 3)
+        for kind in range(3):
+            selected = visible & (kinds == kind)
+            if not np.any(selected):
+                continue
+            xs = screen_x[selected]
+            ys = screen_y[selected]
+            zs = depth[selected]
+            depth_buffer = np.full(
+                render_width * render_height, -np.inf, dtype=np.float32
+            )
+            for dy, dx in offsets:
+                shifted_x = xs + dx
+                shifted_y = ys + dy
+                inside = (
+                    (shifted_x >= 0)
+                    & (shifted_x < render_width)
+                    & (shifted_y >= 0)
+                    & (shifted_y < render_height)
+                )
+                if np.any(inside):
+                    flat = shifted_y[inside] * render_width + shifted_x[inside]
+                    np.maximum.at(depth_buffer, flat, zs[inside])
+            covered = np.isfinite(depth_buffer)
+            if not np.any(covered):
+                continue
+            lighting = 0.58 + 0.42 * (
+                (depth_buffer[covered] - depth_low) / depth_span
+            )
+            chosen = self._kind_colors[kind]
+            base = np.asarray(
+                (chosen.red(), chosen.green(), chosen.blue()), dtype=np.float32
+            )
+            surface = np.clip(lighting[:, None] * base[None, :], 0, 255)
+            opacity = self._kind_opacities[kind]
+            canvas_pixels[covered] = (
+                canvas_pixels[covered] * (1.0 - opacity) + surface * opacity
+            )
+        return np.rint(canvas).astype(np.uint8)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._last_mouse = event.position()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._last_mouse is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            delta = event.position() - self._last_mouse
+            self._yaw += delta.x() * 0.6
+            self._pitch = max(-89.0, min(89.0, self._pitch + delta.y() * 0.6))
+            self._last_mouse = event.position()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._last_mouse = None
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._zoom = max(
+            0.35, min(4.0, self._zoom * (1.12 ** (event.angleDelta().y() / 120.0)))
+        )
+        self.update()
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._yaw, self._pitch, self._zoom = -35.0, 25.0, 1.0
+        self.update()
+        event.accept()
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#111111"))
+        if self._volume is None or not (
+            len(self._volume.mesh_faces) or len(self._volume.points_um)
+        ):
+            painter.setPen(QColor("#dddddd"))
+            painter.drawText(
+                self.rect(), Qt.AlignmentFlag.AlignCenter, "No 3D mask surface"
+            )
+            painter.end()
+            return
+        render_width = max(64, self.width())
+        render_height = max(64, self.height())
+        if len(self._volume.mesh_faces):
+            image = self._render_mesh_image(render_width, render_height)
+        else:
+            points = self._volume.points_um.astype(np.float32, copy=False)
+            (
+                rotated,
+                centered,
+                cos_yaw,
+                sin_yaw,
+                cos_pitch,
+                sin_pitch,
+            ) = self._rotate_coordinates(points)
+            span = max(1e-6, float(np.ptp(centered, axis=0).max()))
+            scale = min(render_width, render_height) * 0.78 * self._zoom / span
+            screen_x = np.rint(
+                rotated[:, 0] * scale + render_width / 2
+            ).astype(np.int32)
+            screen_y = np.rint(
+                -rotated[:, 1] * scale + render_height / 2
+            ).astype(np.int32)
+            visible = (
+                (screen_x >= 1)
+                & (screen_x < render_width - 1)
+                & (screen_y >= 1)
+                & (screen_y < render_height - 1)
+            )
+            visible &= np.isin(
+                self._volume.point_kinds,
+                np.flatnonzero(self._visible_kinds).astype(np.uint8),
+            )
+            point_radius = self._point_radius(
+                scale, cos_yaw, sin_yaw, cos_pitch, sin_pitch
+            )
+            canvas = self._rasterize_solid_objects(
+                screen_x,
+                screen_y,
+                rotated[:, 2],
+                visible,
+                render_width,
+                render_height,
+                point_radius,
+            )
+            image = QImage(
+                canvas.data,
+                render_width,
+                render_height,
+                canvas.strides[0],
+                QImage.Format.Format_RGB888,
+            ).copy()
+        painter.drawImage(self.rect(), image)
+        painter.setPen(QColor("#eeeeee"))
+        painter.drawText(16, 24, "Drag: rotate   Wheel: zoom   Double-click: reset")
+        legend_x = 16
+        for kind, label in enumerate(("Dendrites", "Spines", "Clusters")):
+            painter.setPen(self._kind_colors[kind])
+            painter.drawText(legend_x, 46, label)
+            legend_x += (84, 60, 72)[kind]
+        painter.end()
+
+
+class ContextViewerDialog(QDialog):
+    z_selected = Signal(int)
+
+    def __init__(
+        self, title: str, volume: ContextVolume, initial_z: int, parent=None
+    ) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(1220, 860)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.volume = volume
+        y_count, x_count = volume.xy.raw.shape
+        self._crosshair = (
+            x_count // 2,
+            y_count // 2,
+            max(0, min(volume.z_count - 1, initial_z)),
+        )
+        outer = QVBoxLayout(self)
+        overlay_row = QHBoxLayout()
+        overlay_row.addWidget(QLabel("Visible objects:"))
+        self.context_overlay_checks: list[QCheckBox] = []
+        for label in ("Dendrites", "Spines", "Protein clusters"):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(self._visibility_changed)
+            self.context_overlay_checks.append(checkbox)
+            overlay_row.addWidget(checkbox)
+        overlay_row.addStretch(1)
+        outer.addLayout(overlay_row)
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs, 1)
+
+        projections_tab = QWidget()
+        projection_layout = QGridLayout(projections_tab)
+        self.projection_views: dict[str, ProjectionView] = {}
+        for column, axis in enumerate(("XY", "XZ", "YZ")):
+            label = QLabel(f"{axis} maximum projection")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            projection_layout.addWidget(label, 0, column)
+            view = ProjectionView(axis)
+            view.coordinate_selected.connect(self._projection_clicked)
+            self.projection_views[axis] = view
+            projection_layout.addWidget(view, 1, column)
+        help_label = QLabel(
+            "Click any projection to link the yellow crosshairs and update the main Z slice. "
+            "Orthogonal views use the confirmed physical voxel calibration."
+        )
+        help_label.setWordWrap(True)
+        projection_layout.addWidget(help_label, 2, 0, 1, 3)
+        self.tabs.addTab(projections_tab, "XY / XZ / YZ maxima")
+
+        volume_tab = QWidget()
+        volume_layout = QVBoxLayout(volume_tab)
+        material_note = QLabel(
+            "Dendrites and spines are translucent; protein clusters are opaque. "
+            "Triangular surfaces are interpolated continuously between Z layers."
+        )
+        material_note.setWordWrap(True)
+        volume_layout.addWidget(material_note)
+        self.volume_view = Volume3DView()
+        self.volume_view.set_volume(volume)
+        render_row = QHBoxLayout()
+        render_row.addWidget(QLabel("Z-layer spacing:"))
+        self.volume_z_spacing = QDoubleSpinBox()
+        self.volume_z_spacing.setRange(0.2, 5.0)
+        self.volume_z_spacing.setDecimals(2)
+        self.volume_z_spacing.setSingleStep(0.1)
+        self.volume_z_spacing.setValue(1.0)
+        self.volume_z_spacing.setSuffix("×")
+        self.volume_z_spacing.setToolTip(
+            "Display only. 1.00× uses the confirmed physical Z calibration; "
+            "measurements and masks are never changed."
+        )
+        render_row.addWidget(self.volume_z_spacing)
+        reset_spacing = QPushButton("Use calibrated spacing")
+        reset_spacing.clicked.connect(lambda: self.volume_z_spacing.setValue(1.0))
+        render_row.addWidget(reset_spacing)
+        render_row.addStretch(1)
+        volume_layout.addLayout(render_row)
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(QLabel("Surface opacity:"))
+        self.volume_opacity_spins: list[QSpinBox] = []
+        for kind, label in enumerate(("Dendrites", "Spines")):
+            opacity_row.addWidget(QLabel(f"{label}:"))
+            control = QSpinBox()
+            control.setRange(5, 100)
+            control.setSingleStep(5)
+            control.setSuffix("%")
+            control.setValue(round(VOLUME_DEFAULT_OPACITIES[kind] * 100))
+            control.setToolTip(
+                "Display and snapshot only; segmentation and measurements are unchanged."
+            )
+            control.valueChanged.connect(
+                lambda value, index=kind: self.volume_view.set_kind_opacity(
+                    index, value / 100.0
+                )
+            )
+            self.volume_opacity_spins.append(control)
+            opacity_row.addWidget(control)
+        opacity_row.addWidget(QLabel("Protein clusters: 100% (opaque)"))
+        reset_opacity = QPushButton("Reset opacity")
+        reset_opacity.clicked.connect(self._reset_volume_opacity)
+        opacity_row.addWidget(reset_opacity)
+        opacity_row.addStretch(1)
+        volume_layout.addLayout(opacity_row)
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("3D colors:"))
+        self.volume_color_buttons: list[QPushButton] = []
+        for kind, label in enumerate(VOLUME_KIND_LABELS):
+            button = QPushButton(f"{label} color…")
+            button.clicked.connect(
+                lambda _checked=False, index=kind: self._choose_volume_color(index)
+            )
+            self.volume_color_buttons.append(button)
+            color_row.addWidget(button)
+        reset_colors = QPushButton("Reset colors")
+        reset_colors.clicked.connect(self._reset_volume_colors)
+        color_row.addWidget(reset_colors)
+        color_row.addStretch(1)
+        volume_layout.addLayout(color_row)
+        self.volume_z_spacing.valueChanged.connect(
+            self.volume_view.set_z_spacing_factor
+        )
+        self._refresh_volume_color_buttons()
+        volume_layout.addWidget(self.volume_view, 1)
+        save_snapshot = QPushButton("Save current 3D snapshot…")
+        save_snapshot.clicked.connect(self._save_snapshot)
+        volume_layout.addWidget(save_snapshot)
+        self.tabs.addTab(volume_tab, "Rotatable 3D objects")
+        self.tabs.setTabEnabled(
+            1, bool(len(volume.mesh_faces) or len(volume.points_um))
+        )
+        self._refresh_projections()
+
+    def _choose_volume_color(self, kind: int) -> None:
+        color = QColorDialog.getColor(
+            self.volume_view.kind_color(kind),
+            self,
+            f"Choose {VOLUME_KIND_LABELS[kind].lower()} color",
+        )
+        if color.isValid():
+            self.volume_view.set_kind_color(kind, color)
+            self._refresh_volume_color_buttons()
+
+    def _reset_volume_colors(self) -> None:
+        self.volume_view.reset_kind_colors()
+        self._refresh_volume_color_buttons()
+
+    def _reset_volume_opacity(self) -> None:
+        for kind, control in enumerate(self.volume_opacity_spins):
+            control.setValue(round(VOLUME_DEFAULT_OPACITIES[kind] * 100))
+
+    def _refresh_volume_color_buttons(self) -> None:
+        for kind, button in enumerate(self.volume_color_buttons):
+            color = self.volume_view.kind_color(kind)
+            text = "#111111" if color.lightness() > 145 else "#ffffff"
+            button.setStyleSheet(
+                f"background-color: {color.name()}; color: {text};"
+            )
+
+    def select_view(self, view: str) -> None:
+        self.tabs.setCurrentIndex(1 if view == "3d" else 0)
+
+    def _refresh_projections(self) -> None:
+        for axis, projection in (
+            ("XY", self.volume.xy),
+            ("XZ", self.volume.xz),
+            ("YZ", self.volume.yz),
+        ):
+            self.projection_views[axis].set_projection(
+                projection,
+                self._crosshair,
+                xy_um_per_pixel=self.volume.xy_um_per_pixel,
+                z_step_um=self.volume.z_step_um,
+            )
+
+    def _visibility_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        visible = tuple(
+            checkbox.isChecked() for checkbox in self.context_overlay_checks
+        )
+        for view in self.projection_views.values():
+            view.set_visible_kinds(visible)
+        self.volume_view.set_visible_kinds(visible)
+
+    @Slot(str, int, int)
+    def _projection_clicked(self, axis: str, column: int, row: int) -> None:
+        x, y, z = self._crosshair
+        if axis == "XY":
+            x, y = column, row
+        elif axis == "XZ":
+            x, z = column, row
+        else:
+            y, z = column, row
+        self._crosshair = (x, y, max(0, min(self.volume.z_count - 1, z)))
+        for view in self.projection_views.values():
+            view.set_crosshair(self._crosshair)
+        self.z_selected.emit(self._crosshair[2])
+
+    def _save_snapshot(self) -> None:
+        selected, _ = QFileDialog.getSaveFileName(
+            self, "Save 3D snapshot", "synpo-3d-view.png", "PNG image (*.png)"
+        )
+        if selected:
+            destination = Path(selected)
+            if destination.suffix.lower() != ".png":
+                destination = destination.with_suffix(".png")
+            if not self.volume_view.grab().save(str(destination), "PNG"):
+                QMessageBox.warning(self, "Cannot save snapshot", str(destination))
+
+
+class AreaSelectionDialog(QDialog):
+    area_selected = Signal(object)
+
+    def __init__(self, title: str, volume: ContextVolume, parent=None) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(900, 820)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        outer = QVBoxLayout(self)
+        instructions = QLabel(
+            "Drag an orange rectangle around only the structures needed in the 3D view. "
+            "A smaller area renders faster and uses much less memory."
+        )
+        instructions.setWordWrap(True)
+        outer.addWidget(instructions)
+        self.selection_view = ProjectionView("XY")
+        self.selection_view.set_projection(
+            volume.xy,
+            (volume.xy.raw.shape[1] // 2, volume.xy.raw.shape[0] // 2, 0),
+            xy_um_per_pixel=volume.xy_um_per_pixel,
+            z_step_um=volume.z_step_um,
+        )
+        self.selection_view.enable_rectangle_selection(True)
+        self.selection_view.selection_changed.connect(self._selection_changed)
+        outer.addWidget(self.selection_view, 1)
+        self.selection_label = QLabel("No area selected.")
+        outer.addWidget(self.selection_label)
+        buttons = QHBoxLayout()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.close)
+        buttons.addWidget(cancel)
+        buttons.addStretch(1)
+        self.generate_button = QPushButton("Generate 3D view from selected area")
+        self.generate_button.setEnabled(False)
+        self.generate_button.clicked.connect(self._accept_area)
+        buttons.addWidget(self.generate_button)
+        outer.addLayout(buttons)
+
+    @Slot(object)
+    def _selection_changed(self, rectangle) -> None:  # type: ignore[no-untyped-def]
+        if rectangle is None:
+            self.generate_button.setEnabled(False)
+            self.selection_label.setText("No area selected.")
+            return
+        x0, y0, x1, y1 = (int(value) for value in rectangle)
+        valid = x1 - x0 >= 8 and y1 - y0 >= 8
+        self.generate_button.setEnabled(valid)
+        self.selection_label.setText(
+            f"Selected X {x0}–{x1 - 1}, Y {y0}–{y1 - 1} "
+            f"({x1 - x0} × {y1 - y0} pixels)."
+            + ("" if valid else " Select at least 8 × 8 pixels.")
+        )
+
+    def _accept_area(self) -> None:
+        rectangle = self.selection_view.selected_rectangle()
+        if rectangle is not None:
+            self.area_selected.emit(rectangle)
+            self.close()
 
 
 class PreviewWorker(QObject):
@@ -262,6 +1247,98 @@ class DetectionWorker(QObject):
         self.completed.emit(result)
 
 
+class ReviewWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        project_path: Path,
+        specimen_index: int,
+        action: ReviewAction | None,
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        self.specimen_index = specimen_index
+        self.action = action
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            if self.action is None:
+                result = undo_last_review_action(
+                    self.manifest, self.project_path, self.specimen_index
+                )
+            else:
+                result = apply_review_action(
+                    self.manifest,
+                    self.project_path,
+                    self.specimen_index,
+                    self.action,
+                    progress=lambda phase, current, total, detail: self.progress.emit(
+                        phase, current, total, detail
+                    ),
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
+class ContextWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        specimen_index: int,
+        background_channel: str,
+        corrected: bool,
+        include_3d: bool,
+        roi_xy: tuple[int, int, int, int] | None,
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.specimen_index = specimen_index
+        self.background_channel = background_channel
+        self.corrected = corrected
+        self.include_3d = include_3d
+        self.roi_xy = roi_xy
+        self.cancel_event = Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = generate_context_volume(
+                self.manifest,
+                self.specimen_index,
+                self.background_channel,
+                corrected=self.corrected,
+                include_3d=self.include_3d,
+                roi_xy=self.roi_xy,
+                progress=lambda phase, current, total, detail: self.progress.emit(
+                    phase, current, total, detail
+                ),
+                cancel_event=self.cancel_event,
+            )
+        except ProcessingCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
 class ScanWorker(QObject):
     progress = Signal(str, int, int, str)
     completed = Signal(object)
@@ -329,7 +1406,7 @@ class VerifyWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Synpo Microscopy Processor — Stage 3")
+        self.setWindowTitle("Synpo Microscopy Processor — Stage 4")
         self.resize(1380, 860)
 
         self.report: ScanReport | None = None
@@ -341,6 +1418,18 @@ class MainWindow(QMainWindow):
         self._preview_statistics: dict[tuple[object, ...], StackStatistics] = {}
         self._last_preview: PreviewResult | None = None
         self._last_detection: DetectionSlice | None = None
+        self._last_review: ReviewSlice | None = None
+        self._last_review_context: ContextVolume | None = None
+        self._review_thread: QThread | None = None
+        self._review_worker: ReviewWorker | None = None
+        self._review_refresh_pending = False
+        self._context_thread: QThread | None = None
+        self._context_worker: ContextWorker | None = None
+        self._context_progress: QProgressDialog | None = None
+        self._context_request: tuple[object, ...] | None = None
+        self._context_cache: dict[tuple[object, ...], ContextVolume] = {}
+        self._context_dialogs: list[ContextViewerDialog] = []
+        self._area_dialog: AreaSelectionDialog | None = None
         self._preview_requested_while_busy = False
         self._calibration_store = CalibrationStore()
         self._preview_timer = QTimer(self)
@@ -474,8 +1563,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(setup_tab, "1. Batch setup")
         self._build_preprocessing_tab()
         self._build_detection_tab()
+        self._build_review_tab()
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
+        self.tabs.setTabEnabled(3, False)
         self.setCentralWidget(central)
 
     def _build_preprocessing_tab(self) -> None:
@@ -746,6 +1837,22 @@ class MainWindow(QMainWindow):
         self.detection_counts = QLabel("No completed detection for this specimen.")
         self.detection_counts.setWordWrap(True)
         results_layout.addWidget(self.detection_counts)
+        self.detection_projections_button = QPushButton(
+            "Generate XY/XZ/YZ maximum projections"
+        )
+        self.detection_projections_button.setMinimumHeight(34)
+        self.detection_projections_button.setEnabled(False)
+        self.detection_projections_button.clicked.connect(
+            lambda: self._open_context_view(False, "projections")
+        )
+        results_layout.addWidget(self.detection_projections_button)
+        self.detection_3d_button = QPushButton("Generate rotatable 3D object view")
+        self.detection_3d_button.setMinimumHeight(34)
+        self.detection_3d_button.setEnabled(False)
+        self.detection_3d_button.clicked.connect(
+            lambda: self._open_context_view(False, "3d")
+        )
+        results_layout.addWidget(self.detection_3d_button)
         self.detection_status = QLabel(
             "Detection can start when at least one specimen pair has completed preprocessing."
         )
@@ -792,6 +1899,214 @@ class MainWindow(QMainWindow):
         splitter.setSizes([410, 970])
 
         self.tabs.addTab(tab, "3. Automatic detection")
+
+    def _build_review_tab(self) -> None:
+        tab = QWidget()
+        outer = QHBoxLayout(tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        outer.addWidget(splitter)
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        side_scroll.setMinimumWidth(390)
+        side_scroll.setMaximumWidth(500)
+        side_panel = QWidget()
+        side_layout = QVBoxLayout(side_panel)
+
+        queue_group = QGroupBox("Specimen review queue")
+        queue_layout = QVBoxLayout(queue_group)
+        self.review_specimen = QComboBox()
+        self.review_specimen.currentIndexChanged.connect(
+            self._review_specimen_changed
+        )
+        queue_layout.addWidget(self.review_specimen)
+        queue_buttons = QHBoxLayout()
+        self.previous_review_button = QPushButton("Previous specimen")
+        self.previous_review_button.clicked.connect(
+            lambda: self._move_review_specimen(-1)
+        )
+        queue_buttons.addWidget(self.previous_review_button)
+        self.next_review_button = QPushButton("Next specimen")
+        self.next_review_button.clicked.connect(lambda: self._move_review_specimen(1))
+        queue_buttons.addWidget(self.next_review_button)
+        queue_layout.addLayout(queue_buttons)
+        self.review_queue_status = QLabel("No detected specimens are ready for review.")
+        self.review_queue_status.setWordWrap(True)
+        queue_layout.addWidget(self.review_queue_status)
+        side_layout.addWidget(queue_group)
+
+        display_group = QGroupBox("Display")
+        display_form = QFormLayout(display_group)
+        display_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.review_view_mode = QComboBox()
+        self.review_view_mode.addItem("Individual Z slice", "slice")
+        self.review_view_mode.addItem("Drawable XY maximum projection", "xy_max")
+        self.review_view_mode.currentIndexChanged.connect(
+            self._review_view_mode_changed
+        )
+        display_form.addRow("Main canvas:", self.review_view_mode)
+        self.review_background_channel = QComboBox()
+        self.review_background_channel.addItem("ChanB", "ChanB")
+        self.review_background_channel.addItem("ChanA", "ChanA")
+        self.review_background_channel.currentIndexChanged.connect(
+            self._load_review_view
+        )
+        display_form.addRow("Image background:", self.review_background_channel)
+        self.review_black = QSpinBox()
+        self.review_black.setRange(0, 65535)
+        self.review_black.valueChanged.connect(self._render_review_view)
+        display_form.addRow("Black level:", self.review_black)
+        self.review_white = QSpinBox()
+        self.review_white.setRange(1, 65535)
+        self.review_white.setValue(65535)
+        self.review_white.valueChanged.connect(self._render_review_view)
+        display_form.addRow("White level:", self.review_white)
+        review_auto = QPushButton("Set contrast automatically")
+        review_auto.clicked.connect(self._auto_review_contrast)
+        display_form.addRow(review_auto)
+        self.review_show_dendrites = QCheckBox("Dendrite shafts — green")
+        self.review_show_dendrites.setChecked(True)
+        self.review_show_dendrites.toggled.connect(self._render_review_view)
+        display_form.addRow(self.review_show_dendrites)
+        self.review_show_spines = QCheckBox("Spines — cyan")
+        self.review_show_spines.setChecked(True)
+        self.review_show_spines.toggled.connect(self._render_review_view)
+        display_form.addRow(self.review_show_spines)
+        self.review_show_clusters = QCheckBox("Protein clusters — magenta")
+        self.review_show_clusters.setChecked(True)
+        self.review_show_clusters.toggled.connect(self._render_review_view)
+        display_form.addRow(self.review_show_clusters)
+        self.review_projections_button = QPushButton(
+            "Generate XY/XZ/YZ maximum projections"
+        )
+        self.review_projections_button.clicked.connect(
+            lambda: self._open_context_view(True, "projections")
+        )
+        display_form.addRow(self.review_projections_button)
+        self.review_3d_button = QPushButton("Generate rotatable 3D object view")
+        self.review_3d_button.clicked.connect(
+            lambda: self._open_context_view(True, "3d")
+        )
+        display_form.addRow(self.review_3d_button)
+        side_layout.addWidget(display_group)
+
+        correction_group = QGroupBox("Hint-driven local correction")
+        correction_form = QFormLayout(correction_group)
+        correction_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        correction_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.review_object_type = QComboBox()
+        self.review_object_type.addItem("Dendrite", "dendrite")
+        self.review_object_type.addItem("Spine", "spine")
+        correction_form.addRow("Object type:", self.review_object_type)
+        self.review_operation = QComboBox()
+        for label, value in (
+            ("Add missed object", "add"),
+            ("Exclude object", "exclude"),
+            ("Exclude as filopodium", "filopodium"),
+            ("Split touching objects", "split"),
+            ("Merge objects", "merge"),
+            ("Expand boundary", "expand"),
+            ("Trim boundary", "trim"),
+            ("Accept object", "accept"),
+            ("Flag object for attention", "needs_attention"),
+        ):
+            self.review_operation.addItem(label, value)
+        self.review_operation.currentIndexChanged.connect(
+            self._review_tool_changed
+        )
+        correction_form.addRow("Action:", self.review_operation)
+        self.review_brush_radius = QSpinBox()
+        self.review_brush_radius.setRange(1, 100)
+        self.review_brush_radius.setValue(4)
+        self.review_brush_radius.setSuffix(" px")
+        self.review_brush_radius.valueChanged.connect(
+            self._review_brush_changed
+        )
+        correction_form.addRow("Hint brush radius:", self.review_brush_radius)
+        self.review_instruction = QLabel()
+        self.review_instruction.setWordWrap(True)
+        correction_form.addRow(self.review_instruction)
+        self.review_hint_status = QLabel("No hint drawn.")
+        correction_form.addRow(self.review_hint_status)
+        hint_buttons = QHBoxLayout()
+        self.clear_review_hint_button = QPushButton("Clear hint")
+        self.clear_review_hint_button.clicked.connect(self._clear_review_hint)
+        hint_buttons.addWidget(self.clear_review_hint_button)
+        self.undo_review_stroke_button = QPushButton("Undo drawn stroke")
+        self.undo_review_stroke_button.clicked.connect(
+            self._undo_review_stroke
+        )
+        hint_buttons.addWidget(self.undo_review_stroke_button)
+        correction_form.addRow(hint_buttons)
+        self.apply_review_button = QPushButton("Apply hint and resegment locally")
+        self.apply_review_button.setMinimumHeight(38)
+        self.apply_review_button.clicked.connect(self._apply_review_action)
+        correction_form.addRow(self.apply_review_button)
+        self.undo_review_action_button = QPushButton("Undo last applied correction")
+        self.undo_review_action_button.clicked.connect(self._undo_review_action)
+        correction_form.addRow(self.undo_review_action_button)
+        side_layout.addWidget(correction_group)
+
+        checkpoint_group = QGroupBox("Specimen checkpoint")
+        checkpoint_layout = QVBoxLayout(checkpoint_group)
+        self.review_comment = QLineEdit()
+        self.review_comment.setPlaceholderText("Optional note for this specimen")
+        checkpoint_layout.addWidget(self.review_comment)
+        checkpoint_buttons = QHBoxLayout()
+        self.save_review_progress_button = QPushButton("Save as in progress")
+        self.save_review_progress_button.clicked.connect(
+            lambda: self._save_review_state(False)
+        )
+        checkpoint_buttons.addWidget(self.save_review_progress_button)
+        self.complete_review_button = QPushButton("Mark review complete")
+        self.complete_review_button.clicked.connect(
+            lambda: self._save_review_state(True)
+        )
+        checkpoint_buttons.addWidget(self.complete_review_button)
+        checkpoint_layout.addLayout(checkpoint_buttons)
+        self.review_progress = QProgressBar()
+        self.review_progress.setVisible(False)
+        checkpoint_layout.addWidget(self.review_progress)
+        self.review_status = QLabel("Corrections affect only the selected specimen.")
+        self.review_status.setWordWrap(True)
+        checkpoint_layout.addWidget(self.review_status)
+        side_layout.addWidget(checkpoint_group)
+        side_layout.addStretch(1)
+        side_scroll.setWidget(side_panel)
+        splitter.addWidget(side_scroll)
+
+        viewer_panel = QWidget()
+        viewer_layout = QVBoxLayout(viewer_panel)
+        z_row = QHBoxLayout()
+        self.review_z_label = QLabel("Z: —")
+        self.review_z_label.setMinimumWidth(72)
+        z_row.addWidget(self.review_z_label)
+        self.review_z_slider = QSlider(Qt.Orientation.Horizontal)
+        self.review_z_slider.setRange(0, 0)
+        self.review_z_slider.valueChanged.connect(self._review_z_changed)
+        z_row.addWidget(self.review_z_slider, 1)
+        viewer_layout.addLayout(z_row)
+        self.review_view = ReviewCanvas(
+            "A detected specimen will appear here for optional correction"
+        )
+        self.review_view.hint_changed.connect(self._review_hint_changed)
+        review_scroll = QScrollArea()
+        review_scroll.setWidgetResizable(True)
+        review_scroll.setWidget(self.review_view)
+        viewer_layout.addWidget(review_scroll, 1)
+        splitter.addWidget(viewer_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([430, 950])
+
+        tab.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.tabs.addTab(tab, "4. Review and correction")
+        self._review_tool_changed()
 
     def _role_combo(self, selected: str) -> QComboBox:
         combo = QComboBox()
@@ -1122,6 +2437,7 @@ class MainWindow(QMainWindow):
         )
         self._prepare_preprocessing_tab()
         self._prepare_detection_tab()
+        self._prepare_review_tab()
 
     @Slot(str)
     def _batch_preprocessing_cancelled(self, message: str) -> None:
@@ -1246,6 +2562,8 @@ class MainWindow(QMainWindow):
     def _detection_pair_completed(
         self, specimen_index: int, summary: dict[str, object]
     ) -> None:
+        if not bool(summary.get("skipped", False)):
+            self._invalidate_context_views(specimen_index, corrected_only=False)
         self.detection_status.setText(
             f"Completed pair {specimen_index + 1}: {summary['dendrite_count']} dendrite "
             f"field(s), {summary['spine_count']} spine candidates, "
@@ -1260,6 +2578,7 @@ class MainWindow(QMainWindow):
             )
         if self.detection_specimen.currentData() == specimen_index:
             self._detection_specimen_changed()
+        self._prepare_review_tab()
 
     @Slot(object)
     def _detection_completed(self, result: dict[str, object]) -> None:
@@ -1268,6 +2587,7 @@ class MainWindow(QMainWindow):
             f"{float(result['elapsed_seconds']) / 60:.1f} min. All candidates are awaiting review."
         )
         self._prepare_detection_tab()
+        self._prepare_review_tab()
 
     @Slot(str)
     def _detection_cancelled(self, message: str) -> None:
@@ -1292,6 +2612,8 @@ class MainWindow(QMainWindow):
         checkpoint = self.manifest["specimens"][index]["checkpoints"]["detection"]
         summary = checkpoint.get("summary", {})
         if checkpoint.get("state") == "complete":
+            self.detection_projections_button.setEnabled(True)
+            self.detection_3d_button.setEnabled(True)
             self.detection_counts.setText(
                 f"{summary.get('dendrite_count', 0)} dendrites | "
                 f"{summary.get('spine_count', 0)} spines "
@@ -1301,6 +2623,8 @@ class MainWindow(QMainWindow):
             )
             self._load_detection_view()
         else:
+            self.detection_projections_button.setEnabled(False)
+            self.detection_3d_button.setEnabled(False)
             self._last_detection = None
             self.detection_counts.setText("No completed detection for this specimen.")
             self.detection_view.setText("Detection is not complete for this specimen.")
@@ -1359,24 +2683,755 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _prepare_review_tab(self) -> None:
+        if self._review_thread is not None:
+            self._review_refresh_pending = True
+            return
+        self._review_refresh_pending = False
+        if self.manifest is None:
+            self.tabs.setTabEnabled(3, False)
+            return
+        detected = [
+            index
+            for index, specimen in enumerate(self.manifest["specimens"])
+            if specimen["checkpoints"]["detection"].get("state") == "complete"
+        ]
+        self.tabs.setTabEnabled(3, bool(detected))
+        current = self.review_specimen.currentData()
+        self.review_specimen.blockSignals(True)
+        self.review_specimen.clear()
+        complete_count = 0
+        for index in detected:
+            specimen = self.manifest["specimens"][index]
+            state = str(specimen["review"].get("state", "needs_attention"))
+            if state == "complete":
+                complete_count += 1
+            self.review_specimen.addItem(
+                f"{specimen['experimental_group']} — {specimen['specimen_id']} [{state}]",
+                index,
+            )
+        if current is not None:
+            found = self.review_specimen.findData(current)
+            self.review_specimen.setCurrentIndex(max(0, found))
+        self.review_specimen.blockSignals(False)
+        self.review_queue_status.setText(
+            f"{len(detected)} detected specimen(s) available; "
+            f"{complete_count} marked review complete. New detections appear here immediately."
+        )
+        if detected:
+            self._review_specimen_changed()
+        else:
+            self._last_review = None
+            self.review_view.setText("Waiting for automatic detection to finish a specimen.")
+        self._set_review_busy(self._review_thread is not None)
+
+    def _selected_review_specimen(self) -> int:
+        value = self.review_specimen.currentData()
+        if value is None:
+            raise ValueError("Select a detected specimen to review.")
+        return int(value)
+
+    def _review_specimen_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.review_specimen.currentData() is None:
+            return
+        index = self._selected_review_specimen()
+        channel = str(self.review_background_channel.currentData() or "ChanB")
+        shape = self.manifest["specimens"][index]["channels"][channel]["metadata"][
+            "shape"
+        ]
+        z_count = 1 if len(shape) == 2 else int(shape[0])
+        self.review_z_slider.blockSignals(True)
+        self.review_z_slider.setRange(0, max(0, z_count - 1))
+        self.review_z_slider.setValue(max(0, (z_count - 1) // 2))
+        self.review_z_slider.blockSignals(False)
+        self._update_review_z_label()
+        specimen = self.manifest["specimens"][index]
+        self.review_comment.setText(str(specimen["review"].get("comment", "")))
+        self.review_view.clear_hint()
+        self._load_review_view(auto_contrast=True)
+        checkpoint = specimen["checkpoints"]["review"]
+        detection_summary = specimen["checkpoints"]["detection"].get("summary", {})
+        self.review_status.setText(
+            f"State: {specimen['review'].get('state', 'needs_attention')} | "
+            f"{checkpoint.get('edit_count', 0)} active edit(s) | "
+            f"automatic candidates: {detection_summary.get('dendrite_count', 0)} dendrites, "
+            f"{detection_summary.get('spine_count', 0)} spines, "
+            f"{detection_summary.get('cluster_count', 0)} clusters."
+        )
+
+    def _move_review_specimen(self, offset: int) -> None:
+        count = self.review_specimen.count()
+        if not count:
+            return
+        self.review_specimen.setCurrentIndex(
+            (self.review_specimen.currentIndex() + offset) % count
+        )
+
+    def _review_z_changed(self, value: int) -> None:
+        self._update_review_z_label()
+        self.review_view.clear_hint()
+        if self.review_view_mode.currentData() == "slice":
+            self._load_review_view(auto_contrast=False)
+
+    def _update_review_z_label(self) -> None:
+        prefix = (
+            "Reference Z"
+            if self.review_view_mode.currentData() == "xy_max"
+            else "Z"
+        )
+        self.review_z_label.setText(
+            f"{prefix}: {self.review_z_slider.value() + 1}/"
+            f"{self.review_z_slider.maximum() + 1}"
+        )
+
+    def _review_view_mode_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self.review_view.clear_hint()
+        self._update_review_z_label()
+        self._load_review_view(auto_contrast=True)
+
+    def _load_review_view(
+        self, *_args, auto_contrast: bool = False
+    ) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.review_specimen.currentData() is None:
+            return
+        if self.review_view_mode.currentData() == "xy_max":
+            self._load_review_projection(auto_contrast=auto_contrast)
+            return
+        try:
+            self._last_review = load_review_slice(
+                self.manifest,
+                self._selected_review_specimen(),
+                self.review_z_slider.value(),
+                str(self.review_background_channel.currentData()),
+            )
+            if auto_contrast:
+                self._auto_review_contrast()
+            else:
+                self._render_review_view()
+        except (OSError, ValueError, KeyError, IndexError) as exc:
+            self.review_view.setText(f"Cannot load review slice: {exc}")
+
+    def _load_review_projection(self, *, auto_contrast: bool) -> None:
+        if self.manifest is None or self.review_specimen.currentData() is None:
+            return
+        specimen_index = self._selected_review_specimen()
+        background_channel = str(self.review_background_channel.currentData())
+        signature = context_signature(
+            self.manifest, specimen_index, corrected=True
+        )
+        cache_key = (
+            specimen_index,
+            background_channel,
+            True,
+            signature,
+            False,
+            None,
+        )
+        if cache_key in self._context_cache:
+            self._display_review_projection(
+                self._context_cache[cache_key], auto_contrast=auto_contrast
+            )
+            return
+        request = (
+            cache_key,
+            specimen_index,
+            background_channel,
+            True,
+            "review_main",
+            self.review_z_slider.value(),
+            False,
+            None,
+            auto_contrast,
+        )
+        if self._context_thread is not None:
+            self.review_status.setText(
+                "Waiting for the current projection/3D generation to finish."
+            )
+            return
+        self._start_context_generation(request)
+
+    def _display_review_projection(
+        self, volume: ContextVolume, *, auto_contrast: bool
+    ) -> None:
+        self._last_review_context = volume
+        projection = volume.xy
+        self._last_review = ReviewSlice(
+            raw=projection.raw,
+            dendrites=projection.dendrites,
+            spines=projection.spines,
+            clusters=projection.clusters,
+            z_index=self.review_z_slider.value(),
+            z_count=volume.z_count,
+            corrected=volume.corrected,
+        )
+        self.review_status.setText(
+            "Drawable XY maximum projection ready. Projection hints infer their "
+            "3D Z location from objects or image signal."
+        )
+        if auto_contrast:
+            self._auto_review_contrast()
+        else:
+            self._render_review_view()
+
+    def _auto_review_contrast(self) -> None:
+        if self._last_review is None:
+            return
+        low, high = np.percentile(self._last_review.raw, (0.5, 99.8))
+        low_value = int(max(0, min(65534, round(float(low)))))
+        high_value = int(max(low_value + 1, min(65535, round(float(high)))))
+        self.review_black.blockSignals(True)
+        self.review_white.blockSignals(True)
+        self.review_black.setValue(low_value)
+        self.review_white.setValue(high_value)
+        self.review_black.blockSignals(False)
+        self.review_white.blockSignals(False)
+        self._render_review_view()
+
+    def _render_review_view(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self._last_review is None:
+            return
+        self.review_view.show_detection(
+            self._last_review.raw,
+            self.review_black.value(),
+            max(self.review_black.value() + 1, self.review_white.value()),
+            dendrites=(
+                self._last_review.dendrites
+                if self.review_show_dendrites.isChecked()
+                else None
+            ),
+            spines=(
+                self._last_review.spines if self.review_show_spines.isChecked() else None
+            ),
+            clusters=(
+                self._last_review.clusters
+                if self.review_show_clusters.isChecked()
+                else None
+            ),
+        )
+
+    def _review_tool_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        operation = str(self.review_operation.currentData())
+        if operation == "filopodium":
+            self.review_object_type.setCurrentIndex(
+                self.review_object_type.findData("spine")
+            )
+        instructions = {
+            "add": "Draw inside and along a missed object; the image signal determines its boundary.",
+            "exclude": "Touch an unwanted object to exclude the complete 3D object.",
+            "filopodium": "Touch a spine candidate to exclude and record it as a filopodium.",
+            "split": "Draw across the contact or neck that should separate one object into two.",
+            "merge": "Draw through at least two objects that should be one object.",
+            "expand": "Draw toward missing signal from an existing object; the boundary is regrown locally.",
+            "trim": "Draw across the excess part; the connected object is retained locally.",
+            "accept": "Touch an object to mark it accepted without changing its mask.",
+            "needs_attention": "Touch an object to retain it but flag it for later attention.",
+        }
+        self.review_instruction.setText(instructions.get(operation, "Draw a hint."))
+
+    def _review_brush_changed(self, value: int) -> None:
+        self.review_view.set_brush_radius(value)
+
+    def _review_hint_changed(self, count: int) -> None:
+        self.review_hint_status.setText(
+            f"Hint contains {count} sampled point(s)." if count else "No hint drawn."
+        )
+
+    def _clear_review_hint(self) -> None:
+        self.review_view.clear_hint()
+
+    def _undo_review_stroke(self) -> None:
+        self.review_view.undo_stroke()
+
+    def _apply_review_action(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            QMessageBox.information(self, "No project", "Save or open a project first.")
+            return
+        points = self.review_view.hint_points()
+        if not points:
+            QMessageBox.information(
+                self,
+                "Draw a hint",
+                "Draw or click on the current Z slice or XY maximum projection first.",
+            )
+            return
+        action = ReviewAction(
+            object_type=str(self.review_object_type.currentData()),
+            operation=str(self.review_operation.currentData()),
+            z_index=self.review_z_slider.value(),
+            points=points,
+            brush_radius_pixels=self.review_brush_radius.value(),
+            projection_hint=self.review_view_mode.currentData() == "xy_max",
+        )
+        self._start_review_worker(action)
+
+    def _undo_review_action(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        self._start_review_worker(None)
+
+    def _start_review_worker(self, action: ReviewAction | None) -> None:
+        if (
+            self._review_thread is not None
+            or self.manifest is None
+            or self.project_path is None
+        ):
+            return
+        try:
+            specimen_index = self._selected_review_specimen()
+        except ValueError as exc:
+            QMessageBox.information(self, "No specimen", str(exc))
+            return
+        worker = ReviewWorker(
+            self.manifest, self.project_path, specimen_index, action
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._update_review_progress)
+        worker.completed.connect(self._review_action_completed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(self._review_action_failed)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._review_worker_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._review_thread = thread
+        self._review_worker = worker
+        self._set_review_busy(True)
+        thread.start()
+
+    @Slot(str, int, int, str)
+    def _update_review_progress(
+        self, phase: str, current: int, total: int, detail: str
+    ) -> None:
+        self.review_progress.setVisible(True)
+        self.review_progress.setRange(0, max(1, total))
+        self.review_progress.setValue(current)
+        self.review_status.setText(f"{phase}: {detail}")
+
+    @Slot(object)
+    def _review_action_completed(self, result) -> None:  # type: ignore[no-untyped-def]
+        self._invalidate_context_views(result.specimen_index, corrected_only=True)
+        self.review_view.clear_hint()
+        self._load_review_view(auto_contrast=False)
+        self.review_status.setText(
+            f"Saved {result.operation}: {result.dendrite_count} dendrites, "
+            f"{result.spine_count} spines; {result.edit_count} active edit(s). "
+            "An automatic specimen checkpoint was written."
+        )
+
+    @Slot(str)
+    def _review_action_failed(self, message: str) -> None:
+        self.review_status.setText("Correction was not applied; the previous mask is intact.")
+        QMessageBox.warning(self, "Cannot apply correction", message)
+
+    @Slot()
+    def _review_worker_finished(self) -> None:
+        if self._review_worker is not None:
+            self._review_worker.deleteLater()
+        self._review_worker = None
+        self._review_thread = None
+        self.review_progress.setVisible(False)
+        self._set_review_busy(False)
+        if self._review_refresh_pending:
+            self._prepare_review_tab()
+        else:
+            self._refresh_review_specimen_label()
+
+    def _set_review_busy(self, busy: bool) -> None:
+        has_specimen = self.review_specimen.count() > 0
+        for widget in (
+            self.review_specimen,
+            self.previous_review_button,
+            self.next_review_button,
+            self.review_view_mode,
+            self.review_background_channel,
+            self.review_z_slider,
+            self.review_object_type,
+            self.review_operation,
+            self.review_brush_radius,
+            self.review_projections_button,
+            self.review_3d_button,
+            self.clear_review_hint_button,
+            self.undo_review_stroke_button,
+            self.apply_review_button,
+            self.undo_review_action_button,
+            self.save_review_progress_button,
+            self.complete_review_button,
+        ):
+            widget.setEnabled(has_specimen and not busy)
+        self.review_view.setEnabled(has_specimen and not busy)
+
+    def _refresh_review_specimen_label(self) -> None:
+        if self.manifest is None or self.review_specimen.currentData() is None:
+            return
+        index = self._selected_review_specimen()
+        specimen = self.manifest["specimens"][index]
+        self.review_specimen.setItemText(
+            self.review_specimen.currentIndex(),
+            f"{specimen['experimental_group']} — {specimen['specimen_id']} "
+            f"[{specimen['review'].get('state', 'needs_attention')}]",
+        )
+
+    def _save_review_state(self, complete: bool) -> None:
+        if (
+            self.manifest is None
+            or self.project_path is None
+            or self._review_thread is not None
+        ):
+            return
+        try:
+            set_specimen_review_state(
+                self.manifest,
+                self.project_path,
+                self._selected_review_specimen(),
+                complete=complete,
+                comment=self.review_comment.text(),
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot save review checkpoint", str(exc))
+            return
+        self._refresh_review_specimen_label()
+        state = "complete" if complete else "in progress"
+        self.review_status.setText(
+            f"Specimen review marked {state}; comment and checkpoint saved."
+        )
+        if complete:
+            self._move_review_specimen(1)
+
+    def _open_context_view(self, corrected: bool, view: str) -> None:
+        if self.manifest is None:
+            return
+        if corrected and self._review_thread is not None:
+            QMessageBox.information(
+                self,
+                "Correction in progress",
+                "Wait for the current correction to finish before generating 3D context.",
+            )
+            return
+        try:
+            specimen_index = (
+                self._selected_review_specimen()
+                if corrected
+                else int(self.detection_specimen.currentData())
+            )
+        except (TypeError, ValueError):
+            QMessageBox.information(
+                self, "No specimen", "Select a completed detection first."
+            )
+            return
+        specimen = self.manifest["specimens"][specimen_index]
+        if specimen["checkpoints"]["detection"].get("state") != "complete":
+            QMessageBox.information(
+                self, "Detection incomplete", "This specimen is not ready for 3D viewing."
+            )
+            return
+        background_channel = str(
+            self.review_background_channel.currentData()
+            if corrected
+            else self.detection_background_channel.currentData()
+        )
+        signature = context_signature(
+            self.manifest, specimen_index, corrected=corrected
+        )
+        cache_key = (
+            specimen_index,
+            background_channel,
+            corrected,
+            signature,
+            False,
+            None,
+        )
+        request_view = "select_area" if view == "3d" else "projections"
+        request = (
+            cache_key,
+            specimen_index,
+            background_channel,
+            corrected,
+            request_view,
+            self.review_z_slider.value()
+            if corrected
+            else self.detection_z_slider.value(),
+            False,
+            None,
+            False,
+        )
+        if cache_key in self._context_cache:
+            if request_view == "select_area":
+                self._show_area_selection(request, self._context_cache[cache_key])
+            else:
+                self._show_context_dialog(request, self._context_cache[cache_key])
+            return
+        if self._context_thread is not None:
+            QMessageBox.information(
+                self,
+                "3D view in progress",
+                "Wait for the current projection/3D view to finish generating.",
+            )
+            return
+        self._start_context_generation(request)
+
+    def _start_context_generation(self, request: tuple[object, ...]) -> None:
+        if self.manifest is None or self._context_thread is not None:
+            return
+        (
+            _,
+            specimen_index,
+            background_channel,
+            corrected,
+            _,
+            _,
+            include_3d,
+            roi_xy,
+            _,
+        ) = request
+        worker = ContextWorker(
+            self.manifest,
+            int(specimen_index),
+            str(background_channel),
+            bool(corrected),
+            bool(include_3d),
+            roi_xy,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._context_progress_updated)
+        worker.completed.connect(self._context_completed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(self._context_failed)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(self._context_cancelled)
+        worker.cancelled.connect(thread.quit)
+        thread.finished.connect(self._context_finished)
+        thread.finished.connect(thread.deleteLater)
+        progress_dialog = QProgressDialog(
+            "Preparing projections and 3D objects…", "Cancel", 0, 1, self
+        )
+        progress_dialog.setWindowTitle("Generating 3D context")
+        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.setAutoClose(False)
+        progress_dialog.setAutoReset(False)
+        progress_dialog.canceled.connect(worker.cancel)
+        progress_dialog.show()
+        self._context_thread = thread
+        self._context_worker = worker
+        self._context_progress = progress_dialog
+        self._context_request = request
+        thread.start()
+
+    @Slot(str, int, int, str)
+    def _context_progress_updated(
+        self, phase: str, current: int, total: int, detail: str
+    ) -> None:
+        if self._context_progress is None:
+            return
+        self._context_progress.setRange(0, max(1, total))
+        self._context_progress.setValue(current)
+        self._context_progress.setLabelText(f"{phase}\n{detail}")
+
+    @Slot(object)
+    def _context_completed(self, volume: ContextVolume) -> None:
+        if self._context_request is None:
+            return
+        cache_key = self._context_request[0]
+        self._context_cache[cache_key] = volume
+        while len(self._context_cache) > 2:
+            oldest = next(iter(self._context_cache))
+            del self._context_cache[oldest]
+        view = str(self._context_request[4])
+        if view == "select_area":
+            self._show_area_selection(self._context_request, volume)
+        elif view == "review_main":
+            self._display_review_projection(
+                volume, auto_contrast=bool(self._context_request[8])
+            )
+        else:
+            self._show_context_dialog(self._context_request, volume)
+
+    def _show_context_dialog(
+        self, request: tuple[object, ...], volume: ContextVolume
+    ) -> None:
+        if self.manifest is None:
+            return
+        _, specimen_index, _, corrected, view, initial_z, _, _, _ = request
+        specimen = self.manifest["specimens"][int(specimen_index)]
+        source_label = (
+            "corrected review masks"
+            if bool(corrected) and volume.corrected
+            else "automatic detection masks"
+        )
+        dialog = ContextViewerDialog(
+            f"{specimen['experimental_group']} — {specimen['specimen_id']} | {source_label}",
+            volume,
+            int(initial_z),
+            self,
+        )
+        dialog.setProperty("specimen_index", int(specimen_index))
+        dialog.setProperty("corrected", bool(corrected))
+        dialog.z_selected.connect(
+            lambda z, index=int(specimen_index), review=bool(corrected): self._context_z_selected(
+                index, review, z
+            )
+        )
+        dialog.destroyed.connect(
+            lambda *_args, target=dialog: self._forget_context_dialog(target)
+        )
+        self._context_dialogs.append(dialog)
+        dialog.select_view(str(view))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _show_area_selection(
+        self, request: tuple[object, ...], volume: ContextVolume
+    ) -> None:
+        if self.manifest is None:
+            return
+        _, specimen_index, _, corrected, _, _, _, _, _ = request
+        specimen = self.manifest["specimens"][int(specimen_index)]
+        if self._area_dialog is not None:
+            self._area_dialog.close()
+        dialog = AreaSelectionDialog(
+            f"Select area for 3D — {specimen['experimental_group']} — "
+            f"{specimen['specimen_id']}",
+            volume,
+            self,
+        )
+        dialog.area_selected.connect(
+            lambda roi, source_request=request: self._generate_cropped_3d(
+                source_request, roi
+            )
+        )
+        dialog.destroyed.connect(lambda *_args: self._clear_area_dialog(dialog))
+        self._area_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _clear_area_dialog(self, dialog: AreaSelectionDialog) -> None:
+        if self._area_dialog is dialog:
+            self._area_dialog = None
+
+    def _generate_cropped_3d(
+        self, source_request: tuple[object, ...], roi
+    ) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None:
+            return
+        if self._context_thread is not None:
+            QTimer.singleShot(
+                100, lambda: self._generate_cropped_3d(source_request, roi)
+            )
+            return
+        (
+            _,
+            specimen_index,
+            background_channel,
+            corrected,
+            _,
+            initial_z,
+            _,
+            _,
+            _,
+        ) = source_request
+        rectangle = tuple(int(value) for value in roi)
+        signature = context_signature(
+            self.manifest, int(specimen_index), corrected=bool(corrected)
+        )
+        cache_key = (
+            int(specimen_index),
+            str(background_channel),
+            bool(corrected),
+            signature,
+            True,
+            rectangle,
+        )
+        request = (
+            cache_key,
+            int(specimen_index),
+            str(background_channel),
+            bool(corrected),
+            "3d",
+            int(initial_z),
+            True,
+            rectangle,
+            False,
+        )
+        if cache_key in self._context_cache:
+            self._show_context_dialog(request, self._context_cache[cache_key])
+        else:
+            self._start_context_generation(request)
+
+    def _forget_context_dialog(self, dialog: ContextViewerDialog) -> None:
+        if dialog in self._context_dialogs:
+            self._context_dialogs.remove(dialog)
+
+    def _context_z_selected(self, specimen_index: int, corrected: bool, z: int) -> None:
+        combo = self.review_specimen if corrected else self.detection_specimen
+        if combo.currentData() != specimen_index:
+            return
+        slider = self.review_z_slider if corrected else self.detection_z_slider
+        slider.setValue(max(slider.minimum(), min(slider.maximum(), z)))
+
+    @Slot(str)
+    def _context_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "Cannot generate 3D context", message)
+
+    @Slot(str)
+    def _context_cancelled(self, message: str) -> None:
+        self.statusBar().showMessage(message, 5000)
+
+    @Slot()
+    def _context_finished(self) -> None:
+        if self._context_progress is not None:
+            self._context_progress.close()
+            self._context_progress.deleteLater()
+        if self._context_worker is not None:
+            self._context_worker.deleteLater()
+        self._context_progress = None
+        self._context_worker = None
+        self._context_thread = None
+        self._context_request = None
+
+    def _invalidate_context_views(
+        self, specimen_index: int, *, corrected_only: bool
+    ) -> None:
+        for key in list(self._context_cache):
+            if int(key[0]) == specimen_index and (not corrected_only or bool(key[2])):
+                del self._context_cache[key]
+        for dialog in list(self._context_dialogs):
+            if int(dialog.property("specimen_index")) == specimen_index and (
+                not corrected_only or bool(dialog.property("corrected"))
+            ):
+                dialog.close()
+
     def _scan_source(self) -> None:
+        if self._review_thread is not None:
+            QMessageBox.information(
+                self, "Review in progress", "Wait for the current correction to finish."
+            )
+            return
         directory = Path(self.source_edit.text().strip())
         if not directory.is_dir():
             QMessageBox.warning(self, "Invalid folder", "Select an existing TIFF folder.")
             return
         if not self.output_edit.text().strip():
             self.output_edit.setText(str(directory / "Synpo Results"))
+        for dialog in list(self._context_dialogs):
+            dialog.close()
+        self._context_cache.clear()
         self.report = None
         self.manifest = None
         self.project_path = None
+        self._last_review = None
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
+        self.tabs.setTabEnabled(3, False)
         worker = ScanWorker(directory)
         worker.completed.connect(self._scan_completed)
         self._start_worker(worker, "scan")
 
     def _start_worker(self, worker: QObject, kind: str) -> None:
-        if self._job_thread is not None:
+        if self._job_thread is not None or self._review_thread is not None:
             QMessageBox.information(self, "Work in progress", "Wait for the current operation to finish.")
             return
         thread = QThread(self)
@@ -1527,6 +3582,11 @@ class MainWindow(QMainWindow):
         return roles
 
     def _save_project(self) -> None:
+        if self._review_thread is not None:
+            QMessageBox.information(
+                self, "Review in progress", "Wait for the current correction to finish."
+            )
+            return
         try:
             if self.report is not None:
                 self._sync_scan_edits()
@@ -1563,12 +3623,18 @@ class MainWindow(QMainWindow):
             self.project_path = save_project(self.project_path, self.manifest)
             self._prepare_preprocessing_tab()
             self._prepare_detection_tab()
+            self._prepare_review_tab()
             self.statusBar().showMessage(f"Saved {self.project_path}", 8000)
             self.setWindowTitle(f"Synpo Microscopy Processor — {self.project_path.name}")
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot save project", str(exc))
 
     def _open_project(self) -> None:
+        if self._review_thread is not None:
+            QMessageBox.information(
+                self, "Review in progress", "Wait for the current correction to finish."
+            )
+            return
         selected, _ = QFileDialog.getOpenFileName(
             self,
             "Open Synpo project",
@@ -1584,11 +3650,15 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Cannot open project", str(exc))
             return
         self.report = None
+        for dialog in list(self._context_dialogs):
+            dialog.close()
+        self._context_cache.clear()
         self.manifest = manifest
         self.project_path = Path(selected).resolve()
         self._populate_manifest(manifest)
         self._prepare_preprocessing_tab()
         self._prepare_detection_tab()
+        self._prepare_review_tab()
         missing = sum(item["status"] != "ok" for item in quick_results)
         if missing:
             self.summary_label.setText(
@@ -1685,20 +3755,30 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("Verification complete")
 
     def _new_batch(self) -> None:
-        if self._job_thread is not None:
+        if (
+            self._job_thread is not None
+            or self._review_thread is not None
+            or self._context_thread is not None
+        ):
             return
+        for dialog in list(self._context_dialogs):
+            dialog.close()
+        self._context_cache.clear()
         self.report = None
         self.manifest = None
         self.project_path = None
         self._last_preview = None
+        self._last_detection = None
+        self._last_review = None
         self._preview_statistics.clear()
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
+        self.tabs.setTabEnabled(3, False)
         self.source_edit.clear()
         self.output_edit.clear()
         self.table.setRowCount(0)
         self.summary_label.setText("Select a folder and scan it to begin.")
-        self.setWindowTitle("Synpo Microscopy Processor — Stage 3")
+        self.setWindowTitle("Synpo Microscopy Processor — Stage 4")
 
     def _set_job_running(self, running: bool) -> None:
         self.progress_bar.setVisible(running)
@@ -1736,6 +3816,22 @@ class MainWindow(QMainWindow):
             )
         if not running and not self.progress_label.text():
             self.progress_label.setText("Ready")
+
+    def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if (
+            self._job_thread is not None
+            or self._review_thread is not None
+            or self._context_thread is not None
+        ):
+            QMessageBox.information(
+                self,
+                "Operation in progress",
+                "Cancel the batch operation if needed and wait for the current safe "
+                "step or correction to finish before closing Synpo.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 def main() -> int:

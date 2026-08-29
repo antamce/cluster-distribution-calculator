@@ -644,13 +644,28 @@ def detect_project(
             progress=specimen_progress,
             cancel_event=cancel_event,
         )
+        current_signature = detection_signature(manifest, specimen_index, settings)
+        review_checkpoint = specimen["checkpoints"].get("review", {})
+        if (
+            review_checkpoint.get("state") not in {None, "not_started"}
+            and review_checkpoint.get("detection_signature") != current_signature
+        ):
+            specimen["review"] = {
+                "state": "needs_attention",
+                "comment": "",
+                "history": [],
+                "object_status": {"dendrite": {}, "spine": {}},
+            }
+            specimen["checkpoints"]["review"] = {
+                "state": "not_started",
+                "updated_at": time.time(),
+                "edit_count": 0,
+            }
         checkpoint.update(
             {
                 "state": "complete",
                 "updated_at": time.time(),
-                "settings_signature": detection_signature(
-                    manifest, specimen_index, settings
-                ),
+                "settings_signature": current_signature,
                 "cache_path": str(detection_cache_path(manifest)),
                 "summary": summary.to_dict(),
             }
