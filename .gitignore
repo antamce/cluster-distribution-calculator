@@ -14,3 +14,4 @@ Synpo Results/
 .synpo-cache/
 .stage*-benchmark/
 .ui-*-smoke/
+/icon.jpg

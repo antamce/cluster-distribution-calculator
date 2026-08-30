@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, QRectF, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -5089,7 +5089,12 @@ def main() -> int:
     application = QApplication(sys.argv)
     application.setApplicationName("Synpo Microscopy Processor")
     application.setOrganizationName("Synpo")
+    icon_path = Path(__file__).resolve().parent / "assets" / "synpo.ico"
+    if icon_path.is_file():
+        application.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
+    if icon_path.is_file():
+        window.setWindowIcon(QIcon(str(icon_path)))
     window.show()
     return application.exec()
 
