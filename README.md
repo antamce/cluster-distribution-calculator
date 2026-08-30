@@ -7,7 +7,7 @@ review. Raw TIFFs are never modified or copied.
 
 ## Current project status
 
-The current version is `0.6.0`. Stages 1–5 are user-approved. Stage 6 curved-axis
+The current version is `0.6.1`. Stages 1–5 are user-approved. Stage 6 curved-axis
 protein-distribution analysis, review, and tabular export are ready for testing. See
 [HANDOFF.md](HANDOFF.md) for architecture, scientific constraints, benchmarks, and
 the remaining roadmap.
@@ -204,6 +204,21 @@ is recalculated, and the review advances. Group profiles first average eligible
 spines within each specimen, then average specimen means by experimental group;
 the screen shows SEM across specimen means. Line profiles are the default, with a
 bar-chart switch and automatic or fixed 0–1 scaling.
+
+The cropped spine viewer normally remains an XY maximum projection and requires no
+manual correction. If the automatic distal endpoint is wrong, press **Centerline
+end hint**. The same panel switches to an exact Z-slice viewer with a slider limited
+to the first and last slices occupied by that spine; the XY crop includes the full
+spine and a 1 µm margin. Click near the spine to place the endpoint. Synpo snaps the
+dot to the nearest selected-spine voxel on that slice, rebuilds the path from the
+read-only automatic base, checkpoints it, and returns to the maximum projection.
+The base is green, the endpoint is magenta, and invalid clicks appear only in the
+status line. **Clear end hint** restores automatic endpoint detection.
+
+Placed, replaced, cleared, and resegmentation-invalidated hints remain in audit
+history. A hint invalidated by later mask correction falls back to the automatic
+endpoint and returns the spine to the unreviewed queue. Excel/CSV rows save both
+endpoint coordinates, source and validity; validation PDFs show both endpoint dots.
 
 The export button creates one verified Excel workbook plus CSV copies of every
 sheet. Sheets include master specimen/dendrite/spine/cluster rows,

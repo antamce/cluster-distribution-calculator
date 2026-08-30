@@ -14,9 +14,11 @@ from synpo.detection import detection_cache_path
 from synpo.measurements import (
     MeasurementSettings,
     _cluster_keep_lookup,
+    clear_centerline_endpoint_hint,
     cluster_end_comparison_rows,
     load_measurement_result,
     measure_project,
+    set_centerline_endpoint_hint,
     set_distribution_review,
 )
 from synpo.distribution import calculate_spine_distribution
@@ -85,9 +87,9 @@ class MeasurementTests(unittest.TestCase):
         dendrites = np.zeros(shape, dtype=np.uint32)
         dendrites[:, 11:14, 2:22] = 1
         spines = np.zeros(shape, dtype=np.uint32)
-        spines[1:5, 7:11, 6:10] = 1
+        spines[1:4, 7:11, 6:18] = 1
         clusters = np.zeros(shape, dtype=np.uint32)
-        clusters[0:5, 8:10, 7:9] = 1
+        clusters[1:4, 8:10, 7:9] = 1
         clusters[2:5, 2:4, 17:19] = 2
         source = Path(str(manifest["source_directory"]))
         source.mkdir(parents=True)
@@ -131,9 +133,9 @@ class MeasurementTests(unittest.TestCase):
             self.assertEqual(len(result["distribution_rows"]), 1)
             self.assertEqual(result["distribution_rows"][0]["spine_id"], 1)
             self.assertEqual(result["spine_rows"][0]["included_cluster_count"], 1)
-            self.assertAlmostEqual(result["spine_rows"][0]["volume_um3"], 0.32)
+            self.assertAlmostEqual(result["spine_rows"][0]["volume_um3"], 0.72)
             self.assertAlmostEqual(
-                result["spine_rows"][0]["cluster_to_spine_volume_ratio"], 0.25
+                result["spine_rows"][0]["cluster_to_spine_volume_ratio"], 1 / 12
             )
             individual = [
                 row
@@ -147,12 +149,12 @@ class MeasurementTests(unittest.TestCase):
             ]
             self.assertEqual(len(individual), 1)
             self.assertEqual(len(sums), 1)
-            self.assertAlmostEqual(individual[0]["overlap_percent"], 80.0)
+            self.assertAlmostEqual(individual[0]["overlap_percent"], 100.0)
             self.assertAlmostEqual(
-                individual[0]["cluster_volume_to_spine_volume_ratio"], 0.25
+                individual[0]["cluster_volume_to_spine_volume_ratio"], 1 / 12
             )
             self.assertAlmostEqual(
-                sums[0]["cluster_volume_to_spine_volume_ratio"], 0.25
+                sums[0]["cluster_volume_to_spine_volume_ratio"], 1 / 12
             )
             self.assertEqual(
                 manifest["specimens"][0]["checkpoints"]["measurements"]["state"],
@@ -163,14 +165,67 @@ class MeasurementTests(unittest.TestCase):
             self.assertIn("fixed_candidate_volume_um3", comparison[0])
             self.assertIn("adaptive_candidate_volume_um3", comparison[0])
 
+            hinted_point = (3, 8, 17)
+            set_centerline_endpoint_hint(
+                manifest, project_path, 0, 1, hinted_point
+            )
+            hinted = load_measurement_result(manifest, 0)
+            hinted_row = hinted["distribution_rows"][0]
+            self.assertEqual(hinted_row["centerline_endpoint_source"], "manual")
+            self.assertEqual(hinted_row["centerline_endpoint_zyx"], list(hinted_point))
+            self.assertTrue(hinted_row["centerline_endpoint_hint_valid"])
+            self.assertEqual(hinted_row["centerline_hint_history"][-1]["action"], "placed")
+            set_distribution_review(
+                manifest,
+                project_path,
+                0,
+                1,
+                distribution_included=True,
+                invalid_spine=False,
+                note="endpoint checked",
+            )
+            reviewed_hint = load_measurement_result(manifest, 0)["distribution_rows"][0]
+            self.assertEqual(reviewed_hint["centerline_endpoint_source"], "manual")
+            self.assertEqual(reviewed_hint["centerline_hint_history"][-1]["action"], "placed")
+
+            replacement = (2, 9, 17)
+            set_centerline_endpoint_hint(
+                manifest, project_path, 0, 1, replacement
+            )
+            replaced = load_measurement_result(manifest, 0)["distribution_rows"][0]
+            self.assertEqual(replaced["centerline_endpoint_zyx"], list(replacement))
+            self.assertEqual(replaced["centerline_hint_history"][-1]["action"], "replaced")
+
+            detection_root = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )
+            detection_root["specimens/0000/spine_labels"][replacement] = 0
+            manifest["specimens"][0]["checkpoints"]["measurements"]["state"] = "not_started"
+            measure_project(manifest, project_path)
+            invalid_hint = load_measurement_result(manifest, 0)["distribution_rows"][0]
+            self.assertEqual(invalid_hint["centerline_endpoint_source"], "automatic")
+            self.assertTrue(invalid_hint["centerline_endpoint_hint_present"])
+            self.assertFalse(invalid_hint["centerline_endpoint_hint_valid"])
+            self.assertFalse(invalid_hint["distribution_reviewed"])
+            self.assertEqual(
+                invalid_hint["centerline_hint_history"][-1]["action"],
+                "invalidated_by_resegmentation",
+            )
+
             export = export_measurements(
                 manifest,
                 root / "measurements.xlsx",
-                excluded_audit_pdf=True,
+                validation_pdf=True,
             )
             self.assertTrue(Path(str(export["workbook"])).is_file())
             self.assertTrue((root / "measurements_csv" / "Distribution_Individual.csv").is_file())
             self.assertEqual(len(export["pdfs"]), 1)
+
+            clear_centerline_endpoint_hint(manifest, project_path, 0, 1)
+            cleared = load_measurement_result(manifest, 0)["distribution_rows"][0]
+            self.assertEqual(cleared["centerline_endpoint_source"], "automatic")
+            self.assertFalse(cleared["centerline_endpoint_hint_present"])
+            self.assertEqual(cleared["centerline_hint_history"][-1]["action"], "cleared")
 
             set_distribution_review(
                 manifest,
@@ -232,6 +287,18 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(sum(result.spine_voxels_by_bin), int(spine.sum()))
         self.assertEqual(sum(result.cluster_voxels_by_bin), int(clusters.sum()))
         self.assertGreater(len(result.axis_points_zyx), 10)
+
+        hinted_endpoint = centers[13]
+        hinted = calculate_spine_distribution(
+            spine,
+            dendrite,
+            clusters,
+            sampling_zyx_um=(0.5, 0.1, 0.1),
+            endpoint_hint_zyx=hinted_endpoint,
+        )
+        self.assertEqual(hinted.endpoint_source, "manual")
+        self.assertEqual(hinted.endpoint_zyx, hinted_endpoint)
+        self.assertEqual(sum(hinted.spine_voxels_by_bin), int(spine.sum()))
 
 
 if __name__ == "__main__":

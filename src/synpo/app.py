@@ -83,11 +83,13 @@ from .measurements import (
     DistributionPreview,
     MeasurementSettings,
     cluster_end_comparison_rows,
+    clear_centerline_endpoint_hint,
     distribution_summary_rows,
     load_cluster_trim_preview,
     load_distribution_preview,
     load_measurement_result,
     measure_project,
+    set_centerline_endpoint_hint,
     set_distribution_review,
 )
 from .exporting import export_measurements
@@ -210,6 +212,34 @@ class SliceView(QLabel):
             rgb.data, width, height, rgb.strides[0], QImage.Format.Format_RGB888
         ).copy()
         self._render()
+
+
+class EndpointHintView(SliceView):
+    point_clicked = Signal(int, int)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if (
+            event.button() != Qt.MouseButton.LeftButton
+            or self._image is None
+            or self.pixmap() is None
+        ):
+            super().mousePressEvent(event)
+            return
+        pixmap = self.pixmap()
+        left = (self.width() - pixmap.width()) / 2.0
+        top = (self.height() - pixmap.height()) / 2.0
+        position = event.position()
+        if not (
+            left <= position.x() < left + pixmap.width()
+            and top <= position.y() < top + pixmap.height()
+        ):
+            return
+        x = int((position.x() - left) * self._image.width() / pixmap.width())
+        y = int((position.y() - top) * self._image.height() / pixmap.height())
+        self.point_clicked.emit(
+            min(self._image.width() - 1, max(0, x)),
+            min(self._image.height() - 1, max(0, y)),
+        )
 
 
 class DistributionChart(QWidget):
@@ -1429,6 +1459,50 @@ class DistributionPreviewWorker(QObject):
         self.completed.emit(preview)
 
 
+class CenterlineHintWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        project_path: Path,
+        specimen_index: int,
+        spine_id: int,
+        point_zyx: tuple[int, int, int] | None,
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        self.specimen_index = specimen_index
+        self.spine_id = spine_id
+        self.point_zyx = point_zyx
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            if self.point_zyx is None:
+                result = clear_centerline_endpoint_hint(
+                    self.manifest,
+                    self.project_path,
+                    self.specimen_index,
+                    self.spine_id,
+                )
+            else:
+                result = set_centerline_endpoint_hint(
+                    self.manifest,
+                    self.project_path,
+                    self.specimen_index,
+                    self.spine_id,
+                    self.point_zyx,
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
 class ExportWorker(QObject):
     progress = Signal(str, int, int, str)
     completed = Signal(object)
@@ -1647,6 +1721,7 @@ class MainWindow(QMainWindow):
         self._last_trim_preview: ClusterTrimPreview | None = None
         self._last_distribution_preview: DistributionPreview | None = None
         self._preferred_distribution_spine_id: int | None = None
+        self._centerline_hint_pending_reload = False
         self._review_thread: QThread | None = None
         self._review_worker: ReviewWorker | None = None
         self._review_refresh_pending = False
@@ -2458,6 +2533,13 @@ class MainWindow(QMainWindow):
         self.distribution_spine = QComboBox()
         self.distribution_spine.currentIndexChanged.connect(self._distribution_spine_changed)
         distribution_form.addRow("Review spine:", self.distribution_spine)
+        self.centerline_hint_button = QPushButton("Centerline end hint")
+        self.centerline_hint_button.setCheckable(True)
+        self.centerline_hint_button.toggled.connect(self._centerline_hint_mode_changed)
+        distribution_form.addRow(self.centerline_hint_button)
+        self.clear_centerline_hint_button = QPushButton("Clear end hint")
+        self.clear_centerline_hint_button.clicked.connect(self._clear_centerline_hint)
+        distribution_form.addRow(self.clear_centerline_hint_button)
         self.distribution_include = QCheckBox("Include in distribution summaries")
         self.distribution_include.setChecked(True)
         distribution_form.addRow(self.distribution_include)
@@ -2556,8 +2638,19 @@ class MainWindow(QMainWindow):
         self.distribution_preview_status = QLabel("The first unreviewed cluster-positive spine opens automatically.")
         self.distribution_preview_status.setWordWrap(True)
         distribution_layout.addWidget(self.distribution_preview_status)
+        self.distribution_z_controls = QWidget()
+        distribution_z_layout = QHBoxLayout(self.distribution_z_controls)
+        distribution_z_layout.setContentsMargins(0, 0, 0, 0)
+        self.distribution_z_label = QLabel("Spine Z")
+        self.distribution_z_slider = QSlider(Qt.Orientation.Horizontal)
+        self.distribution_z_slider.valueChanged.connect(self._distribution_z_changed)
+        distribution_z_layout.addWidget(self.distribution_z_label)
+        distribution_z_layout.addWidget(self.distribution_z_slider, 1)
+        self.distribution_z_controls.setVisible(False)
+        distribution_layout.addWidget(self.distribution_z_controls)
         preview_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.distribution_dendrite_view = SliceView("Dendrite/spine distribution preview")
+        self.distribution_dendrite_view = EndpointHintView("Dendrite/spine distribution preview")
+        self.distribution_dendrite_view.point_clicked.connect(self._centerline_hint_clicked)
         self.distribution_protein_view = SliceView("Protein-cluster distribution preview")
         self.distribution_dendrite_view.setMinimumSize(320, 260)
         self.distribution_protein_view.setMinimumSize(320, 260)
@@ -3428,6 +3521,12 @@ class MainWindow(QMainWindow):
             return
         specimen_index = int(self.measurement_specimen.currentData())
         spine_id = int(self.distribution_spine.currentData())
+        self._last_distribution_preview = None
+        self.centerline_hint_button.setEnabled(False)
+        self.centerline_hint_button.blockSignals(True)
+        self.centerline_hint_button.setChecked(False)
+        self.centerline_hint_button.blockSignals(False)
+        self.distribution_z_controls.setVisible(False)
         try:
             result = load_measurement_result(self.manifest, specimen_index)
             row = next(item for item in result.get("distribution_rows", []) if int(item["spine_id"]) == spine_id)
@@ -3442,6 +3541,9 @@ class MainWindow(QMainWindow):
         self.distribution_note.setText(str(row.get("review_note", "")))
         self.distribution_include.blockSignals(False)
         self.distribution_invalid.blockSignals(False)
+        self.clear_centerline_hint_button.setEnabled(
+            bool(row.get("centerline_endpoint_hint_present", False))
+        )
         self.distribution_preview_status.setText(
             f"Loading spine {spine_id}: {row.get('distribution_axis_status', '')}. "
             f"{row.get('distribution_axis_note', '')}"
@@ -3458,11 +3560,24 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _distribution_preview_completed(self, preview: DistributionPreview) -> None:
         self._last_distribution_preview = preview
-        self.distribution_dendrite_view.show_rgb(
-            self._distribution_overlay(preview.dendrite_projection, preview.spine_bins_projection, preview.axis_xy)
+        self.centerline_hint_button.setEnabled(True)
+        self.distribution_z_slider.blockSignals(True)
+        self.distribution_z_slider.setRange(*preview.spine_z_range)
+        preferred_z = (
+            preview.endpoint_local_zyx[0]
+            if preview.endpoint_local_zyx is not None
+            else preview.spine_z_range[0]
         )
+        self.distribution_z_slider.setValue(
+            min(preview.spine_z_range[1], max(preview.spine_z_range[0], preferred_z))
+        )
+        self.distribution_z_slider.blockSignals(False)
+        self._render_distribution_dendrite_view()
         self.distribution_protein_view.show_rgb(
             self._distribution_overlay(preview.protein_projection, preview.cluster_bins_projection, ())
+        )
+        self.clear_centerline_hint_button.setEnabled(
+            bool(preview.row.get("centerline_endpoint_hint_present", False))
         )
         ratios = [preview.row.get(f"bin_{index:02d}_ratio") for index in range(1, 11)]
         self.distribution_preview_status.setText(
@@ -3473,7 +3588,11 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _distribution_overlay(
-        raw: np.ndarray, bins: np.ndarray, axis_xy: tuple[tuple[int, int], ...]
+        raw: np.ndarray,
+        bins: np.ndarray,
+        axis_xy: tuple[tuple[int, int], ...],
+        base_xy: tuple[int, int] | None = None,
+        endpoint_xy: tuple[int, int] | None = None,
     ) -> np.ndarray:
         low, high = np.percentile(raw, (0.5, 99.8))
         scale = max(1.0, float(high - low))
@@ -3486,7 +3605,176 @@ class MainWindow(QMainWindow):
         for x, y in axis_xy:
             if 0 <= y < rgb.shape[0] and 0 <= x < rgb.shape[1]:
                 rgb[max(0, y - 1) : y + 2, max(0, x - 1) : x + 2] = 255
+        for point, color in (
+            (base_xy, np.asarray((32, 220, 88), dtype=np.uint8)),
+            (endpoint_xy, np.asarray((238, 50, 200), dtype=np.uint8)),
+        ):
+            if point is None:
+                continue
+            x, y = point
+            yy, xx = np.ogrid[: rgb.shape[0], : rgb.shape[1]]
+            circle = (xx - x) ** 2 + (yy - y) ** 2 <= 16
+            rgb[circle] = color
         return rgb
+
+    def _render_distribution_dendrite_view(self) -> None:
+        preview = self._last_distribution_preview
+        if preview is None:
+            return
+        if self.centerline_hint_button.isChecked():
+            z_index = self.distribution_z_slider.value()
+            raw = preview.dendrite_stack[z_index]
+            spine_mask = preview.spine_mask_stack[z_index]
+            bins = np.where(spine_mask, 1, 0).astype(np.uint8)
+            axis = tuple(
+                (point[2], point[1])
+                for point in preview.axis_points_local_zyx
+                if point[0] == z_index
+            )
+            base = (
+                (preview.base_point_local_zyx[2], preview.base_point_local_zyx[1])
+                if preview.base_point_local_zyx is not None
+                and preview.base_point_local_zyx[0] == z_index
+                else None
+            )
+            endpoint = (
+                (preview.endpoint_local_zyx[2], preview.endpoint_local_zyx[1])
+                if preview.endpoint_local_zyx is not None
+                and preview.endpoint_local_zyx[0] == z_index
+                else None
+            )
+            rgb = self._distribution_overlay(raw, bins, axis, base, endpoint)
+            self.distribution_z_label.setText(
+                f"Spine Z: {z_index + 1} "
+                f"({preview.spine_z_range[0] + 1}–{preview.spine_z_range[1] + 1})"
+            )
+        else:
+            base = (
+                (preview.base_point_local_zyx[2], preview.base_point_local_zyx[1])
+                if preview.base_point_local_zyx is not None
+                else None
+            )
+            endpoint = (
+                (preview.endpoint_local_zyx[2], preview.endpoint_local_zyx[1])
+                if preview.endpoint_local_zyx is not None
+                else None
+            )
+            rgb = self._distribution_overlay(
+                preview.dendrite_projection,
+                preview.spine_bins_projection,
+                preview.axis_xy,
+                base,
+                endpoint,
+            )
+        self.distribution_dendrite_view.show_rgb(rgb)
+
+    def _centerline_hint_mode_changed(self, enabled: bool) -> None:
+        if enabled and self._last_distribution_preview is None:
+            self.centerline_hint_button.blockSignals(True)
+            self.centerline_hint_button.setChecked(False)
+            self.centerline_hint_button.blockSignals(False)
+            self.distribution_preview_status.setText(
+                "Wait for the cropped spine preview before placing an endpoint hint."
+            )
+            return
+        self.distribution_z_controls.setVisible(enabled)
+        self.distribution_dendrite_view.setCursor(
+            Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor
+        )
+        self._render_distribution_dendrite_view()
+        if enabled:
+            self.distribution_preview_status.setText(
+                "Choose a spine-only Z slice, then click near a spine voxel to set the centerline endpoint."
+            )
+
+    def _distribution_z_changed(self, _value: int) -> None:
+        if self.centerline_hint_button.isChecked():
+            self._render_distribution_dendrite_view()
+
+    def _centerline_hint_clicked(self, x: int, y: int) -> None:
+        preview = self._last_distribution_preview
+        if (
+            not self.centerline_hint_button.isChecked()
+            or preview is None
+            or self._job_thread is not None
+        ):
+            return
+        z_index = self.distribution_z_slider.value()
+        mask = preview.spine_mask_stack[z_index]
+        yy, xx = np.nonzero(mask)
+        if not len(xx):
+            self.distribution_preview_status.setText(
+                "No selected-spine voxels exist on this slice. Choose another spine Z slice."
+            )
+            return
+        distances = (xx - x) ** 2 + (yy - y) ** 2
+        nearest = int(np.argmin(distances))
+        search_radius_pixels = 12
+        if int(distances[nearest]) > search_radius_pixels**2:
+            self.distribution_preview_status.setText(
+                "Endpoint not placed: click closer to the colored spine on this slice."
+            )
+            return
+        local_x, local_y = int(xx[nearest]), int(yy[nearest])
+        global_point = (
+            z_index,
+            preview.crop_origin_yx[0] + local_y,
+            preview.crop_origin_yx[1] + local_x,
+        )
+        if (
+            self.manifest is None
+            or self.project_path is None
+            or self.measurement_specimen.currentData() is None
+            or self.distribution_spine.currentData() is None
+        ):
+            return
+        self.distribution_preview_status.setText(
+            f"Applying endpoint at Z {z_index + 1}; rebuilding this spine’s centerline…"
+        )
+        worker = CenterlineHintWorker(
+            self.manifest,
+            self.project_path,
+            int(self.measurement_specimen.currentData()),
+            int(self.distribution_spine.currentData()),
+            global_point,
+        )
+        worker.completed.connect(self._centerline_hint_completed)
+        self._start_worker(worker, "centerline_hint")
+
+    def _clear_centerline_hint(self) -> None:
+        if (
+            self.manifest is None
+            or self.project_path is None
+            or self.measurement_specimen.currentData() is None
+            or self.distribution_spine.currentData() is None
+            or self._job_thread is not None
+        ):
+            return
+        self.distribution_preview_status.setText(
+            "Clearing the manual endpoint and restoring automatic endpoint detection…"
+        )
+        worker = CenterlineHintWorker(
+            self.manifest,
+            self.project_path,
+            int(self.measurement_specimen.currentData()),
+            int(self.distribution_spine.currentData()),
+            None,
+        )
+        worker.completed.connect(self._centerline_hint_completed)
+        self._start_worker(worker, "centerline_hint")
+
+    @Slot(object)
+    def _centerline_hint_completed(self, _result: dict[str, object]) -> None:
+        self.centerline_hint_button.blockSignals(True)
+        self.centerline_hint_button.setChecked(False)
+        self.centerline_hint_button.blockSignals(False)
+        self.distribution_z_controls.setVisible(False)
+        self._centerline_hint_pending_reload = True
+        self._refresh_distribution_groups()
+        self._populate_measurement_table()
+        self.distribution_preview_status.setText(
+            "Centerline endpoint checkpoint saved. Reloading the cropped maximum projection…"
+        )
 
     def _move_distribution_spine(self, offset: int) -> None:
         count = self.distribution_spine.count()
@@ -4391,7 +4679,7 @@ class MainWindow(QMainWindow):
             )
             if self.project_path is not None:
                 save_project(self.project_path, self.manifest)
-        elif self._job_kind in {"measurements", "trim_preview", "distribution_preview", "export"}:
+        elif self._job_kind in {"measurements", "trim_preview", "distribution_preview", "centerline_hint", "export"}:
             self.measurement_status.setText(
                 "Measurement operation stopped with an error; completed checkpoints remain usable."
             )
@@ -4410,6 +4698,9 @@ class MainWindow(QMainWindow):
             self._preview_requested_while_busy = False
             self._preview_timer.start()
         elif finished_kind == "measurements" and self.distribution_spine.count():
+            QTimer.singleShot(0, self._distribution_spine_changed)
+        elif finished_kind == "centerline_hint" and self._centerline_hint_pending_reload:
+            self._centerline_hint_pending_reload = False
             QTimer.singleShot(0, self._distribution_spine_changed)
 
     @Slot(object)
@@ -4763,6 +5054,17 @@ class MainWindow(QMainWindow):
             )
             self.save_distribution_review_button.setEnabled(not running)
             self.export_measurements_button.setEnabled(not running and eligible)
+            self.centerline_hint_button.setEnabled(not running and eligible)
+            self.clear_centerline_hint_button.setEnabled(
+                not running
+                and eligible
+                and self._last_distribution_preview is not None
+                and bool(
+                    self._last_distribution_preview.row.get(
+                        "centerline_endpoint_hint_present", False
+                    )
+                )
+            )
         if not running and not self.progress_label.text():
             self.progress_label.setText("Ready")
 

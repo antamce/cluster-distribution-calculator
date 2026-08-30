@@ -3,7 +3,7 @@
 ## Current state
 
 Synpo is a Python/PySide6 desktop application for paired-channel, registered 3D
-microscopy TIFF stacks. Version `0.6.0` implements:
+microscopy TIFF stacks. Version `0.6.1` implements:
 
 - Stage 1: batch import, filename parsing, pairing, validation, calibration,
   project manifests, fingerprints, reopening, verification, and relinking;
@@ -181,6 +181,17 @@ changed detection result. Raw TIFFs are never changed or copied.
   spine/dendrite contact patch and the distal endpoint is the longest reachable
   path. Similar contacts/endpoints are flagged `ambiguous_axis`; no path is saved
   as `no_usable_path`.
+- The optional **Centerline end hint** keeps ordinary review on the cropped XY
+  maximum, then switches that panel to an exact slice viewer only while enabled.
+  Its Z slider is bounded by the selected spine's occupied slices and the XY crop
+  uses a 1 µm margin. Clicks snap to the nearest same-slice spine voxel within 12
+  image pixels; rejection is a status-line message, never a dialog.
+- The automatic base is read-only and rendered green; the endpoint is magenta. A
+  manual path follows the reachable medial skeleton toward the exact hinted voxel,
+  then uses an A* shortest path constrained inside the spine for the final segment.
+  Placing/replacing/clearing is checkpointed immediately. Later resegmentation
+  retains but invalidates an off-mask hint, falls back to automatic endpoint
+  detection, and marks that distribution row unreviewed.
 - Ten equal centerline-length bins receive complete spine and qualifying
   inside-cluster voxels by nearest centerline position. Every voxel is assigned
   once. Zero-spine-voxel bins are blank and flagged
@@ -203,6 +214,9 @@ changed detection result. Raw TIFFs are never changed or copied.
   the ten-color overlay, curved axis, individual profile, identifiers, and status.
   Main, distribution-excluded audit, and invalid-spine audit PDFs are independent;
   crop margin defaults to 1 µm and is adjustable.
+- Distribution rows export automatic base and endpoint ZYX coordinates, endpoint
+  source, hint presence/validity, and full hint history. PDFs show both colored
+  dots and identify automatic versus manual endpoint provenance.
 
 ## Pending stages and decisions
 

@@ -95,6 +95,13 @@ class DistributionPreview:
     spine_bins_projection: np.ndarray
     cluster_bins_projection: np.ndarray
     axis_xy: tuple[tuple[int, int], ...]
+    dendrite_stack: np.ndarray
+    spine_mask_stack: np.ndarray
+    axis_points_local_zyx: tuple[tuple[int, int, int], ...]
+    base_point_local_zyx: tuple[int, int, int] | None
+    endpoint_local_zyx: tuple[int, int, int] | None
+    crop_origin_yx: tuple[int, int]
+    spine_z_range: tuple[int, int]
     row: dict[str, object]
 
 
@@ -423,14 +430,16 @@ def set_distribution_review(
     reviews = specimen.setdefault(
         "distribution_review", {"spines": {}, "updated_at": None}
     ).setdefault("spines", {})
-    decision = {
-        "reviewed": True,
-        "distribution_included": bool(distribution_included and not invalid_spine),
-        "invalid_spine": bool(invalid_spine),
-        "note": str(note).strip(),
-        "updated_at": time.time(),
-    }
-    reviews[str(spine_id)] = decision
+    decision = reviews.setdefault(str(spine_id), {})
+    decision.update(
+        {
+            "reviewed": True,
+            "distribution_included": bool(distribution_included and not invalid_spine),
+            "invalid_spine": bool(invalid_spine),
+            "note": str(note).strip(),
+            "updated_at": time.time(),
+        }
+    )
     specimen["distribution_review"]["updated_at"] = decision["updated_at"]
     result = load_measurement_result(manifest, specimen_index)
     found = False
@@ -454,6 +463,194 @@ def set_distribution_review(
     _refresh_result_summaries(result)
     _write_result(measurement_result_path(manifest, specimen_index), result)
     specimen["checkpoints"].setdefault("measurements", {})["review_updated_at"] = time.time()
+    save_project(project_path, manifest)
+    return result
+
+
+def _recalculate_distribution_spine(
+    manifest: dict[str, object],
+    specimen_index: int,
+    spine_id: int,
+    result: dict[str, object],
+) -> dict[str, object]:
+    row = next(
+        (item for item in result.get("distribution_rows", []) if int(item["spine_id"]) == spine_id),
+        None,
+    )
+    if row is None:
+        raise ValueError("This spine has no cluster-positive distribution row.")
+    geometry = result.get("distribution_geometry", {}).get(str(spine_id))
+    if geometry is None:
+        raise ValueError("Saved distribution geometry is unavailable.")
+    editable, detection, _corrected, _signature = _mask_sources(manifest, specimen_index)
+    shape = tuple(int(value) for value in editable["spine_labels"].shape)
+    bounds = geometry["bounds_zyx"]
+    y_slice = slice(max(0, int(bounds[1][0])), min(shape[1], int(bounds[1][1])))
+    x_slice = slice(max(0, int(bounds[2][0])), min(shape[2], int(bounds[2][1])))
+    spine_labels = np.asarray(editable["spine_labels"][:, y_slice, x_slice], dtype=np.uint32)
+    spine = spine_labels == spine_id
+    if not np.any(spine):
+        raise ValueError("The reviewed spine is no longer present in its saved region.")
+    parent_id = int(row.get("dendrite_id") or 0)
+    dendrites = np.asarray(editable["dendrite_labels"][:, y_slice, x_slice], dtype=np.uint32)
+    parent = dendrites == parent_id if parent_id else dendrites > 0
+    cluster_labels = np.asarray(detection["cluster_labels"][:, y_slice, x_slice], dtype=np.uint32)
+    clusters = np.zeros(spine.shape, dtype=bool)
+    included_ids = {
+        int(item["cluster_id"])
+        for item in result.get("cluster_rows", [])
+        if item.get("row_type") == "individual_cluster"
+        and int(item.get("spine_id") or 0) == spine_id
+    }
+    trim_details = result.get("cluster_trim_details", {})
+    for cluster_id in included_ids:
+        discarded = {
+            int(value)
+            for value in trim_details.get(str(cluster_id), {}).get("discarded_z_slices", [])
+        }
+        for z_index in range(shape[0]):
+            if z_index not in discarded:
+                clusters[z_index] |= (cluster_labels[z_index] == cluster_id) & spine[z_index]
+
+    specimen = manifest["specimens"][specimen_index]
+    decision = specimen.setdefault(
+        "distribution_review", {"spines": {}, "updated_at": None}
+    ).setdefault("spines", {}).setdefault(str(spine_id), {})
+    hint_value = decision.get("centerline_endpoint_hint_zyx")
+    hint = (
+        tuple(int(value) for value in hint_value)
+        if isinstance(hint_value, (list, tuple)) and len(hint_value) == 3
+        else None
+    )
+    hint_valid = False
+    if hint is not None:
+        local_hint = (hint[0], hint[1] - y_slice.start, hint[2] - x_slice.start)
+        hint_valid = (
+            0 <= local_hint[0] < spine.shape[0]
+            and 0 <= local_hint[1] < spine.shape[1]
+            and 0 <= local_hint[2] < spine.shape[2]
+            and bool(spine[local_hint])
+        )
+    if hint is not None and not hint_valid:
+        history = decision.setdefault("centerline_hint_history", [])
+        if not history or history[-1].get("action") != "invalidated_by_resegmentation":
+            history.append(
+                {
+                    "action": "invalidated_by_resegmentation",
+                    "point_zyx": list(hint),
+                    "updated_at": time.time(),
+                }
+            )
+        decision["reviewed"] = False
+    decision["centerline_endpoint_hint_valid"] = hint_valid
+    xy_size = float(manifest["calibration"]["xy_um_per_pixel"])
+    z_step = float(manifest["calibration"]["z_step_um"])
+    calculated = calculate_spine_distribution(
+        spine,
+        parent,
+        clusters,
+        sampling_zyx_um=(z_step, xy_size, xy_size),
+        global_offset_zyx=(0, y_slice.start, x_slice.start),
+        endpoint_hint_zyx=hint if hint_valid else None,
+    )
+    recalculated = distribution_row(
+        calculated,
+        experimental_group=str(specimen["experimental_group"]),
+        specimen_id=str(specimen["specimen_id"]),
+        dendrite_id=parent_id,
+        spine_id=spine_id,
+        voxel_volume_um3=float(result["voxel_volume_um3"]),
+    )
+    recalculated.update(
+        {
+            "distribution_reviewed": bool(decision.get("reviewed", row.get("distribution_reviewed", False))),
+            "distribution_included": bool(row.get("distribution_included", False)),
+            "spine_valid": bool(row.get("spine_valid", True)),
+            "review_note": str(decision.get("note", row.get("review_note", ""))),
+            "centerline_endpoint_hint_valid": hint_valid,
+            "centerline_endpoint_hint_present": hint is not None,
+            "centerline_hint_history": list(decision.get("centerline_hint_history", [])),
+        }
+    )
+    row.clear()
+    row.update(recalculated)
+    geometry.update(
+        {
+            "axis_points_zyx": [list(point) for point in calculated.axis_points_zyx],
+            "base_point_zyx": list(calculated.base_point_zyx) if calculated.base_point_zyx else None,
+            "endpoint_zyx": list(calculated.endpoint_zyx) if calculated.endpoint_zyx else None,
+        }
+    )
+    for spine_row in result.get("spine_rows", []):
+        if int(spine_row["spine_id"]) == spine_id:
+            spine_row["protein_distribution_in_spine"] = [
+                row.get(f"bin_{index:02d}_ratio") for index in range(1, 11)
+            ]
+    _refresh_result_summaries(result)
+    _write_result(measurement_result_path(manifest, specimen_index), result)
+    specimen["distribution_review"]["updated_at"] = time.time()
+    specimen["checkpoints"].setdefault("measurements", {})["review_updated_at"] = time.time()
+    return result
+
+
+def set_centerline_endpoint_hint(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    spine_id: int,
+    point_zyx: tuple[int, int, int],
+) -> dict[str, object]:
+    editable, _detection, _corrected, _signature = _mask_sources(manifest, specimen_index)
+    shape = tuple(int(value) for value in editable["spine_labels"].shape)
+    if any(value < 0 or value >= shape[axis] for axis, value in enumerate(point_zyx)):
+        raise ValueError("The endpoint lies outside the stack.")
+    if int(editable["spine_labels"][point_zyx]) != spine_id:
+        raise ValueError("The endpoint must lie on the selected spine.")
+    specimen = manifest["specimens"][specimen_index]
+    decision = specimen.setdefault(
+        "distribution_review", {"spines": {}, "updated_at": None}
+    ).setdefault("spines", {}).setdefault(str(spine_id), {})
+    previous = decision.get("centerline_endpoint_hint_zyx")
+    action = "replaced" if previous is not None else "placed"
+    decision["centerline_endpoint_hint_zyx"] = list(point_zyx)
+    decision["centerline_endpoint_hint_valid"] = True
+    decision.setdefault("centerline_hint_history", []).append(
+        {
+            "action": action,
+            "point_zyx": list(point_zyx),
+            "previous_point_zyx": previous,
+            "updated_at": time.time(),
+        }
+    )
+    result = _recalculate_distribution_spine(
+        manifest, specimen_index, spine_id, load_measurement_result(manifest, specimen_index)
+    )
+    save_project(project_path, manifest)
+    return result
+
+
+def clear_centerline_endpoint_hint(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    spine_id: int,
+) -> dict[str, object]:
+    specimen = manifest["specimens"][specimen_index]
+    decision = specimen.setdefault(
+        "distribution_review", {"spines": {}, "updated_at": None}
+    ).setdefault("spines", {}).setdefault(str(spine_id), {})
+    previous = decision.pop("centerline_endpoint_hint_zyx", None)
+    decision["centerline_endpoint_hint_valid"] = False
+    decision.setdefault("centerline_hint_history", []).append(
+        {
+            "action": "cleared",
+            "previous_point_zyx": previous,
+            "updated_at": time.time(),
+        }
+    )
+    result = _recalculate_distribution_spine(
+        manifest, specimen_index, spine_id, load_measurement_result(manifest, specimen_index)
+    )
     save_project(project_path, manifest)
     return result
 
@@ -676,12 +873,27 @@ def load_distribution_preview(
         for z_index in range(shape[0]):
             if z_index not in discarded:
                 clusters[z_index] |= (cluster_labels[z_index] == cluster_id) & spine[z_index]
+    decision = (
+        manifest["specimens"][specimen_index]
+        .get("distribution_review", {})
+        .get("spines", {})
+        .get(str(spine_id), {})
+    )
+    hint_value = decision.get("centerline_endpoint_hint_zyx")
+    endpoint_hint = (
+        tuple(int(value) for value in hint_value)
+        if bool(decision.get("centerline_endpoint_hint_valid", False))
+        and isinstance(hint_value, (list, tuple))
+        and len(hint_value) == 3
+        else None
+    )
     calculated = calculate_spine_distribution(
         spine,
         parent,
         clusters,
         sampling_zyx_um=(z_step, xy_size, xy_size),
         global_offset_zyx=(0, y_slice.start, x_slice.start),
+        endpoint_hint_zyx=endpoint_hint,
     )
     if calculated.voxel_bins is None:
         spine_bins = np.zeros(spine.shape[1:], dtype=np.uint8)
@@ -693,6 +905,7 @@ def load_distribution_preview(
     role_channels = {role: channel for channel, role in manifest["channel_roles"].items()}
     specimen = manifest["specimens"][specimen_index]
     projections: dict[str, np.ndarray] = {}
+    dendrite_stack = np.zeros(spine.shape, dtype=np.uint16)
     for role in ("dendrite_spines", "protein_clusters"):
         channel = role_channels[role]
         source = Path(str(manifest["source_directory"])) / specimen["channels"][channel]["filename"]
@@ -704,13 +917,45 @@ def load_distribution_preview(
             # into a temporary disk-backed array instead of consuming stack RAM.
             stack = np.squeeze(tifffile.imread(source, out="memmap"))
         if stack.ndim == 2:
-            projection = np.asarray(stack[y_slice, x_slice], dtype=np.uint16)
+            cropped_stack = np.asarray(stack[y_slice, x_slice], dtype=np.uint16)[None]
+            projection = cropped_stack[0]
         else:
-            projection = np.max(stack[:, y_slice, x_slice], axis=0).astype(np.uint16, copy=False)
+            cropped_stack = np.asarray(stack[:, y_slice, x_slice], dtype=np.uint16)
+            projection = np.max(cropped_stack, axis=0).astype(np.uint16, copy=False)
+        if role == "dendrite_spines":
+            dendrite_stack = cropped_stack
         projections[role] = projection
     axis_xy = tuple(
         (int(point[2]) - x_slice.start, int(point[1]) - y_slice.start)
         for point in calculated.axis_points_zyx
+    )
+    axis_local = tuple(
+        (int(point[0]), int(point[1]) - y_slice.start, int(point[2]) - x_slice.start)
+        for point in calculated.axis_points_zyx
+    )
+    base_local = (
+        (
+            calculated.base_point_zyx[0],
+            calculated.base_point_zyx[1] - y_slice.start,
+            calculated.base_point_zyx[2] - x_slice.start,
+        )
+        if calculated.base_point_zyx
+        else None
+    )
+    endpoint_local = (
+        (
+            calculated.endpoint_zyx[0],
+            calculated.endpoint_zyx[1] - y_slice.start,
+            calculated.endpoint_zyx[2] - x_slice.start,
+        )
+        if calculated.endpoint_zyx
+        else None
+    )
+    occupied_z = np.flatnonzero(np.any(spine, axis=(1, 2)))
+    z_range = (
+        (int(occupied_z[0]), int(occupied_z[-1]))
+        if len(occupied_z)
+        else (0, max(0, spine.shape[0] - 1))
     )
     return DistributionPreview(
         dendrite_projection=projections["dendrite_spines"],
@@ -718,6 +963,13 @@ def load_distribution_preview(
         spine_bins_projection=spine_bins,
         cluster_bins_projection=cluster_bins,
         axis_xy=axis_xy,
+        dendrite_stack=dendrite_stack,
+        spine_mask_stack=spine,
+        axis_points_local_zyx=axis_local,
+        base_point_local_zyx=base_local,
+        endpoint_local_zyx=endpoint_local,
+        crop_origin_yx=(y_slice.start, x_slice.start),
+        spine_z_range=z_range,
         row=dict(row),
     )
 
@@ -919,12 +1171,41 @@ def measure_specimen(
                     np.isin(local_cluster_labels[z_index], retained_ids)
                     & local_spine[z_index]
                 )
+        decision = saved_reviews.get(str(spine_id), {})
+        hint_value = decision.get("centerline_endpoint_hint_zyx")
+        hint = (
+            tuple(int(value) for value in hint_value)
+            if isinstance(hint_value, (list, tuple)) and len(hint_value) == 3
+            else None
+        )
+        hint_valid = False
+        if hint is not None:
+            local_hint = (hint[0], hint[1] - y_slice.start, hint[2] - x_slice.start)
+            hint_valid = (
+                0 <= local_hint[0] < local_spine.shape[0]
+                and 0 <= local_hint[1] < local_spine.shape[1]
+                and 0 <= local_hint[2] < local_spine.shape[2]
+                and bool(local_spine[local_hint])
+            )
+            if not hint_valid:
+                history = decision.setdefault("centerline_hint_history", [])
+                if not history or history[-1].get("action") != "invalidated_by_resegmentation":
+                    history.append(
+                        {
+                            "action": "invalidated_by_resegmentation",
+                            "point_zyx": list(hint),
+                            "updated_at": time.time(),
+                        }
+                    )
+                decision["reviewed"] = False
+        decision["centerline_endpoint_hint_valid"] = hint_valid
         calculated = calculate_spine_distribution(
             local_spine,
             local_parent,
             qualifying,
             sampling_zyx_um=(z_step, xy_size, xy_size),
             global_offset_zyx=(0, y_slice.start, x_slice.start),
+            endpoint_hint_zyx=hint if hint_valid else None,
         )
         row = distribution_row(
             calculated,
@@ -934,7 +1215,6 @@ def measure_specimen(
             spine_id=spine_id,
             voxel_volume_um3=voxel_volume,
         )
-        decision = saved_reviews.get(str(spine_id), {})
         default_include = calculated.axis_status in {
             "ok",
             "insufficient_axis_resolution",
@@ -947,6 +1227,11 @@ def measure_specimen(
                 ),
                 "spine_valid": not bool(decision.get("invalid_spine", False)),
                 "review_note": str(decision.get("note", "")),
+                "centerline_endpoint_hint_valid": hint_valid,
+                "centerline_endpoint_hint_present": hint is not None,
+                "centerline_hint_history": list(
+                    decision.get("centerline_hint_history", [])
+                ),
             }
         )
         distribution_rows.append(row)
@@ -957,6 +1242,8 @@ def measure_specimen(
                 [x_slice.start, x_slice.stop],
             ],
             "axis_points_zyx": [list(point) for point in calculated.axis_points_zyx],
+            "base_point_zyx": list(calculated.base_point_zyx) if calculated.base_point_zyx else None,
+            "endpoint_zyx": list(calculated.endpoint_zyx) if calculated.endpoint_zyx else None,
         }
 
     spine_rows: list[dict[str, object]] = []
