@@ -3,7 +3,7 @@
 ## Current state
 
 Synpo is a Python/PySide6 desktop application for paired-channel, registered 3D
-microscopy TIFF stacks. Version `0.5.0` implements:
+microscopy TIFF stacks. Version `0.6.0` implements:
 
 - Stage 1: batch import, filename parsing, pairing, validation, calibration,
   project manifests, fingerprints, reopening, verification, and relinking;
@@ -16,11 +16,15 @@ microscopy TIFF stacks. Version `0.5.0` implements:
   in both Detection and Review (user-approved);
 - Stage 5: resumable spine/cluster association and raw specimen-, dendrite-, spine-,
   and cluster-level measurement tables, with cluster-end method comparison and a
-  counted/discarded-voxel illustration (awaiting user testing and approval).
+  counted/discarded-voxel illustration (user-approved);
+- Stage 6: calibrated curved-centerline protein distribution, ten voxel-assigned
+  shaft-to-tip parts, distribution/invalid-spine review, specimen-weighted group
+  profiles with SEM, Excel/CSV exports, and optional validation/audit PDFs
+  (implemented and awaiting user testing).
 
 All settings and actions except the Z slider are in scrollable side panels. Do not
-skip the staged approval process: let the user test Stage 5 and wait for approval
-before beginning export work.
+skip the staged approval process: let the user test Stage 6 and wait for approval
+before proceeding to the remaining final-export work.
 
 ## Running and testing
 
@@ -160,7 +164,7 @@ changed detection result. Raw TIFFs are never changed or copied.
   included only when retained-cluster overlap meets the configurable threshold
   (80% default). Only voxels inside that spine contribute to its measured volume.
 - Cluster rows preserve every included individual cluster and add a per-spine sum
-  row. Distribution fields remain explicit null/pending values.
+  row. Stage 6 populates the corresponding ten-part spine-distribution records.
 - End handling offers untrimmed, fixed terminal-slice removal, and adaptive removal
   of consecutive oversized terminal slices. The larger terminal end is inferred
   from endpoint areas; at least two slices are retained by default.
@@ -170,26 +174,50 @@ changed detection result. Raw TIFFs are never changed or copied.
 - Results are gzip-compressed under the project cache and checkpointed after every
   specimen. Signatures include masks, settings, and calibration.
 
+## Stage 6 behavior
+
+- `distribution.py` skeletonizes one cropped 3D spine at a time. Calibrated graph
+  edge lengths use `(z_step, xy_size, xy_size)`. The origin is the largest
+  spine/dendrite contact patch and the distal endpoint is the longest reachable
+  path. Similar contacts/endpoints are flagged `ambiguous_axis`; no path is saved
+  as `no_usable_path`.
+- Ten equal centerline-length bins receive complete spine and qualifying
+  inside-cluster voxels by nearest centerline position. Every voxel is assigned
+  once. Zero-spine-voxel bins are blank and flagged
+  `insufficient_axis_resolution`; all other bin data are preserved.
+- Only cluster-positive spines receive distribution rows. Numerators use inside
+  portions of clusters passing the overlap threshold after selected end trimming.
+  Rows contain ten ratios, ten spine-part volumes, ten cluster volumes, status,
+  review state, and note.
+- Valid automatic axes are included by default, so correction is optional.
+  Ambiguous axes are excluded pending review. Distribution exclusion leaves other
+  metrics intact. Invalid-spine review retains raw rows/masks but immediately
+  removes that spine from all specimen/dendrite/group metrics and checkpoints the
+  decision before auto-advance.
+- Aggregation first averages included cluster-positive spines within each specimen,
+  then averages specimen means within experimental groups. Group SD, SEM, and
+  separate per-bin `n` are saved; the app displays mean ± SEM with line/bar and
+  automatic/fixed-scale controls.
+- `exporting.py` writes and verifies an Excel workbook and CSV copy of every sheet.
+  Optional multi-page validation PDFs use two original-channel XY maximum panels,
+  the ten-color overlay, curved axis, individual profile, identifiers, and status.
+  Main, distribution-excluded audit, and invalid-spine audit PDFs are independent;
+  crop margin defaults to 1 µm and is adjustable.
+
 ## Pending stages and decisions
 
-After Stage 5 approval, remaining work includes:
+After Stage 6 approval, remaining work includes:
 
-1. Confirm the fixed-versus-adaptive cluster-end behavior on representative data.
-2. Confirm the implemented metrics and define protein distribution:
-   - spine: volume, cluster presence, summed cluster-volume/spine-volume ratio,
-     protein distribution;
-   - cluster inside a spine: volume and distribution relative to the spine;
-   - dendrite: spine density per µm, mean spine volume, inclusion percentage, mean
-     summed inclusion/spine ratio, mean cluster volume, protein distribution;
-   - specimen: averages of requested lower-level metrics.
-3. Protein-distribution definitions await user clarification.
-4. Export one Excel workbook with raw specimen/spine/cluster rows, master sheets,
-   compact group summaries (counts, means, variability, inclusion percentages),
-   CSV copies, reproducible settings/masks, ImageJ ROI ZIPs, and saved snapshots.
-5. Keep cache compressed and temporary; offer deletion only after verified export.
-6. Optionally add an in-app annotation/training utility after the main app. It must
+1. Validate curved axes and ten-bin profiles on representative microscopy data.
+2. Complete final export of segmentation masks, ImageJ-compatible ROI ZIPs,
+   reproducible project/settings files, and manually saved 3D snapshots. The
+   workbook and raw CSV export are already implemented.
+3. Keep cache compressed and temporary; offer deletion only after the complete
+   final export has been verified. Stage 6 tabular/PDF export alone does not make
+   cache deletion eligible.
+4. Optionally add an in-app annotation/training utility after the main app. It must
    not depend on Fiji; the user can provide up to two annotated pairs.
-7. Statistics remain out of scope. Synpo calculates and exports labeled metrics;
+5. Statistics remain out of scope. Synpo calculates and exports labeled metrics;
    statistical analysis occurs elsewhere.
 
 The current target is Windows with Anaconda and a desktop shortcut. Keep the design

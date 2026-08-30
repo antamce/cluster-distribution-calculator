@@ -6,7 +6,7 @@ from threading import Event
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QPoint, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QPoint, QRectF, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -80,12 +80,17 @@ from .visualization import (
 )
 from .measurements import (
     ClusterTrimPreview,
+    DistributionPreview,
     MeasurementSettings,
     cluster_end_comparison_rows,
+    distribution_summary_rows,
     load_cluster_trim_preview,
+    load_distribution_preview,
     load_measurement_result,
     measure_project,
+    set_distribution_review,
 )
+from .exporting import export_measurements
 
 
 ROLE_LABELS = {
@@ -96,6 +101,10 @@ ROLE_LABELS = {
 VOLUME_KIND_LABELS = ("Dendrites", "Spines", "Protein clusters")
 VOLUME_DEFAULT_COLORS = (QColor(55, 220, 85), QColor(35, 195, 245), QColor(245, 55, 200))
 VOLUME_DEFAULT_OPACITIES = (0.75, 0.60, 1.0)
+DISTRIBUTION_COLORS = (
+    (35, 0, 75), (75, 3, 110), (112, 14, 117), (147, 37, 103), (177, 63, 82),
+    (204, 93, 58), (224, 127, 36), (239, 167, 25), (246, 210, 42), (240, 249, 33),
+)
 
 
 def _label_colors(labels: np.ndarray, kind: int) -> np.ndarray:
@@ -147,6 +156,18 @@ class SliceView(QLabel):
         ).copy()
         self._render()
 
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        self._render()
+
+    def show_rgb(self, rgb: np.ndarray) -> None:
+        image = np.ascontiguousarray(rgb, dtype=np.uint8)
+        height, width = image.shape[:2]
+        self._image = QImage(
+            image.data, width, height, image.strides[0], QImage.Format.Format_RGB888
+        ).copy()
+        self._render()
+
     def _render(self) -> None:
         if self._image is None:
             return
@@ -190,10 +211,75 @@ class SliceView(QLabel):
         ).copy()
         self._render()
 
-    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        super().resizeEvent(event)
-        self._render()
 
+class DistributionChart(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumHeight(230)
+        self._row: dict[str, object] | None = None
+        self._mode = "line"
+        self._fixed_scale = False
+
+    def set_profile(self, row: dict[str, object] | None) -> None:
+        self._row = row
+        self.update()
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode
+        self.update()
+
+    def set_fixed_scale(self, fixed: bool) -> None:
+        self._fixed_scale = fixed
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(250, 250, 250))
+        plot = QRectF(58, 24, max(40, self.width() - 82), max(40, self.height() - 76))
+        painter.setPen(QPen(QColor(50, 50, 50), 1))
+        painter.drawLine(plot.bottomLeft(), plot.topLeft())
+        painter.drawLine(plot.bottomLeft(), plot.bottomRight())
+        if not self._row:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No group distribution profile yet")
+            return
+        means = [self._row.get(f"bin_{index:02d}_mean") for index in range(1, 11)]
+        sems = [self._row.get(f"bin_{index:02d}_sem") for index in range(1, 11)]
+        finite = [float(value) for value in means if value is not None]
+        if not finite:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No included distribution values")
+            return
+        maximum = 1.0 if self._fixed_scale else max(0.01, max(finite) * 1.15)
+        points: list[QPoint] = []
+        for index, value in enumerate(means):
+            if value is None:
+                continue
+            x = plot.left() + (index + 0.5) * plot.width() / 10
+            y = plot.bottom() - min(maximum, float(value)) / maximum * plot.height()
+            point = QPoint(int(x), int(y))
+            points.append(point)
+            color = QColor(*DISTRIBUTION_COLORS[index])
+            painter.setPen(QPen(color, 2))
+            sem = float(sems[index] or 0.0)
+            error = sem / maximum * plot.height()
+            painter.drawLine(QPoint(int(x), int(y - error)), QPoint(int(x), int(y + error)))
+            painter.drawLine(QPoint(int(x - 4), int(y - error)), QPoint(int(x + 4), int(y - error)))
+            painter.drawLine(QPoint(int(x - 4), int(y + error)), QPoint(int(x + 4), int(y + error)))
+            if self._mode == "bar":
+                painter.fillRect(QRectF(x - plot.width() / 28, y, plot.width() / 14, plot.bottom() - y), color)
+            else:
+                painter.setBrush(color)
+                painter.drawEllipse(point, 4, 4)
+            painter.setPen(QColor(60, 60, 60))
+            painter.drawText(QRectF(x - 15, plot.bottom() + 4, 30, 18), Qt.AlignmentFlag.AlignCenter, str(index + 1))
+        if self._mode == "line" and len(points) > 1:
+            painter.setPen(QPen(QColor(55, 90, 170), 2))
+            painter.drawPolyline(QPolygon(points))
+        painter.setPen(QColor(40, 40, 40))
+        painter.drawText(QRectF(0, 0, self.width(), 20), Qt.AlignmentFlag.AlignCenter, f"{self._row.get('experimental_group', '')}: mean ± SEM across specimen means")
+        painter.drawText(QRectF(plot.left(), plot.bottom() + 24, plot.width(), 20), Qt.AlignmentFlag.AlignCenter, "Spine part: shaft → tip")
+        painter.drawText(QRectF(4, plot.top(), 48, 20), Qt.AlignmentFlag.AlignRight, f"{maximum:.3g}")
+        painter.drawText(QRectF(4, plot.bottom() - 10, 48, 20), Qt.AlignmentFlag.AlignRight, "0")
 
 class ReviewCanvas(SliceView):
     hint_changed = Signal(int)
@@ -1320,6 +1406,71 @@ class ClusterTrimPreviewWorker(QObject):
         self.completed.emit(preview)
 
 
+class DistributionPreviewWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, manifest: dict[str, object], specimen_index: int, spine_id: int) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.specimen_index = specimen_index
+        self.spine_id = spine_id
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            preview = load_distribution_preview(
+                self.manifest, self.specimen_index, self.spine_id, margin_um=1.0
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(preview)
+
+
+class ExportWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        workbook_path: Path,
+        validation_pdf: bool,
+        excluded_pdf: bool,
+        invalid_pdf: bool,
+        margin_um: float,
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.workbook_path = workbook_path
+        self.validation_pdf = validation_pdf
+        self.excluded_pdf = excluded_pdf
+        self.invalid_pdf = invalid_pdf
+        self.margin_um = margin_um
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = export_measurements(
+                self.manifest,
+                self.workbook_path,
+                validation_pdf=self.validation_pdf,
+                excluded_audit_pdf=self.excluded_pdf,
+                invalid_audit_pdf=self.invalid_pdf,
+                pdf_margin_um=self.margin_um,
+                progress=lambda phase, current, total, detail: self.progress.emit(
+                    phase, current, total, detail
+                ),
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
 class ReviewWorker(QObject):
     progress = Signal(str, int, int, str)
     completed = Signal(object)
@@ -1479,7 +1630,7 @@ class VerifyWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Synpo Microscopy Processor — Stage 5")
+        self.setWindowTitle("Synpo Microscopy Processor — Stage 6")
         self.resize(1380, 860)
 
         self.report: ScanReport | None = None
@@ -1494,6 +1645,8 @@ class MainWindow(QMainWindow):
         self._last_review: ReviewSlice | None = None
         self._last_review_context: ContextVolume | None = None
         self._last_trim_preview: ClusterTrimPreview | None = None
+        self._last_distribution_preview: DistributionPreview | None = None
+        self._preferred_distribution_spine_id: int | None = None
         self._review_thread: QThread | None = None
         self._review_worker: ReviewWorker | None = None
         self._review_refresh_pending = False
@@ -2283,6 +2436,7 @@ class MainWindow(QMainWindow):
         self.measurement_table_level.addItem("Dendrites", "dendrite_rows")
         self.measurement_table_level.addItem("Spines", "spine_rows")
         self.measurement_table_level.addItem("Clusters and spine sums", "cluster_rows")
+        self.measurement_table_level.addItem("Spine distributions", "distribution_rows")
         self.measurement_table_level.addItem(
             "Compare cluster-end methods", "cluster_end_comparison"
         )
@@ -2299,12 +2453,75 @@ class MainWindow(QMainWindow):
         inspect_form.addRow(self.load_trim_preview_button)
         side_layout.addWidget(inspect_group)
 
-        pending = QLabel(
-            "Protein-distribution fields are retained as pending values until their "
-            "scientific definition is approved. No statistical tests are performed."
+        distribution_group = QGroupBox("Spine-distribution review")
+        distribution_form = QFormLayout(distribution_group)
+        self.distribution_spine = QComboBox()
+        self.distribution_spine.currentIndexChanged.connect(self._distribution_spine_changed)
+        distribution_form.addRow("Review spine:", self.distribution_spine)
+        self.distribution_include = QCheckBox("Include in distribution summaries")
+        self.distribution_include.setChecked(True)
+        distribution_form.addRow(self.distribution_include)
+        self.distribution_invalid = QCheckBox("Invalid spine (exclude from all metrics)")
+        self.distribution_invalid.toggled.connect(
+            lambda checked: self.distribution_include.setEnabled(not checked)
         )
-        pending.setWordWrap(True)
-        side_layout.addWidget(pending)
+        distribution_form.addRow(self.distribution_invalid)
+        self.distribution_note = QLineEdit()
+        self.distribution_note.setPlaceholderText("Optional reason or review note")
+        distribution_form.addRow("Note:", self.distribution_note)
+        self.save_distribution_review_button = QPushButton("Checkpoint decision and advance")
+        self.save_distribution_review_button.clicked.connect(self._save_distribution_review)
+        distribution_form.addRow(self.save_distribution_review_button)
+        navigation = QHBoxLayout()
+        self.previous_distribution_button = QPushButton("Previous")
+        self.previous_distribution_button.clicked.connect(lambda: self._move_distribution_spine(-1))
+        self.next_distribution_button = QPushButton("Next")
+        self.next_distribution_button.clicked.connect(lambda: self._move_distribution_spine(1))
+        navigation.addWidget(self.previous_distribution_button)
+        navigation.addWidget(self.next_distribution_button)
+        distribution_form.addRow(navigation)
+        side_layout.addWidget(distribution_group)
+
+        chart_group = QGroupBox("Experimental-group profile")
+        chart_form = QFormLayout(chart_group)
+        self.distribution_group_combo = QComboBox()
+        self.distribution_group_combo.currentIndexChanged.connect(self._update_distribution_chart)
+        chart_form.addRow("Group:", self.distribution_group_combo)
+        self.distribution_chart_mode = QComboBox()
+        self.distribution_chart_mode.addItem("Line profile", "line")
+        self.distribution_chart_mode.addItem("Bar chart", "bar")
+        self.distribution_chart_mode.currentIndexChanged.connect(self._update_distribution_chart)
+        chart_form.addRow("Chart type:", self.distribution_chart_mode)
+        self.distribution_fixed_scale = QCheckBox("Fixed 0–1 Y-axis")
+        self.distribution_fixed_scale.toggled.connect(self._update_distribution_chart)
+        chart_form.addRow(self.distribution_fixed_scale)
+        side_layout.addWidget(chart_group)
+
+        export_group = QGroupBox("Excel, CSV, and optional PDF export")
+        export_form = QFormLayout(export_group)
+        self.export_validation_pdf = QCheckBox("Main validation PDF")
+        self.export_excluded_pdf = QCheckBox("Excluded-distribution audit PDF")
+        self.export_invalid_pdf = QCheckBox("Invalid-spine audit PDF")
+        export_form.addRow(self.export_validation_pdf)
+        export_form.addRow(self.export_excluded_pdf)
+        export_form.addRow(self.export_invalid_pdf)
+        self.export_pdf_margin = QDoubleSpinBox()
+        self.export_pdf_margin.setRange(0.0, 20.0)
+        self.export_pdf_margin.setDecimals(2)
+        self.export_pdf_margin.setValue(1.0)
+        self.export_pdf_margin.setSuffix(" µm")
+        export_form.addRow("PDF crop margin:", self.export_pdf_margin)
+        self.export_measurements_button = QPushButton("Export workbook and CSV files…")
+        self.export_measurements_button.clicked.connect(self._export_measurements)
+        export_form.addRow(self.export_measurements_button)
+        side_layout.addWidget(export_group)
+
+        note = QLabel(
+            "Ten calibrated curved-axis bins run from shaft to distal tip. Group means "
+            "are specimen-weighted and error bars are SEM; no statistical tests are performed."
+        )
+        note.setWordWrap(True)
+        side_layout.addWidget(note)
         side_layout.addStretch(1)
         side_scroll.setWidget(side_panel)
         splitter.addWidget(side_scroll)
@@ -2314,20 +2531,42 @@ class MainWindow(QMainWindow):
         self.measurement_summary = QLabel("No saved measurement result selected.")
         self.measurement_summary.setWordWrap(True)
         result_layout.addWidget(self.measurement_summary)
+        self.measurement_result_tabs = QTabWidget()
+        result_layout.addWidget(self.measurement_result_tabs, 1)
+        raw_page = QWidget()
+        raw_layout = QVBoxLayout(raw_page)
         self.measurement_table = QTableWidget(0, 0)
         self.measurement_table.setAlternatingRowColors(True)
         self.measurement_table.verticalHeader().setVisible(False)
-        result_layout.addWidget(self.measurement_table, 1)
+        raw_layout.addWidget(self.measurement_table, 1)
         self.trim_preview_label = QLabel(
             "Cluster-end illustration: green voxels are counted; magenta voxels are discarded."
         )
         self.trim_preview_label.setWordWrap(True)
-        result_layout.addWidget(self.trim_preview_label)
+        raw_layout.addWidget(self.trim_preview_label)
         self.trim_preview_view = SliceView(
             "Run measurements, select a cluster, then generate its voxel illustration"
         )
         self.trim_preview_view.setMinimumSize(420, 300)
-        result_layout.addWidget(self.trim_preview_view, 1)
+        raw_layout.addWidget(self.trim_preview_view, 1)
+        self.measurement_result_tabs.addTab(raw_page, "Raw measurement tables")
+
+        distribution_page = QWidget()
+        distribution_layout = QVBoxLayout(distribution_page)
+        self.distribution_preview_status = QLabel("The first unreviewed cluster-positive spine opens automatically.")
+        self.distribution_preview_status.setWordWrap(True)
+        distribution_layout.addWidget(self.distribution_preview_status)
+        preview_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.distribution_dendrite_view = SliceView("Dendrite/spine distribution preview")
+        self.distribution_protein_view = SliceView("Protein-cluster distribution preview")
+        self.distribution_dendrite_view.setMinimumSize(320, 260)
+        self.distribution_protein_view.setMinimumSize(320, 260)
+        preview_splitter.addWidget(self.distribution_dendrite_view)
+        preview_splitter.addWidget(self.distribution_protein_view)
+        distribution_layout.addWidget(preview_splitter, 2)
+        self.distribution_chart = DistributionChart()
+        distribution_layout.addWidget(self.distribution_chart, 1)
+        self.measurement_result_tabs.addTab(distribution_page, "Distribution review and group profiles")
         splitter.addWidget(result_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -3025,6 +3264,7 @@ class MainWindow(QMainWindow):
         self.measurement_status.setText(
             f"{len(detected)} detected specimen(s); {complete} measurement checkpoint(s) complete."
         )
+        self._refresh_distribution_groups()
         if detected:
             self._measurement_specimen_changed()
 
@@ -3104,6 +3344,33 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError) as exc:
             self.measurement_summary.setText(f"Cannot load measurements: {exc}")
             return
+        previous_spine = (
+            self._preferred_distribution_spine_id
+            if self._preferred_distribution_spine_id is not None
+            else self.distribution_spine.currentData()
+        )
+        self._preferred_distribution_spine_id = None
+        self.distribution_spine.blockSignals(True)
+        self.distribution_spine.clear()
+        distribution_rows = list(result.get("distribution_rows", []))
+        for row in distribution_rows:
+            reviewed = bool(row.get("distribution_reviewed", False))
+            valid = bool(row.get("spine_valid", True))
+            included = bool(row.get("distribution_included", False))
+            state = "invalid" if not valid else ("included" if included else "distribution excluded")
+            self.distribution_spine.addItem(
+                f"Spine {row['spine_id']} — {'reviewed' if reviewed else 'unreviewed'}; {state}; {row.get('distribution_axis_status', '')}",
+                int(row["spine_id"]),
+            )
+        selected = self.distribution_spine.findData(previous_spine) if previous_spine is not None else -1
+        if selected < 0:
+            selected = next(
+                (index for index, row in enumerate(distribution_rows) if not bool(row.get("distribution_reviewed", False))),
+                0,
+            )
+        if self.distribution_spine.count():
+            self.distribution_spine.setCurrentIndex(selected)
+        self.distribution_spine.blockSignals(False)
         specimen_row = result["specimen_rows"][0]
         source = "corrected" if result.get("corrected_masks") else "automatic"
         self.measurement_summary.setText(
@@ -3119,6 +3386,184 @@ class MainWindow(QMainWindow):
                 int(cluster_id),
             )
         self._populate_measurement_table()
+        if self.distribution_spine.count():
+            self._distribution_spine_changed()
+
+    def _refresh_distribution_groups(self) -> None:
+        if self.manifest is None:
+            return
+        results = []
+        for index, specimen in enumerate(self.manifest["specimens"]):
+            if specimen["checkpoints"].get("measurements", {}).get("state") != "complete":
+                continue
+            try:
+                results.append(load_measurement_result(self.manifest, index))
+            except (ValueError, OSError):
+                continue
+        _specimen_rows, group_rows = distribution_summary_rows(results)
+        current = self.distribution_group_combo.currentData()
+        self.distribution_group_combo.blockSignals(True)
+        self.distribution_group_combo.clear()
+        for row in group_rows:
+            self.distribution_group_combo.addItem(str(row["experimental_group"]), row)
+        if current is not None:
+            index = self.distribution_group_combo.findData(current)
+            if index >= 0:
+                self.distribution_group_combo.setCurrentIndex(index)
+        self.distribution_group_combo.blockSignals(False)
+        self._update_distribution_chart()
+
+    def _update_distribution_chart(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        row = self.distribution_group_combo.currentData()
+        self.distribution_chart.set_mode(str(self.distribution_chart_mode.currentData() or "line"))
+        self.distribution_chart.set_fixed_scale(self.distribution_fixed_scale.isChecked())
+        self.distribution_chart.set_profile(row if isinstance(row, dict) else None)
+
+    def _distribution_spine_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if (
+            self.manifest is None
+            or self.measurement_specimen.currentData() is None
+            or self.distribution_spine.currentData() is None
+        ):
+            return
+        specimen_index = int(self.measurement_specimen.currentData())
+        spine_id = int(self.distribution_spine.currentData())
+        try:
+            result = load_measurement_result(self.manifest, specimen_index)
+            row = next(item for item in result.get("distribution_rows", []) if int(item["spine_id"]) == spine_id)
+        except (OSError, ValueError, KeyError, StopIteration) as exc:
+            self.distribution_preview_status.setText(f"Cannot load distribution row: {exc}")
+            return
+        self.distribution_include.blockSignals(True)
+        self.distribution_invalid.blockSignals(True)
+        self.distribution_include.setChecked(bool(row.get("distribution_included", False)))
+        self.distribution_invalid.setChecked(not bool(row.get("spine_valid", True)))
+        self.distribution_include.setEnabled(bool(row.get("spine_valid", True)))
+        self.distribution_note.setText(str(row.get("review_note", "")))
+        self.distribution_include.blockSignals(False)
+        self.distribution_invalid.blockSignals(False)
+        self.distribution_preview_status.setText(
+            f"Loading spine {spine_id}: {row.get('distribution_axis_status', '')}. "
+            f"{row.get('distribution_axis_note', '')}"
+        )
+        if self._job_thread is not None:
+            self.distribution_preview_status.setText(
+                "Distribution row is ready; its image preview will load when the current background operation finishes."
+            )
+            return
+        worker = DistributionPreviewWorker(self.manifest, specimen_index, spine_id)
+        worker.completed.connect(self._distribution_preview_completed)
+        self._start_worker(worker, "distribution_preview")
+
+    @Slot(object)
+    def _distribution_preview_completed(self, preview: DistributionPreview) -> None:
+        self._last_distribution_preview = preview
+        self.distribution_dendrite_view.show_rgb(
+            self._distribution_overlay(preview.dendrite_projection, preview.spine_bins_projection, preview.axis_xy)
+        )
+        self.distribution_protein_view.show_rgb(
+            self._distribution_overlay(preview.protein_projection, preview.cluster_bins_projection, ())
+        )
+        ratios = [preview.row.get(f"bin_{index:02d}_ratio") for index in range(1, 11)]
+        self.distribution_preview_status.setText(
+            f"Spine {preview.row['spine_id']} | {preview.row['distribution_axis_status']} | "
+            f"shaft-to-tip ratios: " + ", ".join("blank" if value is None else f"{float(value):.3g}" for value in ratios)
+        )
+        self.measurement_result_tabs.setCurrentIndex(1)
+
+    @staticmethod
+    def _distribution_overlay(
+        raw: np.ndarray, bins: np.ndarray, axis_xy: tuple[tuple[int, int], ...]
+    ) -> np.ndarray:
+        low, high = np.percentile(raw, (0.5, 99.8))
+        scale = max(1.0, float(high - low))
+        gray = np.clip((raw.astype(np.float32) - low) * 255.0 / scale, 0, 255).astype(np.uint8)
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        for index, color in enumerate(DISTRIBUTION_COLORS, start=1):
+            mask = bins == index
+            if np.any(mask):
+                rgb[mask] = np.clip(rgb[mask].astype(np.float32) * 0.30 + np.asarray(color) * 0.70, 0, 255).astype(np.uint8)
+        for x, y in axis_xy:
+            if 0 <= y < rgb.shape[0] and 0 <= x < rgb.shape[1]:
+                rgb[max(0, y - 1) : y + 2, max(0, x - 1) : x + 2] = 255
+        return rgb
+
+    def _move_distribution_spine(self, offset: int) -> None:
+        count = self.distribution_spine.count()
+        if count:
+            self.distribution_spine.setCurrentIndex((self.distribution_spine.currentIndex() + offset) % count)
+
+    def _save_distribution_review(self) -> None:
+        if (
+            self.manifest is None
+            or self.project_path is None
+            or self.measurement_specimen.currentData() is None
+            or self.distribution_spine.currentData() is None
+        ):
+            return
+        specimen_index = int(self.measurement_specimen.currentData())
+        spine_id = int(self.distribution_spine.currentData())
+        try:
+            updated = set_distribution_review(
+                self.manifest,
+                self.project_path,
+                specimen_index,
+                spine_id,
+                distribution_included=self.distribution_include.isChecked(),
+                invalid_spine=self.distribution_invalid.isChecked(),
+                note=self.distribution_note.text(),
+            )
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot save spine review", str(exc))
+            return
+        next_id = next(
+            (
+                int(row["spine_id"])
+                for row in updated.get("distribution_rows", [])
+                if not bool(row.get("distribution_reviewed", False))
+            ),
+            None,
+        )
+        self._preferred_distribution_spine_id = next_id
+        self._refresh_distribution_groups()
+        # Refresh labels, then advance to the first remaining unreviewed spine.
+        self._measurement_specimen_changed()
+        if next_id is None:
+            self.distribution_preview_status.setText("All cluster-positive spines in this specimen have been reviewed.")
+
+    def _export_measurements(self) -> None:
+        if self.manifest is None:
+            return
+        output = Path(str(self.manifest["output_directory"]))
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Synpo measurement workbook",
+            str(output / "Synpo_measurements.xlsx"),
+            "Excel workbook (*.xlsx)",
+        )
+        if not selected:
+            return
+        worker = ExportWorker(
+            self.manifest,
+            Path(selected),
+            self.export_validation_pdf.isChecked(),
+            self.export_excluded_pdf.isChecked(),
+            self.export_invalid_pdf.isChecked(),
+            self.export_pdf_margin.value(),
+        )
+        worker.completed.connect(self._export_completed)
+        self._start_worker(worker, "export")
+
+    @Slot(object)
+    def _export_completed(self, result: dict[str, object]) -> None:
+        self.measurement_status.setText(
+            f"Verified export complete: {result['workbook']} and CSV files in {result['csv_directory']}."
+        )
+        QMessageBox.information(
+            self,
+            "Export verified",
+            f"Workbook and CSV files were written and reopened successfully.\n\n{result['workbook']}",
+        )
 
     def _populate_measurement_table(self, *_args) -> None:  # type: ignore[no-untyped-def]
         if self.manifest is None or self.measurement_specimen.currentData() is None:
@@ -3946,7 +4391,7 @@ class MainWindow(QMainWindow):
             )
             if self.project_path is not None:
                 save_project(self.project_path, self.manifest)
-        elif self._job_kind in {"measurements", "trim_preview"}:
+        elif self._job_kind in {"measurements", "trim_preview", "distribution_preview", "export"}:
             self.measurement_status.setText(
                 "Measurement operation stopped with an error; completed checkpoints remain usable."
             )
@@ -3964,6 +4409,8 @@ class MainWindow(QMainWindow):
         if finished_kind == "preview" and self._preview_requested_while_busy:
             self._preview_requested_while_busy = False
             self._preview_timer.start()
+        elif finished_kind == "measurements" and self.distribution_spine.count():
+            QTimer.singleShot(0, self._distribution_spine_changed)
 
     @Slot(object)
     def _scan_completed(self, report: ScanReport) -> None:
@@ -4251,6 +4698,7 @@ class MainWindow(QMainWindow):
         self._last_preview = None
         self._last_detection = None
         self._last_review = None
+        self._last_distribution_preview = None
         self._preview_statistics.clear()
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
@@ -4260,7 +4708,7 @@ class MainWindow(QMainWindow):
         self.output_edit.clear()
         self.table.setRowCount(0)
         self.summary_label.setText("Select a folder and scan it to begin.")
-        self.setWindowTitle("Synpo Microscopy Processor — Stage 5")
+        self.setWindowTitle("Synpo Microscopy Processor — Stage 6")
 
     def _set_job_running(self, running: bool) -> None:
         self.progress_bar.setVisible(running)
@@ -4313,6 +4761,8 @@ class MainWindow(QMainWindow):
             self.cancel_measurements_button.setEnabled(
                 running and self._job_kind == "measurements"
             )
+            self.save_distribution_review_button.setEnabled(not running)
+            self.export_measurements_button.setEnabled(not running and eligible)
         if not running and not self.progress_label.text():
             self.progress_label.setText("Ready")
 

@@ -58,7 +58,7 @@ def default_review_manifest() -> dict[str, object]:
 
 def default_measurements_manifest() -> dict[str, object]:
     return {
-        "algorithm_version": 1,
+        "algorithm_version": 2,
         "settings": {
             "minimum_cluster_spine_overlap_percent": 80.0,
             "cluster_end_method": "adaptive",
@@ -136,6 +136,11 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
         )
         object_status.setdefault("dendrite", {})
         object_status.setdefault("spine", {})
+        distribution_review = specimen.setdefault(
+            "distribution_review", {"spines": {}, "updated_at": None}
+        )
+        distribution_review.setdefault("spines", {})
+        distribution_review.setdefault("updated_at", None)
     return manifest
 
 

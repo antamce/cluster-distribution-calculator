@@ -7,8 +7,8 @@ review. Raw TIFFs are never modified or copied.
 
 ## Current project status
 
-The current version is `0.5.0`. Stages 1–4 are user-approved. Stage 5 measurements
-and spine/cluster association are implemented and ready for user testing. See
+The current version is `0.6.0`. Stages 1–5 are user-approved. Stage 6 curved-axis
+protein-distribution analysis, review, and tabular export are ready for testing. See
 [HANDOFF.md](HANDOFF.md) for architecture, scientific constraints, benchmarks, and
 the remaining roadmap.
 
@@ -184,9 +184,36 @@ voxels in magenta on the original 16-bit protein-channel maximum projection.
 The resumable batch produces compressed per-specimen raw rows for specimens,
 dendrites, spines, individual included clusters, and per-spine cluster sums.
 Current metrics include calibrated volumes, approximate skeleton length, spine
-density, inclusion percentage, and summed cluster/spine volume ratios. Protein
-distribution columns are deliberately marked pending until their scientific
-definition is approved. Final workbook/CSV export remains a later stage.
+density, inclusion percentage, and summed cluster/spine volume ratios.
+
+## Stage 6: curved-axis protein distribution and export
+
+For every cluster-positive spine, Synpo builds a calibrated 3D curved centerline
+from the largest shaft-contact region to the longest distal skeleton endpoint. It
+divides that path into ten equal physical-length parts and assigns every spine and
+qualifying inside-cluster voxel to its nearest centerline position. The individual
+distribution table saves, for each part, spine volume, cluster volume, and their
+unitless 0–1 ratio. Empty physical parts remain blank and are excluded per-bin;
+ambiguous axes and unusable paths are explicitly flagged.
+
+The distribution review opens at the first unreviewed spine. **Include in
+distribution summaries** affects only profile aggregation, while **Invalid spine**
+excludes the spine from all downstream counts and metrics without deleting its
+mask or audit row. Each decision is checkpointed immediately, the current specimen
+is recalculated, and the review advances. Group profiles first average eligible
+spines within each specimen, then average specimen means by experimental group;
+the screen shows SEM across specimen means. Line profiles are the default, with a
+bar-chart switch and automatic or fixed 0–1 scaling.
+
+The export button creates one verified Excel workbook plus CSV copies of every
+sheet. Sheets include master specimen/dendrite/spine/cluster rows,
+`Distribution_Individual`, `Distribution_Specimen`, `Distribution_Group`,
+`Distribution_Excluded`, `Invalid_Spines`, compact group summaries, and settings.
+Optional PDFs contain one two-panel XY maximum-projection page per spine using the
+same fixed shaft-to-tip palette, its curved axis and ten-bin profile. The crop
+margin is adjustable; excluded-distribution and invalid-spine audit PDFs are
+separate options. Segmentation-mask/ImageJ ROI export remains part of the later
+final-export stage.
 
 ## Tests and command-line validation
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synpo-microscopy"
-version = "0.5.0"
+version = "0.6.0"
 description = "Desktop workflow for paired-channel 3D microscopy data"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -16,6 +16,8 @@ dependencies = [
     "zarr>=2.18,<3",
     "numcodecs>=0.12,<0.16",
     "psutil>=6,<8",
+    "openpyxl>=3.1,<4",
+    "matplotlib>=3.9,<4",
 ]
 
 [project.scripts]

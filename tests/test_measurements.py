@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+import tifffile
 import zarr
 
 from synpo.detection import detection_cache_path
@@ -16,7 +17,10 @@ from synpo.measurements import (
     cluster_end_comparison_rows,
     load_measurement_result,
     measure_project,
+    set_distribution_review,
 )
+from synpo.distribution import calculate_spine_distribution
+from synpo.exporting import export_measurements
 from synpo.project import migrate_manifest, save_project
 
 
@@ -85,6 +89,17 @@ class MeasurementTests(unittest.TestCase):
         clusters = np.zeros(shape, dtype=np.uint32)
         clusters[0:5, 8:10, 7:9] = 1
         clusters[2:5, 2:4, 17:19] = 2
+        source = Path(str(manifest["source_directory"]))
+        source.mkdir(parents=True)
+        channel_a = "batch_treated_cell-1_ChanA_registered.tif"
+        channel_b = "batch_treated_cell-1_ChanB_registered.tif"
+        tifffile.imwrite(source / channel_a, (clusters > 0).astype(np.uint16) * 1200)
+        tifffile.imwrite(source / channel_b, ((dendrites > 0) | (spines > 0)).astype(np.uint16) * 1800)
+        manifest["specimens"][0]["channels"] = {
+            "ChanA": {"filename": channel_a},
+            "ChanB": {"filename": channel_b},
+        }
+        save_project(project_path, manifest)
         root_group = zarr.open_group(str(detection_cache_path(manifest)), mode="a")
         group = root_group.require_group("specimens/0000")
         for name, data in (
@@ -113,6 +128,8 @@ class MeasurementTests(unittest.TestCase):
             self.assertEqual(len(output["summaries"]), 1)
             result = load_measurement_result(manifest, 0)
             self.assertEqual(len(result["spine_rows"]), 1)
+            self.assertEqual(len(result["distribution_rows"]), 1)
+            self.assertEqual(result["distribution_rows"][0]["spine_id"], 1)
             self.assertEqual(result["spine_rows"][0]["included_cluster_count"], 1)
             self.assertAlmostEqual(result["spine_rows"][0]["volume_um3"], 0.32)
             self.assertAlmostEqual(
@@ -146,6 +163,28 @@ class MeasurementTests(unittest.TestCase):
             self.assertIn("fixed_candidate_volume_um3", comparison[0])
             self.assertIn("adaptive_candidate_volume_um3", comparison[0])
 
+            export = export_measurements(
+                manifest,
+                root / "measurements.xlsx",
+                excluded_audit_pdf=True,
+            )
+            self.assertTrue(Path(str(export["workbook"])).is_file())
+            self.assertTrue((root / "measurements_csv" / "Distribution_Individual.csv").is_file())
+            self.assertEqual(len(export["pdfs"]), 1)
+
+            set_distribution_review(
+                manifest,
+                project_path,
+                0,
+                1,
+                distribution_included=False,
+                invalid_spine=True,
+                note="broken",
+            )
+            invalidated = load_measurement_result(manifest, 0)
+            self.assertEqual(invalidated["specimen_rows"][0]["spine_count"], 0)
+            self.assertFalse(invalidated["spine_rows"][0]["spine_valid"])
+
     def test_fixed_and_adaptive_end_trimming(self) -> None:
         areas = np.zeros((8, 2), dtype=np.int64)
         areas[1:7, 1] = [80, 70, 20, 22, 19, 20]
@@ -171,6 +210,28 @@ class MeasurementTests(unittest.TestCase):
         self.assertFalse(adaptive[1, 1])
         self.assertFalse(adaptive[2, 1])
         self.assertEqual(adaptive_details[1]["discarded_z_slices"], [1, 2])
+
+    def test_calibrated_curved_axis_assigns_every_voxel_once(self) -> None:
+        spine = np.zeros((7, 18, 28), dtype=bool)
+        centers = []
+        for x in range(3, 24):
+            y = 7 + int(round(3 * np.sin((x - 3) / 20 * np.pi)))
+            centers.append((3, y, x))
+            spine[2:5, y - 1 : y + 2, x] = True
+        dendrite = np.zeros_like(spine)
+        dendrite[:, :, :3] = True
+        clusters = np.zeros_like(spine)
+        clusters[:, :, 15:23] = spine[:, :, 15:23]
+        result = calculate_spine_distribution(
+            spine,
+            dendrite,
+            clusters,
+            sampling_zyx_um=(0.5, 0.1, 0.1),
+        )
+        self.assertNotEqual(result.axis_status, "no_usable_path")
+        self.assertEqual(sum(result.spine_voxels_by_bin), int(spine.sum()))
+        self.assertEqual(sum(result.cluster_voxels_by_bin), int(clusters.sum()))
+        self.assertGreater(len(result.axis_points_zyx), 10)
 
 
 if __name__ == "__main__":
