@@ -13,6 +13,7 @@ from skimage.measure import marching_cubes
 from .detection import detection_cache_path
 from .models import ProgressCallback
 from .preprocessing import ProcessingCancelled
+from .project import channel_source_path
 from .review import review_cache_path
 
 
@@ -260,9 +261,8 @@ def generate_context_volume(
     editable_group, detection_group, actually_corrected = _mask_groups(
         manifest, specimen_index, corrected
     )
-    source = (
-        Path(str(manifest["source_directory"]))
-        / specimen["channels"][background_channel]["filename"]
+    source = channel_source_path(
+        manifest, specimen["channels"][background_channel]
     )
     raw_xy = np.zeros((y_count, x_count), dtype=np.uint16)
     raw_xz = np.zeros((z_count, x_count), dtype=np.uint16)

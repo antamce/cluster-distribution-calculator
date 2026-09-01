@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from threading import Event
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QPoint, QRectF, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSettings, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -40,10 +41,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .calibration import CalibrationStore
-from .importer import scan_batch
+from .importer import inspect_manual_pair, scan_batch
 from .models import Calibration, ScanReport, SpecimenPair
 from .project import (
+    channel_source_path,
     create_project_manifest,
     load_project,
     relink_project_sources,
@@ -81,16 +84,19 @@ from .visualization import (
 from .measurements import (
     ClusterTrimPreview,
     DistributionPreview,
+    SpineReviewPreview,
     MeasurementSettings,
     cluster_end_comparison_rows,
     clear_centerline_endpoint_hint,
     distribution_summary_rows,
     load_cluster_trim_preview,
     load_distribution_preview,
+    load_spine_review_preview,
     load_measurement_result,
     measure_project,
     set_centerline_endpoint_hint,
     set_distribution_review,
+    set_spine_quality_review,
 )
 from .exporting import export_measurements
 
@@ -129,13 +135,100 @@ def _label_colors(labels: np.ndarray, kind: int) -> np.ndarray:
     return colors
 
 
+def _screen_limited_size(widget: QWidget, width: int, height: int) -> tuple[int, int]:
+    screen = widget.screen() or QGuiApplication.primaryScreen()
+    if screen is None:
+        return width, height
+    available = screen.availableGeometry()
+    return (
+        max(320, min(width, round(available.width() * 0.9))),
+        max(240, min(height, round(available.height() * 0.9))),
+    )
+
+
 class SliceView(QLabel):
+    zoom_changed = Signal(int)
+
     def __init__(self, placeholder: str) -> None:
         super().__init__(placeholder)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(360, 360)
+        self.setMinimumSize(240, 200)
         self.setStyleSheet("background: #171717; color: #bdbdbd; border: 1px solid #444;")
         self._image: QImage | None = None
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self._panning = False
+        self._last_pan_position: QPointF | None = None
+        self._cursor_before_pan = self.cursor()
+
+    def _display_aspect_ratio(self) -> float:
+        if self._image is None:
+            return 1.0
+        return self._image.width() / max(1, self._image.height())
+
+    def _native_display_size(self) -> tuple[float, float]:
+        if self._image is None:
+            return 1.0, 1.0
+        width = float(self._image.width())
+        return width, width / max(1e-9, self._display_aspect_ratio())
+
+    def _fit_scale(self) -> float:
+        native_width, native_height = self._native_display_size()
+        return max(
+            1e-9,
+            min(
+                max(1, self.width()) / native_width,
+                max(1, self.height()) / native_height,
+            ),
+        )
+
+    def _display_scale(self) -> float:
+        return self._fit_scale() * self._zoom
+
+    def zoom_percent(self) -> int:
+        return max(1, round(self._display_scale() * 100.0))
+
+    def _target_rect(self, *, clamp_pan: bool = True) -> QRectF:
+        native_width, native_height = self._native_display_size()
+        scale = self._display_scale()
+        target_width = native_width * scale
+        target_height = native_height * scale
+        if clamp_pan:
+            maximum_x = max(0.0, (target_width - self.width()) / 2.0)
+            maximum_y = max(0.0, (target_height - self.height()) / 2.0)
+            self._pan.setX(max(-maximum_x, min(maximum_x, self._pan.x())))
+            self._pan.setY(max(-maximum_y, min(maximum_y, self._pan.y())))
+        return QRectF(
+            (self.width() - target_width) / 2.0 + self._pan.x(),
+            (self.height() - target_height) / 2.0 + self._pan.y(),
+            target_width,
+            target_height,
+        )
+
+    def reset_view(self) -> None:
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self._render()
+        self.zoom_changed.emit(self.zoom_percent())
+
+    def set_native_zoom(self) -> None:
+        self._zoom = max(0.05, min(40.0, 1.0 / self._fit_scale()))
+        self._pan = QPointF(0.0, 0.0)
+        self._render()
+        self.zoom_changed.emit(self.zoom_percent())
+
+    def image_coordinate(self, position: QPointF) -> tuple[int, int] | None:
+        if self._image is None:
+            return None
+        target = self._target_rect()
+        if not target.contains(position) or target.width() <= 0 or target.height() <= 0:
+            return None
+        column = int((position.x() - target.left()) * self._image.width() / target.width())
+        row = int((position.y() - target.top()) * self._image.height() / target.height())
+        return (
+            min(self._image.width() - 1, max(0, column)),
+            min(self._image.height() - 1, max(0, row)),
+        )
 
     def show_array(
         self,
@@ -161,6 +254,7 @@ class SliceView(QLabel):
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
         self._render()
+        self.zoom_changed.emit(self.zoom_percent())
 
     def show_rgb(self, rgb: np.ndarray) -> None:
         image = np.ascontiguousarray(rgb, dtype=np.uint8)
@@ -169,17 +263,6 @@ class SliceView(QLabel):
             image.data, width, height, image.strides[0], QImage.Format.Format_RGB888
         ).copy()
         self._render()
-
-    def _render(self) -> None:
-        if self._image is None:
-            return
-        self.setPixmap(
-            QPixmap.fromImage(self._image).scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
 
     def show_detection(
         self,
@@ -213,33 +296,358 @@ class SliceView(QLabel):
         ).copy()
         self._render()
 
+    def _render(self) -> None:
+        if self._image is None:
+            return
+        canvas = QPixmap(max(1, self.width()), max(1, self.height()))
+        canvas.fill(QColor("#171717"))
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawImage(
+            self._target_rect(),
+            self._image,
+            QRectF(0, 0, self._image.width(), self._image.height()),
+        )
+        painter.end()
+        self.setPixmap(canvas)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._image is None or event.angleDelta().y() == 0:
+            super().wheelEvent(event)
+            return
+        position = event.position()
+        old_target = self._target_rect()
+        if old_target.width() <= 0 or old_target.height() <= 0:
+            return
+        anchor_x = (position.x() - old_target.left()) / old_target.width()
+        anchor_y = (position.y() - old_target.top()) / old_target.height()
+        factor = 1.15 ** (event.angleDelta().y() / 120.0)
+        self._zoom = max(0.05, min(40.0, self._zoom * factor))
+        new_target = self._target_rect(clamp_pan=False)
+        self._pan.setX(
+            position.x()
+            - anchor_x * new_target.width()
+            - (self.width() - new_target.width()) / 2.0
+        )
+        self._pan.setY(
+            position.y()
+            - anchor_y * new_target.height()
+            - (self.height() - new_target.height()) / 2.0
+        )
+        self._render()
+        self.zoom_changed.emit(self.zoom_percent())
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._last_pan_position = event.position()
+            self._cursor_before_pan = self.cursor()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._panning and self._last_pan_position is not None:
+            delta = event.position() - self._last_pan_position
+            self._pan += delta
+            self._last_pan_position = event.position()
+            self._render()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._panning and event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = False
+            self._last_pan_position = None
+            self.setCursor(self._cursor_before_pan)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class ZoomControls(QWidget):
+    def __init__(self, view: SliceView) -> None:
+        super().__init__()
+        self.view = view
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        self.zoom_label = QLabel("Zoom: 100%")
+        self.zoom_label.setMinimumWidth(82)
+        layout.addWidget(self.zoom_label)
+        fit_button = QPushButton("Fit image")
+        fit_button.setToolTip("Fit the complete image in the available panel.")
+        fit_button.clicked.connect(view.reset_view)
+        layout.addWidget(fit_button)
+        native_button = QPushButton("100%")
+        native_button.setToolTip("Show one source image pixel per display pixel.")
+        native_button.clicked.connect(view.set_native_zoom)
+        layout.addWidget(native_button)
+        view.zoom_changed.connect(self._set_zoom)
+        self.setToolTip("Mouse wheel: zoom around pointer. Middle-button drag: pan.")
+        QTimer.singleShot(0, lambda: self._set_zoom(view.zoom_percent()))
+
+    @Slot(int)
+    def _set_zoom(self, percent: int) -> None:
+        self.zoom_label.setText(f"Zoom: {percent}%")
+
 
 class EndpointHintView(SliceView):
     point_clicked = Signal(int, int)
+    context_requested = Signal()
+
+    def __init__(self, placeholder: str) -> None:
+        super().__init__(placeholder)
+        self.point_mode = False
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if (
-            event.button() != Qt.MouseButton.LeftButton
-            or self._image is None
-            or self.pixmap() is None
-        ):
+        if event.button() != Qt.MouseButton.LeftButton or self._image is None:
             super().mousePressEvent(event)
             return
-        pixmap = self.pixmap()
-        left = (self.width() - pixmap.width()) / 2.0
-        top = (self.height() - pixmap.height()) / 2.0
-        position = event.position()
-        if not (
-            left <= position.x() < left + pixmap.width()
-            and top <= position.y() < top + pixmap.height()
-        ):
+        if not self.point_mode:
+            self.context_requested.emit()
+            event.accept()
             return
-        x = int((position.x() - left) * self._image.width() / pixmap.width())
-        y = int((position.y() - top) * self._image.height() / pixmap.height())
-        self.point_clicked.emit(
-            min(self._image.width() - 1, max(0, x)),
-            min(self._image.height() - 1, max(0, y)),
+        coordinate = self.image_coordinate(event.position())
+        if coordinate is None:
+            return
+        self.point_clicked.emit(*coordinate)
+        event.accept()
+
+
+class ClickableSliceView(SliceView):
+    context_requested = Signal()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() == Qt.MouseButton.LeftButton and self._image is not None:
+            self.context_requested.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class SpineMapView(SliceView):
+    spine_selected = Signal(int)
+
+    def __init__(self) -> None:
+        super().__init__("Numbered spine map")
+        self._labels: np.ndarray | None = None
+        self._visible_ids: set[int] = set()
+
+    @staticmethod
+    def _boundaries(labels: np.ndarray) -> np.ndarray:
+        present = labels > 0
+        interior = present.copy()
+        interior[1:, :] &= labels[1:, :] == labels[:-1, :]
+        interior[:-1, :] &= labels[:-1, :] == labels[1:, :]
+        interior[:, 1:] &= labels[:, 1:] == labels[:, :-1]
+        interior[:, :-1] &= labels[:, :-1] == labels[:, 1:]
+        return present & ~interior
+
+    def set_scene(
+        self,
+        raw: np.ndarray,
+        spines: np.ndarray,
+        clusters: np.ndarray,
+        visible_ids: set[int],
+        current_id: int | None,
+        *,
+        focus_only: bool,
+    ) -> None:
+        labels = np.asarray(spines, dtype=np.uint32)
+        self._labels = labels
+        self._visible_ids = set(visible_ids)
+        low, high = np.percentile(raw, (0.5, 99.8))
+        scale = max(1.0, float(high) - float(low))
+        gray = np.clip(
+            (np.asarray(raw, dtype=np.float32) - float(low)) * 255.0 / scale,
+            0,
+            255,
+        ).astype(np.uint8)
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        cluster_mask = np.asarray(clusters) > 0
+        rgb[cluster_mask] = np.clip(
+            rgb[cluster_mask].astype(np.float32) * 0.35
+            + np.asarray((245, 45, 205), dtype=np.float32) * 0.65,
+            0,
+            255,
+        ).astype(np.uint8)
+        filtered = np.where(np.isin(labels, list(visible_ids)), labels, 0).astype(
+            np.uint32
         )
+        boundaries = self._boundaries(filtered)
+        other = boundaries & (filtered != int(current_id or 0))
+        rgb[other] = (105, 205, 225) if not focus_only else (120, 130, 135)
+        if current_id is not None:
+            current = boundaries & (filtered == current_id)
+            rgb[current] = (255, 230, 20)
+        image = QImage(
+            np.ascontiguousarray(rgb).data,
+            rgb.shape[1],
+            rgb.shape[0],
+            rgb.strides[0],
+            QImage.Format.Format_RGB888,
+        ).copy()
+        painter = QPainter(image)
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(9)
+        painter.setFont(font)
+        for spine_id in sorted(visible_ids):
+            yy, xx = np.nonzero(labels == spine_id)
+            if not len(xx):
+                continue
+            x, y = int(np.median(xx)), int(np.median(yy))
+            color = QColor(255, 235, 25) if spine_id == current_id else QColor(230, 250, 255)
+            painter.setPen(QPen(QColor(20, 20, 20), 3))
+            painter.drawText(x + 3, y - 3, str(spine_id))
+            painter.setPen(QPen(color, 1))
+            painter.drawText(x + 3, y - 3, str(spine_id))
+        painter.end()
+        self._image = image
+        self._render()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() != Qt.MouseButton.LeftButton or self._labels is None:
+            super().mousePressEvent(event)
+            return
+        coordinate = self.image_coordinate(event.position())
+        if coordinate is None:
+            return
+        x, y = coordinate
+        spine_id = int(self._labels[y, x])
+        if spine_id not in self._visible_ids:
+            y0, y1 = max(0, y - 6), min(self._labels.shape[0], y + 7)
+            x0, x1 = max(0, x - 6), min(self._labels.shape[1], x + 7)
+            nearby = self._labels[y0:y1, x0:x1]
+            candidates = nearby[np.isin(nearby, list(self._visible_ids))]
+            if not len(candidates):
+                return
+            spine_id = int(np.bincount(candidates.astype(np.int64)).argmax())
+        self.spine_selected.emit(spine_id)
+        event.accept()
+
+
+class SpineMapDialog(QDialog):
+    spine_selected = Signal(int)
+
+    def __init__(
+        self,
+        title: str,
+        volume: ContextVolume,
+        result: dict[str, object],
+        slice_loader,
+        current_id: int | None,
+        *,
+        focus_only: bool,
+        parent=None,
+    ) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(*_screen_limited_size(self, 1100, 820))
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.volume = volume
+        self.result = result
+        self.slice_loader = slice_loader
+        self.current_id = current_id
+        self.focus_only = focus_only
+        self.rows = {
+            int(row["spine_id"]): row for row in result.get("spine_rows", [])
+        }
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        self.filter_combo = QComboBox()
+        for label, value in (
+            ("All spines", "all"),
+            ("Cluster-positive", "positive"),
+            ("Cluster-less", "cluster_less"),
+            ("Valid", "valid"),
+            ("Invalid", "invalid"),
+        ):
+            self.filter_combo.addItem(label, value)
+        self.filter_combo.currentIndexChanged.connect(self._render_scene)
+        controls.addWidget(QLabel("Show:"))
+        controls.addWidget(self.filter_combo)
+        self.plane_combo = QComboBox()
+        self.plane_combo.addItem("XY maximum projection", "maximum")
+        self.plane_combo.addItem("Single Z slice", "slice")
+        self.plane_combo.currentIndexChanged.connect(self._plane_changed)
+        controls.addWidget(QLabel("View:"))
+        controls.addWidget(self.plane_combo)
+        self.z_slider = QSlider(Qt.Orientation.Horizontal)
+        self.z_slider.setRange(0, max(0, volume.z_count - 1))
+        self.z_slider.setEnabled(False)
+        self.z_slider.valueChanged.connect(self._render_scene)
+        controls.addWidget(self.z_slider, 1)
+        self.z_label = QLabel("XY maximum")
+        controls.addWidget(self.z_label)
+        layout.addLayout(controls)
+        self.view = SpineMapView()
+        self.view.spine_selected.connect(self._spine_clicked)
+        layout.addWidget(self.view, 1)
+        layout.addWidget(ZoomControls(self.view))
+        self.status = QLabel(
+            "Click a numbered spine to open it in the appropriate review queue. "
+            "Mouse wheel zooms; middle-button drag pans."
+        )
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        if focus_only:
+            self.filter_combo.setVisible(False)
+        self._render_scene()
+
+    def _visible_ids(self) -> set[int]:
+        if self.focus_only:
+            return set(self.rows)
+        mode = str(self.filter_combo.currentData() or "all")
+        return {
+            spine_id
+            for spine_id, row in self.rows.items()
+            if mode == "all"
+            or (mode == "positive" and bool(row.get("has_protein_cluster", False)))
+            or (mode == "cluster_less" and not bool(row.get("has_protein_cluster", False)))
+            or (mode == "valid" and bool(row.get("spine_valid", True)))
+            or (mode == "invalid" and not bool(row.get("spine_valid", True)))
+        }
+
+    @Slot()
+    def _plane_changed(self) -> None:
+        single_slice = self.plane_combo.currentData() == "slice"
+        self.z_slider.setEnabled(single_slice)
+        self._render_scene()
+
+    @Slot()
+    def _render_scene(self) -> None:
+        if self.plane_combo.currentData() == "slice":
+            z_index = self.z_slider.value()
+            loaded = self.slice_loader(z_index)
+            raw, spines, clusters = loaded.raw, loaded.spines, loaded.clusters
+            self.z_label.setText(f"Z {z_index + 1}/{self.volume.z_count}")
+        else:
+            raw = self.volume.xy.raw
+            spines = self.volume.xy.spines
+            clusters = self.volume.xy.clusters
+            self.z_label.setText("XY maximum")
+        self.view.set_scene(
+            raw,
+            spines,
+            clusters,
+            self._visible_ids(),
+            self.current_id,
+            focus_only=self.focus_only,
+        )
+
+    @Slot(int)
+    def _spine_clicked(self, spine_id: int) -> None:
+        self.current_id = spine_id
+        self._render_scene()
+        self.status.setText(
+            f"Spine {spine_id} selected in the main review window."
+        )
+        self.spine_selected.emit(spine_id)
 
 
 class DistributionChart(QWidget):
@@ -341,28 +749,18 @@ class ReviewCanvas(SliceView):
     def hint_points(self) -> tuple[tuple[int, int], ...]:
         return tuple(point for stroke in self._strokes for point in stroke)
 
+    def hint_strokes(self) -> tuple[tuple[tuple[int, int], ...], ...]:
+        return tuple(tuple(stroke) for stroke in self._strokes if stroke)
+
     def show_detection(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         super().show_detection(*args, **kwargs)
         self._base_image = self._image.copy() if self._image is not None else None
         self._draw_hints()
 
     def _image_position(self, position) -> tuple[int, int] | None:  # type: ignore[no-untyped-def]
-        if self._base_image is None or self.pixmap() is None:
+        if self._base_image is None:
             return None
-        pixmap = self.pixmap()
-        left = (self.width() - pixmap.width()) / 2.0
-        top = (self.height() - pixmap.height()) / 2.0
-        if not (
-            left <= position.x() < left + pixmap.width()
-            and top <= position.y() < top + pixmap.height()
-        ):
-            return None
-        x = int((position.x() - left) * self._base_image.width() / pixmap.width())
-        y = int((position.y() - top) * self._base_image.height() / pixmap.height())
-        return (
-            min(self._base_image.width() - 1, max(0, x)),
-            min(self._base_image.height() - 1, max(0, y)),
-        )
+        return self.image_coordinate(position)
 
     def _append_to_stroke(self, point: tuple[int, int]) -> None:
         stroke = self._strokes[-1]
@@ -474,6 +872,9 @@ class ProjectionView(SliceView):
             )
         self._render_projection()
 
+    def _display_aspect_ratio(self) -> float:
+        return self._display_aspect
+
     def set_crosshair(self, crosshair: tuple[int, int, int]) -> None:
         self._crosshair = crosshair
         self._render_projection()
@@ -550,41 +951,8 @@ class ProjectionView(SliceView):
         self._image = image
         self._render()
 
-    def _render(self) -> None:
-        if self._image is None:
-            return
-        available_width = max(1, self.width())
-        available_height = max(1, self.height())
-        if available_width / available_height > self._display_aspect:
-            target_height = available_height
-            target_width = max(1, round(target_height * self._display_aspect))
-        else:
-            target_width = available_width
-            target_height = max(1, round(target_width / self._display_aspect))
-        self.setPixmap(
-            QPixmap.fromImage(self._image).scaled(
-                target_width,
-                target_height,
-                Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-
     def _event_image_coordinate(self, event) -> tuple[int, int] | None:  # type: ignore[no-untyped-def]
-        if self._image is None or self.pixmap() is None:
-            return None
-        pixmap = self.pixmap()
-        left = (self.width() - pixmap.width()) / 2.0
-        top = (self.height() - pixmap.height()) / 2.0
-        position = event.position()
-        if not (
-            left <= position.x() < left + pixmap.width()
-            and top <= position.y() < top + pixmap.height()
-        ):
-            return None
-        column = int((position.x() - left) * self._image.width() / pixmap.width())
-        row = int((position.y() - top) * self._image.height() / pixmap.height())
-        return column, row
+        return self.image_coordinate(event.position())
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() != Qt.MouseButton.LeftButton:
@@ -627,13 +995,16 @@ class ProjectionView(SliceView):
 
 
 class Volume3DView(QWidget):
+    rotation_changed = Signal(float, float, float)
+
     def __init__(self) -> None:
         super().__init__()
-        self.setMinimumSize(600, 520)
+        self.setMinimumSize(400, 300)
         self.setStyleSheet("background: #111; color: white;")
         self._volume: ContextVolume | None = None
-        self._yaw = -35.0
-        self._pitch = 25.0
+        self._rotation_x = 25.0
+        self._rotation_y = 0.0
+        self._rotation_z = -35.0
         self._zoom = 1.0
         self._last_mouse = None
         self._visible_kinds = (True, True, True)
@@ -643,10 +1014,30 @@ class Volume3DView(QWidget):
 
     def set_volume(self, volume: ContextVolume) -> None:
         self._volume = volume
-        self._yaw = -35.0
-        self._pitch = 25.0
+        self._rotation_x = 25.0
+        self._rotation_y = 0.0
+        self._rotation_z = -35.0
         self._zoom = 1.0
         self.update()
+        self.rotation_changed.emit(*self.rotation())
+
+    @staticmethod
+    def _bounded_rotation(value: float) -> float:
+        return max(-180.0, min(180.0, float(value)))
+
+    def rotation(self) -> tuple[float, float, float]:
+        return self._rotation_x, self._rotation_y, self._rotation_z
+
+    def set_rotation(self, x: float, y: float, z: float) -> None:
+        values = tuple(self._bounded_rotation(value) for value in (x, y, z))
+        if values == self.rotation():
+            return
+        self._rotation_x, self._rotation_y, self._rotation_z = values
+        self.update()
+        self.rotation_changed.emit(*values)
+
+    def reset_rotation(self) -> None:
+        self.set_rotation(25.0, 0.0, -35.0)
 
     def set_visible_kinds(self, visible: tuple[bool, bool, bool]) -> None:
         self._visible_kinds = visible
@@ -685,19 +1076,19 @@ class Volume3DView(QWidget):
         points = points.astype(np.float32, copy=False)
         centered = points - (points.min(axis=0) + points.max(axis=0)) / 2.0
         centered[:, 2] *= self._z_spacing_factor
-        yaw = np.deg2rad(self._yaw)
-        pitch = np.deg2rad(self._pitch)
-        cos_yaw = np.float32(np.cos(yaw))
-        sin_yaw = np.float32(np.sin(yaw))
-        cos_pitch = np.float32(np.cos(pitch))
-        sin_pitch = np.float32(np.sin(pitch))
-        yaw_x = centered[:, 0] * cos_yaw - centered[:, 1] * sin_yaw
-        yaw_y = centered[:, 0] * sin_yaw + centered[:, 1] * cos_yaw
+        angle_x, angle_y, angle_z = np.deg2rad(self.rotation())
+        cos_x, sin_x = np.float32(np.cos(angle_x)), np.float32(np.sin(angle_x))
+        cos_y, sin_y = np.float32(np.cos(angle_y)), np.float32(np.sin(angle_y))
+        cos_z, sin_z = np.float32(np.cos(angle_z)), np.float32(np.sin(angle_z))
+        z_x = centered[:, 0] * cos_z - centered[:, 1] * sin_z
+        z_y = centered[:, 0] * sin_z + centered[:, 1] * cos_z
+        x_y = z_y * cos_x - centered[:, 2] * sin_x
+        x_z = z_y * sin_x + centered[:, 2] * cos_x
         rotated = np.empty_like(centered)
-        rotated[:, 0] = yaw_x
-        rotated[:, 1] = yaw_y * cos_pitch - centered[:, 2] * sin_pitch
-        rotated[:, 2] = yaw_y * sin_pitch + centered[:, 2] * cos_pitch
-        return rotated, centered, cos_yaw, sin_yaw, cos_pitch, sin_pitch
+        rotated[:, 0] = z_x * cos_y + x_z * sin_y
+        rotated[:, 1] = x_y
+        rotated[:, 2] = -z_x * sin_y + x_z * cos_y
+        return rotated, centered, cos_z, sin_z, cos_x, sin_x
 
     def _render_mesh_image(self, render_width: int, render_height: int) -> QImage:
         assert self._volume is not None
@@ -885,10 +1276,12 @@ class Volume3DView(QWidget):
     def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self._last_mouse is not None and event.buttons() & Qt.MouseButton.LeftButton:
             delta = event.position() - self._last_mouse
-            self._yaw += delta.x() * 0.6
-            self._pitch = max(-89.0, min(89.0, self._pitch + delta.y() * 0.6))
             self._last_mouse = event.position()
-            self.update()
+            self.set_rotation(
+                self._rotation_x + delta.y() * 0.6,
+                self._rotation_y,
+                self._rotation_z + delta.x() * 0.6,
+            )
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -905,7 +1298,8 @@ class Volume3DView(QWidget):
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        self._yaw, self._pitch, self._zoom = -35.0, 25.0, 1.0
+        self._zoom = 1.0
+        self.reset_rotation()
         self.update()
         event.accept()
 
@@ -992,7 +1386,7 @@ class ContextViewerDialog(QDialog):
     ) -> None:  # type: ignore[no-untyped-def]
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(1220, 860)
+        self.resize(*_screen_limited_size(self, 1220, 860))
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.volume = volume
         y_count, x_count = volume.xy.raw.shape
@@ -1027,12 +1421,13 @@ class ContextViewerDialog(QDialog):
             view.coordinate_selected.connect(self._projection_clicked)
             self.projection_views[axis] = view
             projection_layout.addWidget(view, 1, column)
+            projection_layout.addWidget(ZoomControls(view), 2, column)
         help_label = QLabel(
             "Click any projection to link the yellow crosshairs and update the main Z slice. "
             "Orthogonal views use the confirmed physical voxel calibration."
         )
         help_label.setWordWrap(True)
-        projection_layout.addWidget(help_label, 2, 0, 1, 3)
+        projection_layout.addWidget(help_label, 3, 0, 1, 3)
         self.tabs.addTab(projections_tab, "XY / XZ / YZ maxima")
 
         volume_tab = QWidget()
@@ -1045,6 +1440,35 @@ class ContextViewerDialog(QDialog):
         volume_layout.addWidget(material_note)
         self.volume_view = Volume3DView()
         self.volume_view.set_volume(volume)
+        rotation_group = QGroupBox("Rotation")
+        rotation_layout = QGridLayout(rotation_group)
+        self.volume_rotation_sliders: list[QSlider] = []
+        self.volume_rotation_spins: list[QSpinBox] = []
+        for row, (axis, initial) in enumerate(
+            zip(("X", "Y", "Z"), self.volume_view.rotation())
+        ):
+            rotation_layout.addWidget(QLabel(f"{axis} axis:"), row, 0)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(-180, 180)
+            slider.setSingleStep(1)
+            slider.setPageStep(10)
+            slider.setValue(round(initial))
+            slider.valueChanged.connect(self._rotation_control_changed)
+            self.volume_rotation_sliders.append(slider)
+            rotation_layout.addWidget(slider, row, 1)
+            spin = QSpinBox()
+            spin.setRange(-180, 180)
+            spin.setSingleStep(1)
+            spin.setSuffix("°")
+            spin.setValue(round(initial))
+            spin.valueChanged.connect(self._rotation_control_changed)
+            self.volume_rotation_spins.append(spin)
+            rotation_layout.addWidget(spin, row, 2)
+        reset_rotation = QPushButton("Reset rotation")
+        reset_rotation.clicked.connect(self.volume_view.reset_rotation)
+        rotation_layout.addWidget(reset_rotation, 0, 3, 3, 1)
+        self.volume_view.rotation_changed.connect(self._rotation_view_changed)
+        volume_layout.addWidget(rotation_group)
         render_row = QHBoxLayout()
         render_row.addWidget(QLabel("Z-layer spacing:"))
         self.volume_z_spacing = QDoubleSpinBox()
@@ -1117,6 +1541,39 @@ class ContextViewerDialog(QDialog):
             1, bool(len(volume.mesh_faces) or len(volume.points_um))
         )
         self._refresh_projections()
+
+    @Slot()
+    def _rotation_control_changed(self) -> None:
+        sender = self.sender()
+        for slider, spin in zip(
+            self.volume_rotation_sliders, self.volume_rotation_spins
+        ):
+            if sender is slider:
+                spin.blockSignals(True)
+                spin.setValue(slider.value())
+                spin.blockSignals(False)
+            elif sender is spin:
+                slider.blockSignals(True)
+                slider.setValue(spin.value())
+                slider.blockSignals(False)
+        self.volume_view.set_rotation(
+            *(control.value() for control in self.volume_rotation_spins)
+        )
+
+    @Slot(float, float, float)
+    def _rotation_view_changed(self, x: float, y: float, z: float) -> None:
+        for slider, spin, value in zip(
+            self.volume_rotation_sliders,
+            self.volume_rotation_spins,
+            (x, y, z),
+        ):
+            rounded = round(value)
+            slider.blockSignals(True)
+            spin.blockSignals(True)
+            slider.setValue(rounded)
+            spin.setValue(rounded)
+            slider.blockSignals(False)
+            spin.blockSignals(False)
 
     def _choose_volume_color(self, kind: int) -> None:
         color = QColorDialog.getColor(
@@ -1200,7 +1657,7 @@ class AreaSelectionDialog(QDialog):
     def __init__(self, title: str, volume: ContextVolume, parent=None) -> None:  # type: ignore[no-untyped-def]
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(900, 820)
+        self.resize(*_screen_limited_size(self, 900, 820))
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         outer = QVBoxLayout(self)
         instructions = QLabel(
@@ -1219,6 +1676,7 @@ class AreaSelectionDialog(QDialog):
         self.selection_view.enable_rectangle_selection(True)
         self.selection_view.selection_changed.connect(self._selection_changed)
         outer.addWidget(self.selection_view, 1)
+        outer.addWidget(ZoomControls(self.selection_view))
         self.selection_label = QLabel("No area selected.")
         outer.addWidget(self.selection_label)
         buttons = QHBoxLayout()
@@ -1441,17 +1899,30 @@ class DistributionPreviewWorker(QObject):
     completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, manifest: dict[str, object], specimen_index: int, spine_id: int) -> None:
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        specimen_index: int,
+        spine_id: int,
+        review_mode: str = "cluster_positive",
+    ) -> None:
         super().__init__()
         self.manifest = manifest
         self.specimen_index = specimen_index
         self.spine_id = spine_id
+        self.review_mode = review_mode
 
     @Slot()
     def run(self) -> None:
         try:
-            preview = load_distribution_preview(
-                self.manifest, self.specimen_index, self.spine_id, margin_um=1.0
+            preview = (
+                load_distribution_preview(
+                    self.manifest, self.specimen_index, self.spine_id, margin_um=1.0
+                )
+                if self.review_mode == "cluster_positive"
+                else load_spine_review_preview(
+                    self.manifest, self.specimen_index, self.spine_id, margin_um=1.0
+                )
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -1642,19 +2113,41 @@ class ScanWorker(QObject):
     completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        channel_markers: dict[str, str] | None = None,
+        default_group: str = "Experiment",
+        manual_paths: tuple[Path, Path] | None = None,
+    ) -> None:
         super().__init__()
         self.directory = directory
+        self.channel_markers = channel_markers
+        self.default_group = default_group
+        self.manual_paths = manual_paths
 
     @Slot()
     def run(self) -> None:
         try:
-            report = scan_batch(
-                self.directory,
-                include_checksums=True,
-                progress=lambda phase, current, total, detail: self.progress.emit(
-                    phase, current, total, detail
-                ),
+            callback = lambda phase, current, total, detail: self.progress.emit(
+                phase, current, total, detail
+            )
+            report = (
+                inspect_manual_pair(
+                    self.manual_paths[0],
+                    self.manual_paths[1],
+                    default_experimental_group=self.default_group,
+                    include_checksums=True,
+                    progress=callback,
+                )
+                if self.manual_paths is not None
+                else scan_batch(
+                    self.directory,
+                    channel_markers=self.channel_markers,
+                    default_experimental_group=self.default_group,
+                    include_checksums=True,
+                    progress=callback,
+                )
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -1670,7 +2163,7 @@ class VerifyWorker(QObject):
     def __init__(
         self,
         manifest: dict[str, object],
-        directory: Path,
+        directory: Path | None,
         relink: bool,
     ) -> None:
         super().__init__()
@@ -1686,7 +2179,7 @@ class VerifyWorker(QObject):
         try:
             if self.relink:
                 results = relink_project_sources(
-                    self.manifest, self.directory, progress=callback
+                    self.manifest, self.directory, progress=callback  # type: ignore[arg-type]
                 )
             else:
                 results = verify_project_sources(
@@ -1704,8 +2197,9 @@ class VerifyWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Synpo Microscopy Processor — Stage 6")
-        self.resize(1380, 860)
+        self.setWindowTitle(f"Synpo Microscopy Processor — Beta {__version__}")
+        self.setMinimumSize(720, 500)
+        self._was_maximized_before_fullscreen = True
 
         self.report: ScanReport | None = None
         self.manifest: dict[str, object] | None = None
@@ -1713,14 +2207,23 @@ class MainWindow(QMainWindow):
         self._job_thread: QThread | None = None
         self._job_worker: QObject | None = None
         self._job_kind: str | None = None
+        self._progress_started_at = 0.0
+        self._progress_last_at = 0.0
+        self._progress_last_current = 0
+        self._progress_last_total = 0
+        self._progress_rate_ema: float | None = None
         self._preview_statistics: dict[tuple[object, ...], StackStatistics] = {}
         self._last_preview: PreviewResult | None = None
         self._last_detection: DetectionSlice | None = None
         self._last_review: ReviewSlice | None = None
         self._last_review_context: ContextVolume | None = None
         self._last_trim_preview: ClusterTrimPreview | None = None
-        self._last_distribution_preview: DistributionPreview | None = None
+        self._last_distribution_preview: DistributionPreview | SpineReviewPreview | None = None
         self._preferred_distribution_spine_id: int | None = None
+        self._preferred_spine_review_mode: str | None = None
+        self._spine_map_focus_only = False
+        self._spine_map_current_id: int | None = None
+        self._spine_map_dialogs: list[SpineMapDialog] = []
         self._centerline_hint_pending_reload = False
         self._review_thread: QThread | None = None
         self._review_worker: ReviewWorker | None = None
@@ -1733,6 +2236,9 @@ class MainWindow(QMainWindow):
         self._context_dialogs: list[ContextViewerDialog] = []
         self._area_dialog: AreaSelectionDialog | None = None
         self._preview_requested_while_busy = False
+        self._preprocess_view_specimen_key: tuple[int, int] | None = None
+        self._detection_view_specimen_key: tuple[int, int] | None = None
+        self._review_view_specimen_key: tuple[int, int] | None = None
         self._calibration_store = CalibrationStore()
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -1742,6 +2248,7 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._build_interface()
         self._load_presets()
+        self._update_sensitivity_warnings()
         self._set_job_running(False)
 
     def _build_actions(self) -> None:
@@ -1772,6 +2279,79 @@ class MainWindow(QMainWindow):
         self.relink_action.triggered.connect(self._relink_sources)
         project_menu.addAction(self.relink_action)
 
+        view_menu = self.menuBar().addMenu("&View")
+        self.fullscreen_action = QAction("Toggle full screen", self)
+        self.fullscreen_action.setShortcut("F11")
+        self.fullscreen_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.fullscreen_action.triggered.connect(self._toggle_fullscreen)
+        view_menu.addAction(self.fullscreen_action)
+
+    @staticmethod
+    def _clamp_window_geometry(rect: QRect) -> QRect:
+        screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return QRect(rect)
+        available = screen.availableGeometry()
+        width = min(max(320, rect.width()), available.width())
+        height = min(max(240, rect.height()), available.height())
+        left = max(available.left(), min(rect.left(), available.right() - width + 1))
+        top = max(available.top(), min(rect.top(), available.bottom() - height + 1))
+        return QRect(left, top, width, height)
+
+    def show_initial(self) -> None:
+        settings = QSettings()
+        saved_geometry = settings.value("main_window/normal_geometry")
+        has_saved_geometry = isinstance(saved_geometry, QRect) and saved_geometry.isValid()
+        if has_saved_geometry:
+            self.setGeometry(self._clamp_window_geometry(saved_geometry))
+        else:
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                width = min(1380, round(available.width() * 0.9))
+                height = min(860, round(available.height() * 0.9))
+                self.setGeometry(
+                    available.center().x() - width // 2,
+                    available.center().y() - height // 2,
+                    width,
+                    height,
+                )
+        mode = str(settings.value("main_window/mode", "maximized"))
+        if not has_saved_geometry:
+            mode = "maximized"
+        if mode == "fullscreen":
+            self.showFullScreen()
+        elif mode == "maximized":
+            self.showMaximized()
+        else:
+            self.show()
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            if self._was_maximized_before_fullscreen:
+                self.showMaximized()
+            else:
+                self.showNormal()
+            return
+        self._was_maximized_before_fullscreen = self.isMaximized()
+        self.showFullScreen()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self._toggle_fullscreen()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _save_window_preferences(self) -> None:
+        settings = QSettings()
+        normal = self.normalGeometry() if (self.isMaximized() or self.isFullScreen()) else self.geometry()
+        settings.setValue("main_window/normal_geometry", self._clamp_window_geometry(normal))
+        settings.setValue(
+            "main_window/mode",
+            "fullscreen" if self.isFullScreen() else "maximized" if self.isMaximized() else "normal",
+        )
+
     def _build_interface(self) -> None:
         central = QWidget()
         central_layout = QVBoxLayout(central)
@@ -1801,6 +2381,33 @@ class MainWindow(QMainWindow):
         output_row.addWidget(output_browse)
         locations_form.addRow("Output folder:", output_row)
         outer.addWidget(locations)
+
+        import_group = QGroupBox("Filename pairing")
+        import_form = QFormLayout(import_group)
+        self.channel_a_marker = QLineEdit("ChanA")
+        self.channel_a_marker.setPlaceholderText("Example: ChanA or cy")
+        self.channel_b_marker = QLineEdit("ChanB")
+        self.channel_b_marker.setPlaceholderText("Example: ChanB or cl")
+        import_form.addRow("Channel A marker:", self.channel_a_marker)
+        import_form.addRow("Channel B marker:", self.channel_b_marker)
+        self.fallback_group_edit = QLineEdit("Experiment")
+        self.fallback_group_edit.setToolTip(
+            "Used only when filenames do not contain the original underscore metadata schema."
+        )
+        import_form.addRow("Fallback group:", self.fallback_group_edit)
+        self.manual_pair_button = QPushButton(
+            "Manually choose one Channel A file and one Channel B fileвЂ¦"
+        )
+        self.manual_pair_button.clicked.connect(self._choose_manual_pair)
+        import_form.addRow(self.manual_pair_button)
+        import_note = QLabel(
+            "Automatic pairing removes the configured channel marker from each TIFF name. "
+            "Files without the original metadata schema are placed in the fallback group; "
+            "their specimen names can be edited in the table."
+        )
+        import_note.setWordWrap(True)
+        import_form.addRow(import_note)
+        outer.addWidget(import_group)
 
         settings_row = QHBoxLayout()
         channel_group = QGroupBox("Channel roles (confirm for this batch)")
@@ -1920,7 +2527,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(QLabel("Gaussian Z:"))
         controls_layout.addWidget(self.sigma_z_spin)
         self.sensitivity_spin = QDoubleSpinBox()
-        self.sensitivity_spin.setRange(0.1, 3.0)
+        self.sensitivity_spin.setRange(0.1, 10.0)
         self.sensitivity_spin.setDecimals(2)
         self.sensitivity_spin.setSingleStep(0.05)
         self.sensitivity_spin.setToolTip(
@@ -1928,12 +2535,17 @@ class MainWindow(QMainWindow):
         )
         controls_layout.addWidget(QLabel("Threshold sensitivity:"))
         controls_layout.addWidget(self.sensitivity_spin)
+        self.sensitivity_spin.valueChanged.connect(self._update_sensitivity_warnings)
         self.apply_preprocessing_button = QPushButton("Apply channel settings")
         self.apply_preprocessing_button.clicked.connect(
             self._apply_preprocessing_settings
         )
         controls_layout.addWidget(self.apply_preprocessing_button)
         outer.addWidget(controls)
+        self.preprocessing_sensitivity_warning = QLabel("")
+        self.preprocessing_sensitivity_warning.setWordWrap(True)
+        self.preprocessing_sensitivity_warning.setStyleSheet("color: #a65a00;")
+        outer.addWidget(self.preprocessing_sensitivity_warning)
 
         navigation = QHBoxLayout()
         self.z_label = QLabel("Z: —")
@@ -1974,6 +2586,7 @@ class MainWindow(QMainWindow):
             QLabel("Original 16-bit slice (measurements remain tied to this data)")
         )
         self.raw_view = SliceView("Choose a specimen to load a slice")
+        raw_layout.addWidget(ZoomControls(self.raw_view))
         raw_scroll = QScrollArea()
         raw_scroll.setWidgetResizable(True)
         raw_scroll.setWidget(self.raw_view)
@@ -1987,6 +2600,7 @@ class MainWindow(QMainWindow):
             QLabel("Background-subtracted and smoothed detection image")
         )
         self.processed_view = SliceView("Processed preview")
+        processed_layout.addWidget(ZoomControls(self.processed_view))
         processed_scroll = QScrollArea()
         processed_scroll.setWidgetResizable(True)
         processed_scroll.setWidget(self.processed_view)
@@ -2013,6 +2627,14 @@ class MainWindow(QMainWindow):
         self.cancel_preprocessing_button.setEnabled(False)
         batch_row.addWidget(self.cancel_preprocessing_button)
         outer.addLayout(batch_row)
+        self.preprocessing_progress_label = QLabel("Batch progress: not running")
+        self.preprocessing_progress_label.setWordWrap(True)
+        outer.addWidget(self.preprocessing_progress_label)
+        self.preprocessing_progress_bar = QProgressBar()
+        self.preprocessing_progress_bar.setRange(0, 100)
+        self.preprocessing_progress_bar.setValue(0)
+        self.preprocessing_progress_bar.setFormat("%p%")
+        outer.addWidget(self.preprocessing_progress_bar)
 
         tab.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
@@ -2091,7 +2713,7 @@ class MainWindow(QMainWindow):
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
         )
         self.dendrite_detection_sensitivity = QDoubleSpinBox()
-        self.dendrite_detection_sensitivity.setRange(0.25, 3.0)
+        self.dendrite_detection_sensitivity.setRange(0.25, 10.0)
         self.dendrite_detection_sensitivity.setDecimals(2)
         self.dendrite_detection_sensitivity.setSingleStep(0.05)
         self.dendrite_detection_sensitivity.setToolTip(
@@ -2100,8 +2722,11 @@ class MainWindow(QMainWindow):
         settings_layout.addRow(
             "Dendrite/spine sensitivity:", self.dendrite_detection_sensitivity
         )
+        self.dendrite_detection_sensitivity.valueChanged.connect(
+            self._update_sensitivity_warnings
+        )
         self.cluster_detection_sensitivity = QDoubleSpinBox()
-        self.cluster_detection_sensitivity.setRange(0.25, 3.0)
+        self.cluster_detection_sensitivity.setRange(0.25, 10.0)
         self.cluster_detection_sensitivity.setDecimals(2)
         self.cluster_detection_sensitivity.setSingleStep(0.05)
         self.cluster_detection_sensitivity.setToolTip(
@@ -2110,6 +2735,13 @@ class MainWindow(QMainWindow):
         settings_layout.addRow(
             "Protein-cluster sensitivity:", self.cluster_detection_sensitivity
         )
+        self.cluster_detection_sensitivity.valueChanged.connect(
+            self._update_sensitivity_warnings
+        )
+        self.detection_sensitivity_warning = QLabel("")
+        self.detection_sensitivity_warning.setWordWrap(True)
+        self.detection_sensitivity_warning.setStyleSheet("color: #a65a00;")
+        settings_layout.addRow(self.detection_sensitivity_warning)
         self.spine_branch_length = QDoubleSpinBox()
         self.spine_branch_length.setRange(0.5, 10.0)
         self.spine_branch_length.setDecimals(2)
@@ -2162,6 +2794,14 @@ class MainWindow(QMainWindow):
         )
         self.detection_status.setWordWrap(True)
         results_layout.addWidget(self.detection_status)
+        self.detection_progress_label = QLabel("Batch progress: not running")
+        self.detection_progress_label.setWordWrap(True)
+        results_layout.addWidget(self.detection_progress_label)
+        self.detection_progress_bar = QProgressBar()
+        self.detection_progress_bar.setRange(0, 100)
+        self.detection_progress_bar.setValue(0)
+        self.detection_progress_bar.setFormat("%p%")
+        results_layout.addWidget(self.detection_progress_bar)
         self.run_detection_button = QPushButton(
             "Run automatic detection or resume the batch"
         )
@@ -2193,6 +2833,8 @@ class MainWindow(QMainWindow):
         viewer_layout.addLayout(z_row)
 
         self.detection_view = SliceView("Run detection to inspect candidate masks")
+        self.detection_zoom_controls = ZoomControls(self.detection_view)
+        viewer_layout.addWidget(self.detection_zoom_controls)
         detection_scroll = QScrollArea()
         detection_scroll.setWidgetResizable(True)
         detection_scroll.setWidget(self.detection_view)
@@ -2399,6 +3041,8 @@ class MainWindow(QMainWindow):
             "A detected specimen will appear here for optional correction"
         )
         self.review_view.hint_changed.connect(self._review_hint_changed)
+        self.review_zoom_controls = ZoomControls(self.review_view)
+        viewer_layout.addWidget(self.review_zoom_controls)
         review_scroll = QScrollArea()
         review_scroll.setWidgetResizable(True)
         review_scroll.setWidget(self.review_view)
@@ -2485,6 +3129,14 @@ class MainWindow(QMainWindow):
         )
         self.measurement_status.setWordWrap(True)
         run_layout.addWidget(self.measurement_status)
+        self.measurement_progress_label = QLabel("Batch progress: not running")
+        self.measurement_progress_label.setWordWrap(True)
+        run_layout.addWidget(self.measurement_progress_label)
+        self.measurement_progress_bar = QProgressBar()
+        self.measurement_progress_bar.setRange(0, 100)
+        self.measurement_progress_bar.setValue(0)
+        self.measurement_progress_bar.setFormat("%p%")
+        run_layout.addWidget(self.measurement_progress_bar)
         self.run_measurements_button = QPushButton(
             "Calculate measurements for entire batch / resume"
         )
@@ -2528,8 +3180,19 @@ class MainWindow(QMainWindow):
         inspect_form.addRow(self.load_trim_preview_button)
         side_layout.addWidget(inspect_group)
 
-        distribution_group = QGroupBox("Spine-distribution review")
+        distribution_group = QGroupBox("Spine review")
         distribution_form = QFormLayout(distribution_group)
+        self.distribution_review_mode = QComboBox()
+        self.distribution_review_mode.addItem(
+            "Protein-cluster-positive spines", "cluster_positive"
+        )
+        self.distribution_review_mode.addItem(
+            "Cluster-less spines (optional)", "cluster_less"
+        )
+        self.distribution_review_mode.currentIndexChanged.connect(
+            self._distribution_review_mode_changed
+        )
+        distribution_form.addRow("Queue:", self.distribution_review_mode)
         self.distribution_spine = QComboBox()
         self.distribution_spine.currentIndexChanged.connect(self._distribution_spine_changed)
         distribution_form.addRow("Review spine:", self.distribution_spine)
@@ -2562,6 +3225,11 @@ class MainWindow(QMainWindow):
         navigation.addWidget(self.previous_distribution_button)
         navigation.addWidget(self.next_distribution_button)
         distribution_form.addRow(navigation)
+        self.open_spine_map_button = QPushButton("Open numbered spine mapвЂ¦")
+        self.open_spine_map_button.clicked.connect(
+            lambda: self._open_spine_map(False)
+        )
+        distribution_form.addRow(self.open_spine_map_button)
         side_layout.addWidget(distribution_group)
 
         chart_group = QGroupBox("Experimental-group profile")
@@ -2648,15 +3316,31 @@ class MainWindow(QMainWindow):
         distribution_z_layout.addWidget(self.distribution_z_slider, 1)
         self.distribution_z_controls.setVisible(False)
         distribution_layout.addWidget(self.distribution_z_controls)
+        self.distribution_spine_header = QLabel("Protein-cluster-positive spine")
+        self.distribution_spine_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.distribution_spine_header.setStyleSheet(
+            "font-size: 16px; font-weight: 600; padding: 3px;"
+        )
+        distribution_layout.addWidget(self.distribution_spine_header)
         preview_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.distribution_dendrite_view = EndpointHintView("Dendrite/spine distribution preview")
         self.distribution_dendrite_view.point_clicked.connect(self._centerline_hint_clicked)
-        self.distribution_protein_view = SliceView("Protein-cluster distribution preview")
+        self.distribution_dendrite_view.context_requested.connect(
+            lambda: self._open_spine_map(True)
+        )
+        self.distribution_protein_view = ClickableSliceView("Protein-cluster distribution preview")
+        self.distribution_protein_view.context_requested.connect(
+            lambda: self._open_spine_map(True)
+        )
         self.distribution_dendrite_view.setMinimumSize(320, 260)
         self.distribution_protein_view.setMinimumSize(320, 260)
         preview_splitter.addWidget(self.distribution_dendrite_view)
         preview_splitter.addWidget(self.distribution_protein_view)
         distribution_layout.addWidget(preview_splitter, 2)
+        preview_zoom_row = QHBoxLayout()
+        preview_zoom_row.addWidget(ZoomControls(self.distribution_dendrite_view), 1)
+        preview_zoom_row.addWidget(ZoomControls(self.distribution_protein_view), 1)
+        distribution_layout.addLayout(preview_zoom_row)
         self.distribution_chart = DistributionChart()
         distribution_layout.addWidget(self.distribution_chart, 1)
         self.measurement_result_tabs.addTab(distribution_page, "Distribution review and group profiles")
@@ -2727,6 +3411,52 @@ class MainWindow(QMainWindow):
         if directory:
             self.output_edit.setText(directory)
 
+    def _current_channel_markers(self) -> dict[str, str]:
+        markers = {
+            "ChanA": self.channel_a_marker.text().strip(),
+            "ChanB": self.channel_b_marker.text().strip(),
+        }
+        if not markers["ChanA"] or not markers["ChanB"]:
+            raise ValueError("Enter both channel filename markers.")
+        if markers["ChanA"].casefold() == markers["ChanB"].casefold():
+            raise ValueError("Channel filename markers must be different.")
+        return markers
+
+    def _choose_manual_pair(self) -> None:
+        start = self.source_edit.text().strip()
+        channel_a, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose the Channel A TIFF",
+            start,
+            "TIFF stacks (*.tif *.tiff)",
+        )
+        if not channel_a:
+            return
+        channel_b, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose the matching Channel B TIFF",
+            str(Path(channel_a).parent),
+            "TIFF stacks (*.tif *.tiff)",
+        )
+        if not channel_b:
+            return
+        group = self.fallback_group_edit.text().strip()
+        if not group:
+            QMessageBox.warning(
+                self, "Missing group", "Enter a fallback experimental-group name."
+            )
+            return
+        first_parent = Path(channel_a).resolve().parent
+        self.source_edit.setText(str(first_parent))
+        if not self.output_edit.text().strip():
+            self.output_edit.setText(str(first_parent / "Synpo Results"))
+        worker = ScanWorker(
+            first_parent,
+            default_group=group,
+            manual_paths=(Path(channel_a), Path(channel_b)),
+        )
+        self._begin_import_scan(worker)
+
     def _prepare_preprocessing_tab(self) -> None:
         if self.manifest is None:
             self.tabs.setTabEnabled(1, False)
@@ -2779,6 +3509,11 @@ class MainWindow(QMainWindow):
         if self.manifest is None or self.preprocess_specimen.currentData() is None:
             return
         index = self._selected_specimen_index()
+        specimen_key = (id(self.manifest), index)
+        if specimen_key != self._preprocess_view_specimen_key:
+            self.raw_view.reset_view()
+            self.processed_view.reset_view()
+            self._preprocess_view_specimen_key = specimen_key
         channel = self._selected_preprocess_channel()
         shape = self.manifest["specimens"][index]["channels"][channel]["metadata"]["shape"]
         z_count = 1 if len(shape) == 2 else int(shape[0])
@@ -2821,6 +3556,7 @@ class MainWindow(QMainWindow):
             widget.blockSignals(True)
             widget.setValue(value)
             widget.blockSignals(False)
+        self._update_sensitivity_warnings()
 
     def _current_preprocessing_settings(self) -> PreprocessingSettings:
         settings = PreprocessingSettings(
@@ -2831,6 +3567,27 @@ class MainWindow(QMainWindow):
         )
         settings.validate()
         return settings
+
+    def _update_sensitivity_warnings(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if hasattr(self, "preprocessing_sensitivity_warning"):
+            self.preprocessing_sensitivity_warning.setText(
+                "High-sensitivity mode (>3.0): substantially more background may be retained."
+                if self.sensitivity_spin.value() > 3.0
+                else ""
+            )
+        if hasattr(self, "detection_sensitivity_warning"):
+            high = []
+            if self.dendrite_detection_sensitivity.value() > 3.0:
+                high.append("dendrite/spine")
+            if self.cluster_detection_sensitivity.value() > 3.0:
+                high.append("protein-cluster")
+            self.detection_sensitivity_warning.setText(
+                "High-sensitivity mode (>3.0) for "
+                + " and ".join(high)
+                + ": review the additional background candidates carefully."
+                if high
+                else ""
+            )
 
     def _apply_preprocessing_settings(self) -> None:
         if self.manifest is None or self.project_path is None:
@@ -2891,8 +3648,8 @@ class MainWindow(QMainWindow):
             channel = self._selected_preprocess_channel()
             settings = self._current_preprocessing_settings()
             calibration = self.manifest["calibration"]
-            filename = self.manifest["specimens"][index]["channels"][channel]["filename"]
-            path = Path(str(self.manifest["source_directory"])) / str(filename)
+            channel_data = self.manifest["specimens"][index]["channels"][channel]
+            path = channel_source_path(self.manifest, channel_data)
             key = self._preview_cache_key()
             worker = PreviewWorker(
                 path,
@@ -3024,6 +3781,7 @@ class MainWindow(QMainWindow):
             widget.blockSignals(True)
             widget.setValue(value)
             widget.blockSignals(False)
+        self._update_sensitivity_warnings()
 
         current = self.detection_specimen.currentData()
         self.detection_specimen.blockSignals(True)
@@ -3161,6 +3919,10 @@ class MainWindow(QMainWindow):
         if self.manifest is None or self.detection_specimen.currentData() is None:
             return
         index = int(self.detection_specimen.currentData())
+        specimen_key = (id(self.manifest), index)
+        if specimen_key != self._detection_view_specimen_key:
+            self.detection_view.reset_view()
+            self._detection_view_specimen_key = specimen_key
         channel = str(self.detection_background_channel.currentData() or "ChanB")
         shape = self.manifest["specimens"][index]["channels"][channel]["metadata"]["shape"]
         z_count = 1 if len(shape) == 2 else int(shape[0])
@@ -3437,33 +4199,7 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError) as exc:
             self.measurement_summary.setText(f"Cannot load measurements: {exc}")
             return
-        previous_spine = (
-            self._preferred_distribution_spine_id
-            if self._preferred_distribution_spine_id is not None
-            else self.distribution_spine.currentData()
-        )
-        self._preferred_distribution_spine_id = None
-        self.distribution_spine.blockSignals(True)
-        self.distribution_spine.clear()
-        distribution_rows = list(result.get("distribution_rows", []))
-        for row in distribution_rows:
-            reviewed = bool(row.get("distribution_reviewed", False))
-            valid = bool(row.get("spine_valid", True))
-            included = bool(row.get("distribution_included", False))
-            state = "invalid" if not valid else ("included" if included else "distribution excluded")
-            self.distribution_spine.addItem(
-                f"Spine {row['spine_id']} — {'reviewed' if reviewed else 'unreviewed'}; {state}; {row.get('distribution_axis_status', '')}",
-                int(row["spine_id"]),
-            )
-        selected = self.distribution_spine.findData(previous_spine) if previous_spine is not None else -1
-        if selected < 0:
-            selected = next(
-                (index for index, row in enumerate(distribution_rows) if not bool(row.get("distribution_reviewed", False))),
-                0,
-            )
-        if self.distribution_spine.count():
-            self.distribution_spine.setCurrentIndex(selected)
-        self.distribution_spine.blockSignals(False)
+        self._populate_spine_review_queue(result)
         specimen_row = result["specimen_rows"][0]
         source = "corrected" if result.get("corrected_masks") else "automatic"
         self.measurement_summary.setText(
@@ -3479,6 +4215,114 @@ class MainWindow(QMainWindow):
                 int(cluster_id),
             )
         self._populate_measurement_table()
+        if self.distribution_spine.count():
+            self._distribution_spine_changed()
+
+    def _current_spine_review_mode(self) -> str:
+        return str(
+            self._preferred_spine_review_mode
+            or self.distribution_review_mode.currentData()
+            or "cluster_positive"
+        )
+
+    def _populate_spine_review_queue(self, result: dict[str, object]) -> None:
+        mode = self._current_spine_review_mode()
+        if self._preferred_spine_review_mode is not None:
+            index = self.distribution_review_mode.findData(mode)
+            if index >= 0:
+                self.distribution_review_mode.blockSignals(True)
+                self.distribution_review_mode.setCurrentIndex(index)
+                self.distribution_review_mode.blockSignals(False)
+            self._preferred_spine_review_mode = None
+        previous_spine = (
+            self._preferred_distribution_spine_id
+            if self._preferred_distribution_spine_id is not None
+            else self.distribution_spine.currentData()
+        )
+        self._preferred_distribution_spine_id = None
+        rows = (
+            list(result.get("distribution_rows", []))
+            if mode == "cluster_positive"
+            else [
+                row
+                for row in result.get("spine_rows", [])
+                if not bool(row.get("has_protein_cluster", False))
+            ]
+        )
+        self.distribution_spine.blockSignals(True)
+        self.distribution_spine.clear()
+        review_key = (
+            "distribution_reviewed"
+            if mode == "cluster_positive"
+            else "validity_reviewed"
+        )
+        for row in rows:
+            reviewed = bool(row.get(review_key, False))
+            valid = bool(row.get("spine_valid", True))
+            if mode == "cluster_positive":
+                state = (
+                    "invalid"
+                    if not valid
+                    else (
+                        "included"
+                        if bool(row.get("distribution_included", False))
+                        else "distribution excluded"
+                    )
+                )
+                detail = f"; {row.get('distribution_axis_status', '')}"
+            else:
+                state = "invalid" if not valid else "valid"
+                detail = ""
+            self.distribution_spine.addItem(
+                f"Spine {row['spine_id']} — "
+                f"{'reviewed' if reviewed else 'unreviewed'}; {state}{detail}",
+                int(row["spine_id"]),
+            )
+        selected = (
+            self.distribution_spine.findData(previous_spine)
+            if previous_spine is not None
+            else -1
+        )
+        if selected < 0:
+            selected = next(
+                (
+                    index
+                    for index, row in enumerate(rows)
+                    if not bool(row.get(review_key, False))
+                ),
+                0,
+            )
+        if self.distribution_spine.count():
+            self.distribution_spine.setCurrentIndex(selected)
+        self.distribution_spine.blockSignals(False)
+        positive_mode = mode == "cluster_positive"
+        for widget in (
+            self.centerline_hint_button,
+            self.clear_centerline_hint_button,
+            self.distribution_include,
+        ):
+            widget.setVisible(positive_mode)
+        if not self.distribution_spine.count():
+            self.distribution_spine_header.setText(
+                "No protein-cluster-positive spines"
+                if positive_mode
+                else "No cluster-less spines"
+            )
+            self.distribution_preview_status.setText(
+                "This optional review queue is empty for the selected specimen."
+            )
+
+    def _distribution_review_mode_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.measurement_specimen.currentData() is None:
+            return
+        try:
+            result = load_measurement_result(
+                self.manifest, int(self.measurement_specimen.currentData())
+            )
+        except (OSError, ValueError, KeyError):
+            return
+        self._preferred_distribution_spine_id = None
+        self._populate_spine_review_queue(result)
         if self.distribution_spine.count():
             self._distribution_spine_changed()
 
@@ -3521,45 +4365,104 @@ class MainWindow(QMainWindow):
             return
         specimen_index = int(self.measurement_specimen.currentData())
         spine_id = int(self.distribution_spine.currentData())
+        review_mode = self._current_spine_review_mode()
+        positive_mode = review_mode == "cluster_positive"
         self._last_distribution_preview = None
         self.centerline_hint_button.setEnabled(False)
         self.centerline_hint_button.blockSignals(True)
         self.centerline_hint_button.setChecked(False)
         self.centerline_hint_button.blockSignals(False)
+        self.distribution_dendrite_view.point_mode = False
         self.distribution_z_controls.setVisible(False)
         try:
             result = load_measurement_result(self.manifest, specimen_index)
-            row = next(item for item in result.get("distribution_rows", []) if int(item["spine_id"]) == spine_id)
+            rows = (
+                result.get("distribution_rows", [])
+                if positive_mode
+                else result.get("spine_rows", [])
+            )
+            row = next(item for item in rows if int(item["spine_id"]) == spine_id)
         except (OSError, ValueError, KeyError, StopIteration) as exc:
-            self.distribution_preview_status.setText(f"Cannot load distribution row: {exc}")
+            self.distribution_preview_status.setText(f"Cannot load spine review row: {exc}")
             return
         self.distribution_include.blockSignals(True)
         self.distribution_invalid.blockSignals(True)
-        self.distribution_include.setChecked(bool(row.get("distribution_included", False)))
+        self.distribution_include.setChecked(
+            bool(row.get("distribution_included", False)) if positive_mode else False
+        )
         self.distribution_invalid.setChecked(not bool(row.get("spine_valid", True)))
-        self.distribution_include.setEnabled(bool(row.get("spine_valid", True)))
-        self.distribution_note.setText(str(row.get("review_note", "")))
+        self.distribution_include.setEnabled(
+            positive_mode and bool(row.get("spine_valid", True))
+        )
+        self.distribution_note.setText(
+            str(row.get("review_note", row.get("validity_note", "")))
+        )
         self.distribution_include.blockSignals(False)
         self.distribution_invalid.blockSignals(False)
         self.clear_centerline_hint_button.setEnabled(
-            bool(row.get("centerline_endpoint_hint_present", False))
+            positive_mode and bool(row.get("centerline_endpoint_hint_present", False))
+        )
+        position = self.distribution_spine.currentIndex() + 1
+        count = self.distribution_spine.count()
+        kind_label = (
+            "Protein-cluster-positive spine"
+            if positive_mode
+            else "Cluster-less spine (optional quality review)"
+        )
+        self.distribution_spine_header.setText(
+            f"{kind_label} — Spine {spine_id} — {position} of {count}"
         )
         self.distribution_preview_status.setText(
-            f"Loading spine {spine_id}: {row.get('distribution_axis_status', '')}. "
-            f"{row.get('distribution_axis_note', '')}"
+            f"Loading Spine {spine_id}. "
+            + (
+                f"{row.get('distribution_axis_status', '')}. {row.get('distribution_axis_note', '')}"
+                if positive_mode
+                else "This queue contains spines with no cluster meeting the current overlap threshold."
+            )
         )
         if self._job_thread is not None:
             self.distribution_preview_status.setText(
                 "Distribution row is ready; its image preview will load when the current background operation finishes."
             )
             return
-        worker = DistributionPreviewWorker(self.manifest, specimen_index, spine_id)
+        worker = DistributionPreviewWorker(
+            self.manifest, specimen_index, spine_id, review_mode
+        )
         worker.completed.connect(self._distribution_preview_completed)
         self._start_worker(worker, "distribution_preview")
 
     @Slot(object)
-    def _distribution_preview_completed(self, preview: DistributionPreview) -> None:
+    def _distribution_preview_completed(
+        self, preview: DistributionPreview | SpineReviewPreview
+    ) -> None:
         self._last_distribution_preview = preview
+        if isinstance(preview, SpineReviewPreview):
+            self.centerline_hint_button.setEnabled(False)
+            spine_id = int(preview.row["spine_id"])
+            spine_overlay = np.where(
+                preview.spine_projection == spine_id, 1, 0
+            ).astype(np.uint8)
+            cluster_overlay = np.where(
+                preview.cluster_projection > 0, 1, 0
+            ).astype(np.uint8)
+            self.distribution_dendrite_view.show_rgb(
+                self._distribution_overlay(
+                    preview.dendrite_projection, spine_overlay, ()
+                )
+            )
+            self.distribution_protein_view.show_rgb(
+                self._distribution_overlay(
+                    preview.protein_projection, cluster_overlay, ()
+                )
+            )
+            self.clear_centerline_hint_button.setEnabled(False)
+            self.distribution_preview_status.setText(
+                f"Spine {spine_id} has no protein cluster meeting the current overlap rule. "
+                "Mark it invalid only if the spine segmentation itself is unusable. "
+                "Click either crop to locate it in the full specimen."
+            )
+            self.measurement_result_tabs.setCurrentIndex(1)
+            return
         self.centerline_hint_button.setEnabled(True)
         self.distribution_z_slider.blockSignals(True)
         self.distribution_z_slider.setRange(*preview.spine_z_range)
@@ -3582,7 +4485,9 @@ class MainWindow(QMainWindow):
         ratios = [preview.row.get(f"bin_{index:02d}_ratio") for index in range(1, 11)]
         self.distribution_preview_status.setText(
             f"Spine {preview.row['spine_id']} | {preview.row['distribution_axis_status']} | "
-            f"shaft-to-tip ratios: " + ", ".join("blank" if value is None else f"{float(value):.3g}" for value in ratios)
+            f"protein-cluster-positive | shaft-to-tip ratios: "
+            + ", ".join("blank" if value is None else f"{float(value):.3g}" for value in ratios)
+            + ". Click either crop to locate it in the full specimen."
         )
         self.measurement_result_tabs.setCurrentIndex(1)
 
@@ -3619,7 +4524,7 @@ class MainWindow(QMainWindow):
 
     def _render_distribution_dendrite_view(self) -> None:
         preview = self._last_distribution_preview
-        if preview is None:
+        if not isinstance(preview, DistributionPreview):
             return
         if self.centerline_hint_button.isChecked():
             z_index = self.distribution_z_slider.value()
@@ -3669,7 +4574,9 @@ class MainWindow(QMainWindow):
         self.distribution_dendrite_view.show_rgb(rgb)
 
     def _centerline_hint_mode_changed(self, enabled: bool) -> None:
-        if enabled and self._last_distribution_preview is None:
+        if enabled and not isinstance(
+            self._last_distribution_preview, DistributionPreview
+        ):
             self.centerline_hint_button.blockSignals(True)
             self.centerline_hint_button.setChecked(False)
             self.centerline_hint_button.blockSignals(False)
@@ -3678,6 +4585,7 @@ class MainWindow(QMainWindow):
             )
             return
         self.distribution_z_controls.setVisible(enabled)
+        self.distribution_dendrite_view.point_mode = enabled
         self.distribution_dendrite_view.setCursor(
             Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor
         )
@@ -3695,7 +4603,7 @@ class MainWindow(QMainWindow):
         preview = self._last_distribution_preview
         if (
             not self.centerline_hint_button.isChecked()
-            or preview is None
+            or not isinstance(preview, DistributionPreview)
             or self._job_thread is not None
         ):
             return
@@ -3768,6 +4676,8 @@ class MainWindow(QMainWindow):
         self.centerline_hint_button.blockSignals(True)
         self.centerline_hint_button.setChecked(False)
         self.centerline_hint_button.blockSignals(False)
+        self.distribution_dendrite_view.point_mode = False
+        self.distribution_dendrite_view.setCursor(Qt.CursorShape.ArrowCursor)
         self.distribution_z_controls.setVisible(False)
         self._centerline_hint_pending_reload = True
         self._refresh_distribution_groups()
@@ -3791,33 +4701,59 @@ class MainWindow(QMainWindow):
             return
         specimen_index = int(self.measurement_specimen.currentData())
         spine_id = int(self.distribution_spine.currentData())
+        review_mode = self._current_spine_review_mode()
         try:
-            updated = set_distribution_review(
-                self.manifest,
-                self.project_path,
-                specimen_index,
-                spine_id,
-                distribution_included=self.distribution_include.isChecked(),
-                invalid_spine=self.distribution_invalid.isChecked(),
-                note=self.distribution_note.text(),
-            )
+            if review_mode == "cluster_positive":
+                updated = set_distribution_review(
+                    self.manifest,
+                    self.project_path,
+                    specimen_index,
+                    spine_id,
+                    distribution_included=self.distribution_include.isChecked(),
+                    invalid_spine=self.distribution_invalid.isChecked(),
+                    note=self.distribution_note.text(),
+                )
+            else:
+                updated = set_spine_quality_review(
+                    self.manifest,
+                    self.project_path,
+                    specimen_index,
+                    spine_id,
+                    invalid_spine=self.distribution_invalid.isChecked(),
+                    note=self.distribution_note.text(),
+                )
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot save spine review", str(exc))
             return
+        if review_mode == "cluster_positive":
+            candidates = updated.get("distribution_rows", [])
+            review_key = "distribution_reviewed"
+        else:
+            candidates = [
+                row
+                for row in updated.get("spine_rows", [])
+                if not bool(row.get("has_protein_cluster", False))
+            ]
+            review_key = "validity_reviewed"
         next_id = next(
             (
                 int(row["spine_id"])
-                for row in updated.get("distribution_rows", [])
-                if not bool(row.get("distribution_reviewed", False))
+                for row in candidates
+                if not bool(row.get(review_key, False))
             ),
             None,
         )
         self._preferred_distribution_spine_id = next_id
+        self._preferred_spine_review_mode = review_mode
         self._refresh_distribution_groups()
         # Refresh labels, then advance to the first remaining unreviewed spine.
         self._measurement_specimen_changed()
         if next_id is None:
-            self.distribution_preview_status.setText("All cluster-positive spines in this specimen have been reviewed.")
+            self.distribution_preview_status.setText(
+                "All cluster-positive spines in this specimen have been reviewed."
+                if review_mode == "cluster_positive"
+                else "Optional cluster-less spine review is complete for this specimen."
+            )
 
     def _export_measurements(self) -> None:
         if self.manifest is None:
@@ -3941,6 +4877,10 @@ class MainWindow(QMainWindow):
         if self.manifest is None or self.review_specimen.currentData() is None:
             return
         index = self._selected_review_specimen()
+        specimen_key = (id(self.manifest), index)
+        if specimen_key != self._review_view_specimen_key:
+            self.review_view.reset_view()
+            self._review_view_specimen_key = specimen_key
         channel = str(self.review_background_channel.currentData() or "ChanB")
         shape = self.manifest["specimens"][index]["channels"][channel]["metadata"][
             "shape"
@@ -4122,7 +5062,11 @@ class MainWindow(QMainWindow):
                 self.review_object_type.findData("spine")
             )
         instructions = {
-            "add": "Draw inside and along a missed object; the image signal determines its boundary.",
+            "add": (
+                "Draw one separate stroke inside each missed object. Every stroke seeds one "
+                "independent 3D object; the saved preprocessed image determines its boundary. "
+                "Measurements still use the original 16-bit voxels."
+            ),
             "exclude": "Touch an unwanted object to exclude the complete 3D object.",
             "filopodium": "Touch a spine candidate to exclude and record it as a filopodium.",
             "split": "Draw across the contact or neck that should separate one object into two.",
@@ -4138,8 +5082,11 @@ class MainWindow(QMainWindow):
         self.review_view.set_brush_radius(value)
 
     def _review_hint_changed(self, count: int) -> None:
+        stroke_count = len(self.review_view.hint_strokes())
         self.review_hint_status.setText(
-            f"Hint contains {count} sampled point(s)." if count else "No hint drawn."
+            f"{stroke_count} separate hint(s), {count} sampled point(s)."
+            if count
+            else "No hint drawn."
         )
 
     def _clear_review_hint(self) -> None:
@@ -4167,6 +5114,7 @@ class MainWindow(QMainWindow):
             points=points,
             brush_radius_pixels=self.review_brush_radius.value(),
             projection_hint=self.review_view_mode.currentData() == "xy_max",
+            strokes=self.review_view.hint_strokes(),
         )
         self._start_review_worker(action)
 
@@ -4216,9 +5164,31 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _review_action_completed(self, result) -> None:  # type: ignore[no-untyped-def]
-        self._invalidate_context_views(result.specimen_index, corrected_only=True)
-        self.review_view.clear_hint()
-        self._load_review_view(auto_contrast=False)
+        if result.checkpoint_written:
+            self._invalidate_context_views(result.specimen_index, corrected_only=True)
+            self.review_view.clear_hint()
+            self._load_review_view(auto_contrast=False)
+        if result.operation == "add" and result.hint_results:
+            created = [
+                item for item in result.hint_results if item.get("status") == "created"
+            ]
+            skipped = [
+                item for item in result.hint_results if item.get("status") != "created"
+            ]
+            details = "; ".join(
+                f"hint {item['hint_index']}: {item['message']}" for item in skipped
+            )
+            checkpoint = (
+                "One atomic checkpoint was written."
+                if result.checkpoint_written
+                else "No mask change or checkpoint was written; adjust the hint(s) and retry."
+            )
+            self.review_status.setText(
+                f"Add hints: {len(created)}/{len(result.hint_results)} object(s) created. "
+                + (f"{details}. " if details else "")
+                + checkpoint
+            )
+            return
         self.review_status.setText(
             f"Saved {result.operation}: {result.dendrite_count} dendrites, "
             f"{result.spine_count} spines; {result.edit_count} active edit(s). "
@@ -4304,6 +5274,121 @@ class MainWindow(QMainWindow):
         )
         if complete:
             self._move_review_specimen(1)
+
+    def _open_spine_map(self, focus_only: bool) -> None:
+        if (
+            self.manifest is None
+            or self.measurement_specimen.currentData() is None
+            or self.distribution_spine.currentData() is None
+        ):
+            self.distribution_preview_status.setText(
+                "Select a measured specimen and spine before opening its full-field map."
+            )
+            return
+        specimen_index = int(self.measurement_specimen.currentData())
+        spine_id = int(self.distribution_spine.currentData())
+        role_channels = {
+            role: channel for channel, role in self.manifest["channel_roles"].items()
+        }
+        background_channel = str(role_channels["dendrite_spines"])
+        signature = context_signature(
+            self.manifest, specimen_index, corrected=True
+        )
+        cache_key = (
+            specimen_index,
+            background_channel,
+            True,
+            signature,
+            False,
+            None,
+        )
+        request = (
+            cache_key,
+            specimen_index,
+            background_channel,
+            True,
+            "spine_map",
+            0,
+            False,
+            None,
+            False,
+        )
+        self._spine_map_focus_only = bool(focus_only)
+        self._spine_map_current_id = spine_id
+        if cache_key in self._context_cache:
+            self._show_spine_map(request, self._context_cache[cache_key])
+        elif self._context_thread is None:
+            self._start_context_generation(request)
+        else:
+            self.distribution_preview_status.setText(
+                "A projection is already being generated; try the spine map again when it finishes."
+            )
+
+    def _show_spine_map(
+        self, request: tuple[object, ...], volume: ContextVolume
+    ) -> None:
+        if self.manifest is None:
+            return
+        _, specimen_index, background_channel, _, _, _, _, _, _ = request
+        try:
+            result = load_measurement_result(self.manifest, int(specimen_index))
+        except (OSError, ValueError, KeyError) as exc:
+            self.distribution_preview_status.setText(
+                f"Cannot open numbered spine map: {exc}"
+            )
+            return
+        specimen = self.manifest["specimens"][int(specimen_index)]
+        dialog = SpineMapDialog(
+            (
+                f"Spine {self._spine_map_current_id} in full specimen"
+                if self._spine_map_focus_only
+                else "Numbered spine map"
+            )
+            + f" — {specimen['specimen_id']}",
+            volume,
+            result,
+            lambda z, index=int(specimen_index), channel=str(background_channel): load_review_slice(
+                self.manifest, index, z, channel
+            ),
+            self._spine_map_current_id,
+            focus_only=self._spine_map_focus_only,
+            parent=self,
+        )
+        dialog.spine_selected.connect(self._spine_map_selected)
+        dialog.destroyed.connect(
+            lambda *_args, target=dialog: self._forget_spine_map_dialog(target)
+        )
+        self._spine_map_dialogs.append(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    @Slot(int)
+    def _spine_map_selected(self, spine_id: int) -> None:
+        if self.manifest is None or self.measurement_specimen.currentData() is None:
+            return
+        try:
+            result = load_measurement_result(
+                self.manifest, int(self.measurement_specimen.currentData())
+            )
+            row = next(
+                item
+                for item in result.get("spine_rows", [])
+                if int(item["spine_id"]) == spine_id
+            )
+        except (OSError, ValueError, KeyError, StopIteration):
+            return
+        self._preferred_spine_review_mode = (
+            "cluster_positive"
+            if bool(row.get("has_protein_cluster", False))
+            else "cluster_less"
+        )
+        self._preferred_distribution_spine_id = spine_id
+        self._measurement_specimen_changed()
+
+    def _forget_spine_map_dialog(self, dialog: SpineMapDialog) -> None:
+        if dialog in self._spine_map_dialogs:
+            self._spine_map_dialogs.remove(dialog)
 
     def _open_context_view(self, corrected: bool, view: str) -> None:
         if self.manifest is None:
@@ -4448,6 +5533,8 @@ class MainWindow(QMainWindow):
         view = str(self._context_request[4])
         if view == "select_area":
             self._show_area_selection(self._context_request, volume)
+        elif view == "spine_map":
+            self._show_spine_map(self._context_request, volume)
         elif view == "review_main":
             self._display_review_projection(
                 volume, auto_contrast=bool(self._context_request[8])
@@ -4623,7 +5710,22 @@ class MainWindow(QMainWindow):
             return
         if not self.output_edit.text().strip():
             self.output_edit.setText(str(directory / "Synpo Results"))
+        try:
+            markers = self._current_channel_markers()
+            group = self.fallback_group_edit.text().strip()
+            if not group:
+                raise ValueError("Enter a fallback experimental-group name.")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Filename pairing", str(exc))
+            return
+        self._begin_import_scan(
+            ScanWorker(directory, markers, group)
+        )
+
+    def _begin_import_scan(self, worker: ScanWorker) -> None:
         for dialog in list(self._context_dialogs):
+            dialog.close()
+        for dialog in list(self._spine_map_dialogs):
             dialog.close()
         self._context_cache.clear()
         self.report = None
@@ -4634,9 +5736,35 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
         self.tabs.setTabEnabled(4, False)
-        worker = ScanWorker(directory)
         worker.completed.connect(self._scan_completed)
         self._start_worker(worker, "scan")
+
+    @staticmethod
+    def _format_progress_duration(seconds: float) -> str:
+        seconds = max(0, int(round(seconds)))
+        if seconds < 60:
+            return f"{seconds} s"
+        minutes, seconds = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes} min {seconds:02d} s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours} h {minutes:02d} min"
+
+    def _batch_progress_widgets(self, kind: str | None):
+        return {
+            "preprocess": (
+                self.preprocessing_progress_bar,
+                self.preprocessing_progress_label,
+            ),
+            "detection": (
+                self.detection_progress_bar,
+                self.detection_progress_label,
+            ),
+            "measurements": (
+                self.measurement_progress_bar,
+                self.measurement_progress_label,
+            ),
+        }.get(str(kind))
 
     def _start_worker(self, worker: QObject, kind: str) -> None:
         if self._job_thread is not None or self._review_thread is not None:
@@ -4656,14 +5784,73 @@ class MainWindow(QMainWindow):
         self._job_thread = thread
         self._job_worker = worker
         self._job_kind = kind
+        now = time.monotonic()
+        self._progress_started_at = now
+        self._progress_last_at = now
+        self._progress_last_current = 0
+        self._progress_last_total = 0
+        self._progress_rate_ema = None
+        batch_widgets = self._batch_progress_widgets(kind)
+        if batch_widgets is not None:
+            batch_bar, batch_label = batch_widgets
+            batch_bar.setRange(0, 100)
+            batch_bar.setValue(0)
+            batch_bar.setFormat("Starting…")
+            batch_label.setText("Batch progress: starting; estimating remaining time…")
         self._set_job_running(True)
         thread.start()
 
     @Slot(str, int, int, str)
     def _update_progress(self, phase: str, current: int, total: int, detail: str) -> None:
-        self.progress_bar.setRange(0, max(1, total))
+        total = max(1, int(total))
+        current = min(total, max(0, int(current)))
+        now = time.monotonic()
+        if self._progress_started_at <= 0:
+            self._progress_started_at = now
+            self._progress_last_at = now
+        if total != self._progress_last_total or current < self._progress_last_current:
+            self._progress_rate_ema = None
+            self._progress_last_at = self._progress_started_at
+            self._progress_last_current = 0
+            self._progress_last_total = total
+        delta_work = current - self._progress_last_current
+        delta_time = now - self._progress_last_at
+        if delta_work > 0 and delta_time > 0.01:
+            instantaneous = delta_work / delta_time
+            self._progress_rate_ema = (
+                instantaneous
+                if self._progress_rate_ema is None
+                else self._progress_rate_ema * 0.75 + instantaneous * 0.25
+            )
+        self._progress_last_current = current
+        self._progress_last_at = now
+        self._progress_last_total = total
+        elapsed = max(0.0, now - self._progress_started_at)
+        if current >= total:
+            remaining_text = "complete"
+        elif self._progress_rate_ema and self._progress_rate_ema > 0:
+            remaining = (total - current) / self._progress_rate_ema
+            remaining_text = (
+                f"about {self._format_progress_duration(remaining)} remaining"
+            )
+        else:
+            remaining_text = "estimating remaining time…"
+        percent = round(current * 100 / total)
+        progress_text = (
+            f"{phase}: {detail} | {current}/{total} ({percent}%) | "
+            f"elapsed {self._format_progress_duration(elapsed)} | {remaining_text}"
+        )
+        self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(current)
-        self.progress_label.setText(f"{phase}: {detail}")
+        self.progress_bar.setFormat("%p% — %v/%m")
+        self.progress_label.setText(progress_text)
+        batch_widgets = self._batch_progress_widgets(self._job_kind)
+        if batch_widgets is not None:
+            batch_bar, batch_label = batch_widgets
+            batch_bar.setRange(0, total)
+            batch_bar.setValue(current)
+            batch_bar.setFormat("%p% — %v/%m")
+            batch_label.setText(progress_text)
 
     @Slot(str)
     def _job_failed(self, message: str) -> None:
@@ -4688,6 +5875,19 @@ class MainWindow(QMainWindow):
     @Slot()
     def _worker_finished(self) -> None:
         finished_kind = self._job_kind
+        finished_widgets = self._batch_progress_widgets(finished_kind)
+        if finished_widgets is not None:
+            finished_bar, finished_label = finished_widgets
+            elapsed = self._format_progress_duration(
+                max(0.0, time.monotonic() - self._progress_started_at)
+            )
+            if finished_bar.value() >= finished_bar.maximum():
+                finished_label.setText(f"Batch complete in {elapsed}.")
+            else:
+                finished_label.setText(
+                    f"Batch stopped at {finished_bar.value()}/{finished_bar.maximum()} "
+                    f"after {elapsed}; completed checkpoints remain available."
+                )
         if self._job_worker is not None:
             self._job_worker.deleteLater()
         self._job_worker = None
@@ -4706,12 +5906,19 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _scan_completed(self, report: ScanReport) -> None:
         self.report = report
+        self.source_edit.setText(str(report.source_directory))
         self._populate_scan_table(report)
         warnings = self._report_issue_count(report, "warning")
+        mode_text = {
+            "strict": "original metadata filenames",
+            "flexible": "configured channel markers with a single fallback group",
+            "manual": "manually selected channel files",
+        }.get(report.import_mode, report.import_mode)
         self.summary_label.setText(
             f"Found {len(report.pairs)} specimen pair(s). "
             f"Errors: {report.error_count}; warnings: {warnings}. "
-            "Experimental group and specimen labels may be edited before saving."
+            f"Pairing mode: {mode_text}. Experimental group and specimen labels "
+            "may be edited before saving."
         )
         self.progress_label.setText("Scan complete")
 
@@ -4732,7 +5939,7 @@ class MainWindow(QMainWindow):
                 issues.extend(channel_file.issues)
             issue_text = "; ".join(issue.message for issue in issues)
             values = [
-                "Ready" if pair.valid else "Error",
+                (f"Ready ({pair.import_mode})" if pair.valid else "Error"),
                 pair.experimental_group,
                 pair.specimen_id,
                 pair.channels.get("ChanA").filename if "ChanA" in pair.channels else "—",
@@ -4744,6 +5951,14 @@ class MainWindow(QMainWindow):
             for column, value in enumerate(values):
                 editable = column in {1, 2}
                 self._set_table_item(row, column, value, editable=editable)
+            if "ChanA" in pair.channels:
+                self.table.item(row, 3).setToolTip(
+                    str(pair.channels["ChanA"].path)
+                )
+            if "ChanB" in pair.channels:
+                self.table.item(row, 4).setToolTip(
+                    str(pair.channels["ChanB"].path)
+                )
             self.table.item(row, 0).setBackground(
                 QColor("#dff3e4") if pair.valid else QColor("#f8d7da")
             )
@@ -4788,6 +6003,13 @@ class MainWindow(QMainWindow):
         self.manifest["output_directory"] = str(Path(self.output_edit.text().strip()).resolve())
         self.manifest["channel_roles"] = self._current_roles()
         self.manifest["calibration"] = self._current_calibration().to_dict()
+        self.manifest.setdefault("import_settings", {}).update(
+            {
+                "channel_markers": self._current_channel_markers(),
+                "default_experimental_group": self.fallback_group_edit.text().strip()
+                or "Experiment",
+            }
+        )
 
     def _current_roles(self) -> dict[str, str]:
         roles = {
@@ -4870,6 +6092,8 @@ class MainWindow(QMainWindow):
         self.report = None
         for dialog in list(self._context_dialogs):
             dialog.close()
+        for dialog in list(self._spine_map_dialogs):
+            dialog.close()
         self._context_cache.clear()
         self.manifest = manifest
         self.project_path = Path(selected).resolve()
@@ -4894,6 +6118,15 @@ class MainWindow(QMainWindow):
     def _populate_manifest(self, manifest: dict[str, object]) -> None:
         self.source_edit.setText(str(manifest["source_directory"]))
         self.output_edit.setText(str(manifest["output_directory"]))
+        import_settings = manifest.get("import_settings", {})
+        markers = import_settings.get(
+            "channel_markers", {"ChanA": "ChanA", "ChanB": "ChanB"}
+        )
+        self.channel_a_marker.setText(str(markers.get("ChanA", "ChanA")))
+        self.channel_b_marker.setText(str(markers.get("ChanB", "ChanB")))
+        self.fallback_group_edit.setText(
+            str(import_settings.get("default_experimental_group", "Experiment"))
+        )
         roles = manifest["channel_roles"]
         self.channel_a_role.setCurrentIndex(self.channel_a_role.findData(roles["ChanA"]))
         self.channel_b_role.setCurrentIndex(self.channel_b_role.findData(roles["ChanB"]))
@@ -4922,6 +6155,12 @@ class MainWindow(QMainWindow):
             ]
             for column, value in enumerate(values):
                 self._set_table_item(row, column, str(value), editable=column in {1, 2})
+            self.table.item(row, 3).setToolTip(
+                str(channel_source_path(manifest, channel_a))
+            )
+            self.table.item(row, 4).setToolTip(
+                str(channel_source_path(manifest, channel_b))
+            )
 
     def _verify_sources(self) -> None:
         if self.manifest is None:
@@ -4929,7 +6168,7 @@ class MainWindow(QMainWindow):
             return
         worker = VerifyWorker(
             self.manifest,
-            Path(str(self.manifest["source_directory"])),
+            None,
             False,
         )
         worker.completed.connect(lambda results: self._verification_completed(results, False))
@@ -4940,7 +6179,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No project", "Open or save a project first.")
             return
         directory = QFileDialog.getExistingDirectory(
-            self, "Select the relocated TIFF folder", str(self.manifest["source_directory"])
+            self,
+            "Select the relocated TIFF folder or common parent folder",
+            str(self.manifest["source_directory"]),
         )
         if not directory:
             return
@@ -4967,7 +6208,10 @@ class MainWindow(QMainWindow):
                 self.source_edit.setText(str(self.manifest["source_directory"]))
                 if self.project_path is not None:
                     save_project(self.project_path, self.manifest)
-                message = "All checksums match. The project source folder was relinked and saved."
+                message = (
+                    "All checksums match. Each source file path was relinked and saved; "
+                    "subfolders were searched when necessary."
+                )
             else:
                 message = "All source files passed full SHA-256 verification."
             QMessageBox.information(self, "Source verification", message)
@@ -4999,11 +6243,11 @@ class MainWindow(QMainWindow):
         self.output_edit.clear()
         self.table.setRowCount(0)
         self.summary_label.setText("Select a folder and scan it to begin.")
-        self.setWindowTitle("Synpo Microscopy Processor — Stage 6")
+        self.setWindowTitle(f"Synpo Microscopy Processor — Beta {__version__}")
 
     def _set_job_running(self, running: bool) -> None:
         self.progress_bar.setVisible(running)
-        for widget in (self.scan_button, self.save_button):
+        for widget in (self.scan_button, self.manual_pair_button, self.save_button):
             widget.setEnabled(not running)
         for action in (
             self.new_action,
@@ -5054,7 +6298,11 @@ class MainWindow(QMainWindow):
             )
             self.save_distribution_review_button.setEnabled(not running)
             self.export_measurements_button.setEnabled(not running and eligible)
-            self.centerline_hint_button.setEnabled(not running and eligible)
+            self.centerline_hint_button.setEnabled(
+                not running
+                and eligible
+                and self._current_spine_review_mode() == "cluster_positive"
+            )
             self.clear_centerline_hint_button.setEnabled(
                 not running
                 and eligible
@@ -5065,6 +6313,7 @@ class MainWindow(QMainWindow):
                     )
                 )
             )
+            self.open_spine_map_button.setEnabled(not running and eligible)
         if not running and not self.progress_label.text():
             self.progress_label.setText("Ready")
 
@@ -5082,6 +6331,7 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        self._save_window_preferences()
         super().closeEvent(event)
 
 
@@ -5095,7 +6345,7 @@ def main() -> int:
     window = MainWindow()
     if icon_path.is_file():
         window.setWindowIcon(QIcon(str(icon_path)))
-    window.show()
+    window.show_initial()
     return application.exec()
 
 

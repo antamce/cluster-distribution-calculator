@@ -7,10 +7,10 @@ review. Raw TIFFs are never modified or copied.
 
 ## Current project status
 
-The current version is `0.6.1`. Stages 1–5 are user-approved. Stage 6 curved-axis
-protein-distribution analysis, review, and tabular export are ready for testing. See
-[HANDOFF.md](HANDOFF.md) for architecture, scientific constraints, benchmarks, and
-the remaining roadmap.
+The current version is `0.7.0 Beta`. The end-to-end workflow through flexible
+import, preprocessing, detection, correction, measurement, spine review, and
+tabular/PDF export is user-approved. See [HANDOFF.md](HANDOFF.md) for architecture,
+scientific constraints, and development history.
 
 This repository intentionally excludes microscopy TIFFs, project manifests, and
 generated Zarr caches. They are user data or runtime artifacts, not source files.
@@ -37,17 +37,20 @@ environment through Conda's runner, so `conda` does not need to be on the ordina
 Windows command prompt's `PATH`. Run
 `scripts/create_desktop_shortcut.ps1` once to create a desktop shortcut.
 
-## Expected filenames
+## Filename pairing
 
-Files must be directly inside the selected folder and follow:
+The original metadata schema remains supported:
 
 ```text
 <batch_prefix>_<experimental_group>_<specimen_id>_<ChanA|ChanB>_registered.tif
 ```
 
+Channel markers are configurable, so metadata-free pairs such as
+`Untitled001cy.tif` / `Untitled001cl.tif` can be placed in one editable fallback
+group. A manual mode pairs individual A/B TIFFs from the same or different folders.
 The importer checks pairing, duplicates, TIFF dimensions, data type, axis metadata,
 and channel-shape agreement without loading whole stacks into RAM. SHA-256 source
-fingerprints are computed in a background worker.
+fingerprints and per-file source paths support verification and recursive relinking.
 
 ## Stage 1: project setup
 
@@ -230,13 +233,31 @@ margin is adjustable; excluded-distribution and invalid-spine audit PDFs are
 separate options. Segmentation-mask/ImageJ ROI export remains part of the later
 final-export stage.
 
+## Beta workflow additions
+
+Version 0.7.0 adds zoomable preprocessing, detection, correction, projection, and
+spine-context views; larger sensitivity ranges; independent X/Y/Z 3D rotation
+controls; and screen-aware persistent window sizing. Missed-object correction
+strokes now produce separate objects and use preprocessed signal for image-guided
+boundaries.
+
+The measurement screen has separate protein-cluster-positive and optional
+cluster-less spine queues. Both use stable spine IDs. Clicking a crop opens the
+full specimen with the selected spine highlighted, while the numbered spine map
+provides maximum-projection or single-Z viewing and category/validity filters.
+Invalid cluster-less spines are excluded from every downstream metric and retained
+in audit exports.
+
+Preprocessing, automatic detection, and measurement each show a responsive batch
+progress bar with work counts, elapsed time, and a smoothed approximate ETA.
+
 ## Tests and command-line validation
 
 Run the test suite from the repository root:
 
 ```powershell
 $env:PYTHONPATH = (Resolve-Path "src").Path
-conda run -n synpo-microscopy python -m unittest discover -s tests -v
+conda run -n synpo-microscopy python -m pytest -q
 ```
 
 The non-GUI importer can be exercised with:

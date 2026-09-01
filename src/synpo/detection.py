@@ -20,7 +20,7 @@ from skimage.segmentation import watershed
 
 from .models import ProgressCallback
 from .preprocessing import ProcessingCancelled, project_cache_path
-from .project import save_project
+from .project import channel_source_path, save_project
 
 
 ALGORITHM_VERSION = 2
@@ -36,10 +36,10 @@ class DetectionSettings:
     minimum_cluster_voxels: int = 25
 
     def validate(self) -> None:
-        if not 0.25 <= self.dendrite_sensitivity <= 3.0:
-            raise ValueError("Dendrite sensitivity must be between 0.25 and 3.0.")
-        if not 0.25 <= self.cluster_sensitivity <= 3.0:
-            raise ValueError("Cluster sensitivity must be between 0.25 and 3.0.")
+        if not 0.25 <= self.dendrite_sensitivity <= 10.0:
+            raise ValueError("Dendrite sensitivity must be between 0.25 and 10.0.")
+        if not 0.25 <= self.cluster_sensitivity <= 10.0:
+            raise ValueError("Cluster sensitivity must be between 0.25 and 10.0.")
         if not 0.5 <= self.spine_branch_length_um <= 10.0:
             raise ValueError("Spine branch length must be between 0.5 and 10 µm.")
         if not 0.5 <= self.minimum_dendrite_length_um <= 1000:
@@ -628,13 +628,11 @@ def detect_project(
         def specimen_progress(phase: str, current: int, total: int, detail: str) -> None:
             if progress:
                 overall = completed_work + current
-                elapsed = max(0.001, time.monotonic() - started)
-                eta = elapsed / max(1, overall) * max(0, total_work - overall)
                 progress(
                     phase,
                     overall,
                     total_work,
-                    f"{specimen['specimen_id']}: {detail} | batch ETA {eta / 60:.1f} min",
+                    f"{specimen['specimen_id']}: {detail}",
                 )
 
         summary = detect_specimen(
@@ -686,6 +684,13 @@ def detect_project(
         if pair_completed:
             pair_completed(specimen_index, summary.to_dict())
         completed_work += work_units[specimen_index]
+    if progress:
+        progress(
+            "Detection complete",
+            total_work,
+            total_work,
+            f"{len(eligible)} specimen pair(s) checkpointed",
+        )
     return {
         "eligible_pairs": len(eligible),
         "elapsed_seconds": time.monotonic() - started,
@@ -705,9 +710,8 @@ def load_detection_slice(
     z_count = 1 if len(shape) == 2 else shape[0]
     if not 0 <= z_index < z_count:
         raise IndexError(f"Z slice {z_index} is outside 0..{z_count - 1}.")
-    source = (
-        Path(str(manifest["source_directory"]))
-        / specimen["channels"][background_channel]["filename"]
+    source = channel_source_path(
+        manifest, specimen["channels"][background_channel]
     )
     with tifffile.TiffFile(source) as tiff:
         series = tiff.series[0]

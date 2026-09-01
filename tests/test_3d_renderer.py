@@ -84,9 +84,19 @@ class VolumeRendererTests(unittest.TestCase):
         dialog = ContextViewerDialog("3D controls test", volume, 0)
         dialog.volume_z_spacing.setValue(3.0)
         dialog.volume_opacity_spins[0].setValue(90)
+        dialog.volume_view.set_rotation(45.0, -20.0, 90.0)
         self.app.processEvents()
         self.assertEqual(dialog.volume_view.z_spacing_factor(), 3.0)
         self.assertEqual(dialog.volume_view.kind_opacity(0), 0.9)
+        self.assertEqual(dialog.volume_view.rotation(), (45.0, -20.0, 90.0))
+        self.assertEqual(
+            [control.value() for control in dialog.volume_rotation_sliders],
+            [45, -20, 90],
+        )
+        dialog.volume_rotation_spins[1].setValue(35)
+        self.assertEqual(dialog.volume_view.rotation(), (45.0, 35.0, 90.0))
+        dialog.volume_view.reset_rotation()
+        self.assertEqual(dialog.volume_view.rotation(), (25.0, 0.0, -35.0))
         dialog.close()
 
 

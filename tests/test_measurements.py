@@ -17,12 +17,14 @@ from synpo.measurements import (
     clear_centerline_endpoint_hint,
     cluster_end_comparison_rows,
     load_measurement_result,
+    load_spine_review_preview,
     measure_project,
     set_centerline_endpoint_hint,
     set_distribution_review,
+    set_spine_quality_review,
 )
 from synpo.distribution import calculate_spine_distribution
-from synpo.exporting import export_measurements
+from synpo.exporting import collect_export_tables, export_measurements
 from synpo.project import migrate_manifest, save_project
 
 
@@ -265,6 +267,60 @@ class MeasurementTests(unittest.TestCase):
         self.assertFalse(adaptive[1, 1])
         self.assertFalse(adaptive[2, 1])
         self.assertEqual(adaptive_details[1]["discarded_z_slices"], [1, 2])
+
+    def test_clusterless_spine_review_excludes_from_all_metrics(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_project(root)
+            detection_root = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )
+            labels = detection_root["specimens/0000/spine_labels"]
+            labels[2:5, 15:19, 4:9] = 2
+            detection_root["specimens/0000"].attrs["summary"] = {
+                "dendrite_count": 1,
+                "spine_count": 2,
+                "cluster_count": 2,
+            }
+            manifest["specimens"][0]["checkpoints"]["measurements"][
+                "state"
+            ] = "not_started"
+            measure_project(manifest, project_path)
+            before = load_measurement_result(manifest, 0)
+            self.assertEqual(before["specimen_rows"][0]["spine_count"], 2)
+            self.assertAlmostEqual(
+                before["specimen_rows"][0]["spines_with_clusters_percent"], 50.0
+            )
+            clusterless = next(
+                row
+                for row in before["spine_rows"]
+                if not bool(row["has_protein_cluster"])
+            )
+            spine_id = int(clusterless["spine_id"])
+            preview = load_spine_review_preview(manifest, 0, spine_id)
+            self.assertTrue(np.any(preview.spine_projection == spine_id))
+            self.assertLessEqual(preview.spine_z_range[0], preview.spine_z_range[1])
+
+            set_spine_quality_review(
+                manifest,
+                project_path,
+                0,
+                spine_id,
+                invalid_spine=True,
+                note="broken cluster-less spine",
+            )
+            after = load_measurement_result(manifest, 0)
+            reviewed = next(
+                row for row in after["spine_rows"] if int(row["spine_id"]) == spine_id
+            )
+            self.assertFalse(reviewed["spine_valid"])
+            self.assertTrue(reviewed["validity_reviewed"])
+            self.assertEqual(after["specimen_rows"][0]["spine_count"], 1)
+            self.assertAlmostEqual(
+                after["specimen_rows"][0]["spines_with_clusters_percent"], 100.0
+            )
+            tables = collect_export_tables(manifest)
+            self.assertEqual(len(tables["Invalid_Spines"]), 1)
+            self.assertEqual(len(tables["Spine_Review_Audit"]), 1)
 
     def test_calibrated_curved_axis_assigns_every_voxel_once(self) -> None:
         spine = np.zeros((7, 18, 28), dtype=bool)

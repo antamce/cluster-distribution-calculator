@@ -17,7 +17,7 @@ from numcodecs import Blosc
 from scipy import ndimage
 
 from .models import ProgressCallback
-from .project import save_project
+from .project import channel_source_path, save_project
 
 
 ALGORITHM_VERSION = 1
@@ -40,8 +40,8 @@ class PreprocessingSettings:
             raise ValueError("Background percentile must be between 0 and 99.9.")
         if self.gaussian_sigma_xy_um < 0 or self.gaussian_sigma_z_um < 0:
             raise ValueError("Gaussian smoothing values cannot be negative.")
-        if not 0.1 <= self.threshold_sensitivity <= 3.0:
-            raise ValueError("Threshold sensitivity must be between 0.1 and 3.0.")
+        if not 0.1 <= self.threshold_sensitivity <= 10.0:
+            raise ValueError("Threshold sensitivity must be between 0.1 and 10.0.")
 
     def to_dict(self) -> dict[str, float]:
         self.validate()
@@ -455,14 +455,11 @@ def process_stack_to_cache(
             dataset[z_index, :, :] = np.clip(np.rint(processed), 0, 65535).astype(np.uint16)
             dataset.attrs["slices_completed"] = z_index + 1
             if progress:
-                elapsed = max(0.001, time.monotonic() - started)
-                completed = z_index - start_z + 1
-                eta = elapsed / completed * (z_count - z_index - 1)
                 progress(
                     "Preprocessing",
                     z_index + 1,
                     z_count,
-                    f"slice {z_index + 1}/{z_count}; about {eta:.0f} s remaining",
+                    f"slice {z_index + 1}/{z_count}",
                 )
         dataset.attrs["complete"] = True
         dataset.attrs["completed_at"] = time.time()
@@ -524,19 +521,17 @@ def process_project_cache(
                 manifest["preprocessing"]["settings_by_channel"][channel]
             )
             filename = str(channel_data["filename"])
-            source = Path(str(manifest["source_directory"])) / filename
+            source = channel_source_path(manifest, channel_data)
             dataset_key = f"specimens/{specimen_index:04d}/{channel}/data"
 
             def channel_progress(phase: str, current: int, total: int, detail: str) -> None:
                 if progress:
-                    elapsed = max(0.001, time.monotonic() - started)
                     overall = completed_before + current
-                    eta = elapsed / max(1, overall) * max(0, total_slices - overall)
                     progress(
                         phase,
                         overall,
                         total_slices,
-                        f"{specimen['specimen_id']} {channel}: {detail} | batch ETA {eta / 60:.1f} min",
+                        f"{specimen['specimen_id']} {channel}: {detail}",
                     )
 
             result = process_stack_to_cache(
@@ -552,6 +547,13 @@ def process_project_cache(
                 cancel_event=cancel_event,
             )
             completed_before += z_count
+            if progress:
+                progress(
+                    "Preprocessing checkpoint",
+                    completed_before,
+                    total_slices,
+                    f"{specimen['specimen_id']} {channel} saved",
+                )
             checkpoint["channels"][channel] = {
                 "state": "complete",
                 "dataset_key": dataset_key,

@@ -8,11 +8,12 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
+import zarr
 
 from synpo.detection import DetectionSettings, detect_project
 from synpo.importer import scan_batch
 from synpo.models import Calibration
-from synpo.preprocessing import process_project_cache
+from synpo.preprocessing import process_project_cache, project_cache_path
 from synpo.project import create_project_manifest, load_project, save_project
 from synpo.review import (
     ReviewAction,
@@ -35,6 +36,18 @@ def workspace_directory():
 
 
 class ReviewTests(unittest.TestCase):
+    @staticmethod
+    def add_preprocessed_signal(
+        manifest: dict[str, object], mask: np.ndarray, value: int = 5000
+    ) -> None:
+        key = manifest["specimens"][0]["checkpoints"]["preprocessing"]["channels"][
+            "ChanB"
+        ]["dataset_key"]
+        dataset = zarr.open_group(str(project_cache_path(manifest)), mode="a")[key]
+        data = np.asarray(dataset)
+        data[mask] = value
+        dataset[:] = data
+
     def make_detected_project(self, root: Path) -> tuple[dict[str, object], Path]:
         source = root / "source"
         source.mkdir()
@@ -189,6 +202,148 @@ class ReviewTests(unittest.TestCase):
             )
             refreshed_view = load_review_slice(invalidated, 0, 3, "ChanB")
             self.assertFalse(refreshed_view.corrected)
+
+    def test_each_add_stroke_creates_one_preprocessed_object_atomically(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            source = root / "source" / "batch_group_specimen_ChanB_registered.tif"
+            raw = tifffile.imread(source)
+            zz, yy, xx = np.ogrid[: raw.shape[0], : raw.shape[1], : raw.shape[2]]
+            first_signal = (
+                ((zz - 4) / 2.0) ** 2
+                + ((yy - 9) / 3.0) ** 2
+                + ((xx - 10) / 3.0) ** 2
+                <= 1.0
+            )
+            second_signal = (
+                ((zz - 4) / 2.0) ** 2
+                + ((yy - 9) / 3.0) ** 2
+                + ((xx - 67) / 3.0) ** 2
+                <= 1.0
+            )
+            raw[first_signal | second_signal] = 5000
+            tifffile.imwrite(
+                source,
+                raw,
+                metadata={"axes": "ZYX"},
+                photometric="minisblack",
+            )
+            self.add_preprocessed_signal(manifest, first_signal | second_signal)
+
+            before = load_review_slice(manifest, 0, 4, "ChanB")
+            self.assertEqual(int(before.spines[9, 10]), 0)
+            self.assertEqual(int(before.spines[9, 67]), 0)
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="spine",
+                    operation="add",
+                    z_index=4,
+                    points=((10, 9), (16, 9), (67, 9), (40, 6)),
+                    strokes=(((10, 9), (16, 9)), ((67, 9),), ((40, 6),)),
+                    brush_radius_pixels=1,
+                ),
+            )
+            self.assertTrue(result.checkpoint_written)
+            self.assertEqual(len(result.new_ids), 2)
+            self.assertEqual(
+                [item["status"] for item in result.hint_results],
+                ["created", "created", "skipped"],
+            )
+            corrected = load_review_slice(manifest, 0, 4, "ChanB")
+            self.assertEqual(int(corrected.spines[9, 10]), result.new_ids[0])
+            self.assertEqual(int(corrected.spines[9, 67]), result.new_ids[1])
+            self.assertEqual(int(corrected.spines[9, 16]), 0)
+            self.assertEqual(
+                manifest["specimens"][0]["checkpoints"]["review"]["edit_count"],
+                1,
+            )
+            history = manifest["specimens"][0]["review"]["history"][-1]
+            self.assertEqual(history["hint_count"], 3)
+            self.assertEqual(len(history["bboxes"]), 2)
+
+            undo_last_review_action(manifest, project_path, 0)
+            restored = load_review_slice(manifest, 0, 4, "ChanB")
+            self.assertEqual(int(restored.spines[9, 10]), 0)
+            self.assertEqual(int(restored.spines[9, 67]), 0)
+
+    def test_raw_only_signal_writes_no_mask_or_checkpoint(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            source = root / "source" / "batch_group_specimen_ChanB_registered.tif"
+            raw = tifffile.imread(source)
+            raw[0:2, 4:9, 38:43] = 6000
+            tifffile.imwrite(
+                source,
+                raw,
+                metadata={"axes": "ZYX"},
+                photometric="minisblack",
+            )
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="spine",
+                    operation="add",
+                    z_index=0,
+                    points=((40, 6),),
+                    strokes=(((40, 6),),),
+                    brush_radius_pixels=1,
+                ),
+            )
+            self.assertFalse(result.checkpoint_written)
+            self.assertEqual(result.new_ids, ())
+            self.assertEqual(result.hint_results[0]["status"], "skipped")
+            self.assertEqual(
+                manifest["specimens"][0]["checkpoints"]["review"]["edit_count"],
+                0,
+            )
+            view = load_review_slice(manifest, 0, 0, "ChanB")
+            self.assertEqual(int(view.spines[6, 40]), 0)
+
+    def test_two_hints_split_one_connected_preprocessed_region(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            source = root / "source" / "batch_group_specimen_ChanB_registered.tif"
+            raw = tifffile.imread(source)
+            zz, yy, xx = np.ogrid[: raw.shape[0], : raw.shape[1], : raw.shape[2]]
+            connected_signal = (
+                ((zz - 4) / 2.0) ** 2
+                + ((yy - 8) / 3.0) ** 2
+                + ((xx - 40) / 10.0) ** 2
+                <= 1.0
+            )
+            raw[connected_signal] = 5000
+            tifffile.imwrite(
+                source,
+                raw,
+                metadata={"axes": "ZYX"},
+                photometric="minisblack",
+            )
+            self.add_preprocessed_signal(manifest, connected_signal)
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="spine",
+                    operation="add",
+                    z_index=4,
+                    points=((36, 8), (44, 8)),
+                    strokes=(((36, 8),), ((44, 8),)),
+                    brush_radius_pixels=1,
+                ),
+            )
+            self.assertEqual(len(result.new_ids), 2)
+            corrected = load_review_slice(manifest, 0, 4, "ChanB")
+            self.assertEqual(int(corrected.spines[8, 36]), result.new_ids[0])
+            self.assertEqual(int(corrected.spines[8, 44]), result.new_ids[1])
+            self.assertNotEqual(
+                int(corrected.spines[8, 36]), int(corrected.spines[8, 44])
+            )
 
 
 if __name__ == "__main__":

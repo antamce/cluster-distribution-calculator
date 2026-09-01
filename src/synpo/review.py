@@ -13,11 +13,13 @@ import tifffile
 import zarr
 from numcodecs import Blosc
 from scipy import ndimage
+from skimage.filters import threshold_otsu
+from skimage.segmentation import watershed
 
 from .detection import detection_cache_path
 from .models import ProgressCallback
 from .preprocessing import ProcessingCancelled, project_cache_path
-from .project import save_project
+from .project import channel_source_path, save_project
 
 
 ObjectType = Literal["dendrite", "spine"]
@@ -42,6 +44,10 @@ class ReviewAction:
     points: tuple[tuple[int, int], ...]
     brush_radius_pixels: int = 4
     projection_hint: bool = False
+    strokes: tuple[tuple[tuple[int, int], ...], ...] = ()
+
+    def hint_strokes(self) -> tuple[tuple[tuple[int, int], ...], ...]:
+        return self.strokes or ((self.points,) if self.points else ())
 
     def validate(self) -> None:
         if self.object_type not in {"dendrite", "spine"}:
@@ -58,7 +64,8 @@ class ReviewAction:
             "needs_attention",
         }:
             raise ValueError("Unknown review operation.")
-        if not self.points:
+        strokes = self.hint_strokes()
+        if not strokes or any(not stroke for stroke in strokes):
             raise ValueError("Draw or click a hint before applying this action.")
         if self.brush_radius_pixels < 1:
             raise ValueError("Hint brush radius must be positive.")
@@ -77,6 +84,8 @@ class ReviewResult:
     edit_count: int
     dendrite_count: int
     spine_count: int
+    checkpoint_written: bool = True
+    hint_results: tuple[dict[str, object], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -255,22 +264,6 @@ def _best_projection_z(
     return best_z
 
 
-def _brightest_projection_z(
-    processed: zarr.Array,
-    points: tuple[tuple[int, int], ...],
-    radius: int,
-) -> int:
-    y_slice, x_slice, hint = _hint_crop(tuple(processed.shape[1:]), points, radius)
-    best_z = 0
-    best_score = float("-inf")
-    for z_index in range(processed.shape[0]):
-        patch = np.asarray(processed[z_index, y_slice, x_slice], dtype=np.float32)
-        score = float(np.max(patch[hint])) if np.any(hint) else float("-inf")
-        if score > best_score:
-            best_z, best_score = z_index, score
-    return best_z
-
-
 def _bbox_for_ids(
     array: zarr.Array, ids: tuple[int, ...]
 ) -> tuple[int, int, int, int, int, int]:
@@ -382,6 +375,26 @@ def _store_undo_patch(
     undo.attrs.update({"dataset_name": dataset_name, "bbox": list(bbox)})
 
 
+def _store_undo_patches(
+    group: zarr.Group,
+    action_id: str,
+    dataset_name: str,
+    patches: list[tuple[tuple[int, int, int, int, int, int], np.ndarray]],
+) -> None:
+    undo = group.require_group("undo").require_group(action_id)
+    patch_group = undo.require_group("patches")
+    undo.attrs.update({"dataset_name": dataset_name, "multi_patch": True})
+    for index, (bbox, patch) in enumerate(patches):
+        dataset = patch_group.create_dataset(
+            f"{index:04d}",
+            data=np.asarray(patch, dtype=np.uint32),
+            chunks=(1, min(256, patch.shape[1]), min(256, patch.shape[2])),
+            compressor=_compressor(),
+            overwrite=True,
+        )
+        dataset.attrs["bbox"] = list(bbox)
+
+
 def _processed_dendrite_data(
     manifest: dict[str, object], specimen_index: int
 ) -> zarr.Array:
@@ -393,6 +406,266 @@ def _processed_dendrite_data(
     checkpoint = manifest["specimens"][specimen_index]["checkpoints"]["preprocessing"]
     key = checkpoint["channels"][dendrite_channel]["dataset_key"]
     return zarr.open_group(str(project_cache_path(manifest)), mode="r")[key]
+
+
+def _brightest_processed_projection_z(
+    processed: zarr.Array,
+    points: tuple[tuple[int, int], ...],
+    radius: int,
+) -> int:
+    y_slice, x_slice, hint = _hint_crop(tuple(processed.shape[1:]), points, radius)
+    best_z = 0
+    best_score = float("-inf")
+    for z_index in range(processed.shape[0]):
+        patch = np.asarray(processed[z_index, y_slice, x_slice], dtype=np.float32)
+        if not np.any(hint):
+            continue
+        background = float(np.percentile(patch, 20.0))
+        score = float(np.percentile(patch[hint], 90.0)) - background
+        if score > best_score:
+            best_z, best_score = z_index, score
+    return best_z
+
+
+def _bbox_union(
+    first: tuple[int, int, int, int, int, int],
+    second: tuple[int, int, int, int, int, int],
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        min(first[0], second[0]),
+        max(first[1], second[1]),
+        min(first[2], second[2]),
+        max(first[3], second[3]),
+        min(first[4], second[4]),
+        max(first[5], second[5]),
+    )
+
+
+def _bboxes_overlap(
+    first: tuple[int, int, int, int, int, int],
+    second: tuple[int, int, int, int, int, int],
+) -> bool:
+    return not (
+        first[1] <= second[0]
+        or second[1] <= first[0]
+        or first[3] <= second[2]
+        or second[3] <= first[2]
+        or first[5] <= second[4]
+        or second[5] <= first[4]
+    )
+
+
+def _group_overlapping_hint_bboxes(
+    hints: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    groups: list[dict[str, object]] = []
+    for hint in hints:
+        bbox = tuple(int(value) for value in hint["bbox"])
+        matching = [
+            index
+            for index, group in enumerate(groups)
+            if _bboxes_overlap(tuple(group["bbox"]), bbox)
+        ]
+        if not matching:
+            groups.append({"bbox": bbox, "hints": [hint]})
+            continue
+        primary = matching[0]
+        groups[primary]["bbox"] = _bbox_union(tuple(groups[primary]["bbox"]), bbox)
+        groups[primary]["hints"].append(hint)
+        for index in reversed(matching[1:]):
+            groups[primary]["bbox"] = _bbox_union(
+                tuple(groups[primary]["bbox"]), tuple(groups[index]["bbox"])
+            )
+            groups[primary]["hints"].extend(groups[index]["hints"])
+            del groups[index]
+        changed = True
+        while changed:
+            changed = False
+            for index in range(len(groups) - 1, -1, -1):
+                if index == primary:
+                    continue
+                if _bboxes_overlap(
+                    tuple(groups[primary]["bbox"]), tuple(groups[index]["bbox"])
+                ):
+                    groups[primary]["bbox"] = _bbox_union(
+                        tuple(groups[primary]["bbox"]), tuple(groups[index]["bbox"])
+                    )
+                    groups[primary]["hints"].extend(groups[index]["hints"])
+                    del groups[index]
+                    if index < primary:
+                        primary -= 1
+                    changed = True
+                    break
+    return groups
+
+
+def _relative_slices(
+    inner: tuple[int, int, int, int, int, int],
+    outer: tuple[int, int, int, int, int, int],
+) -> tuple[slice, slice, slice]:
+    return (
+        slice(inner[0] - outer[0], inner[1] - outer[0]),
+        slice(inner[2] - outer[2], inner[3] - outer[2]),
+        slice(inner[4] - outer[4], inner[5] - outer[4]),
+    )
+
+
+def _segment_add_hint_group(
+    processed_patch: np.ndarray,
+    target_patch: np.ndarray,
+    dendrite_patch: np.ndarray | None,
+    group_bbox: tuple[int, int, int, int, int, int],
+    hints: list[dict[str, object]],
+    *,
+    object_type: str,
+    brush_radius: int,
+    sensitivity: float,
+    preprocessing_threshold: float,
+    next_id: int,
+) -> tuple[np.ndarray, int, list[dict[str, object]]]:
+    candidate_union = np.zeros(target_patch.shape, dtype=bool)
+    combined_signal = np.zeros(target_patch.shape, dtype=np.float32)
+    markers = np.zeros(target_patch.shape, dtype=np.int32)
+    marker_hints: list[dict[str, object]] = []
+    results: list[dict[str, object]] = []
+    occupied_markers: set[tuple[int, int, int]] = set()
+
+    for hint in hints:
+        hint_index = int(hint["index"])
+        hint_bbox = tuple(int(value) for value in hint["bbox"])
+        relative = _relative_slices(hint_bbox, group_bbox)
+        local_processed = np.asarray(processed_patch[relative], dtype=np.float32)
+        background = float(np.percentile(local_processed, 20.0))
+        corrected = np.maximum(local_processed - background, 0.0)
+        signal = ndimage.gaussian_filter(corrected, sigma=(0.35, 0.6, 0.6))
+        peak = float(signal.max(initial=0.0))
+        median = float(np.median(signal))
+        mad = float(np.median(np.abs(signal - median)))
+        noise_floor = median + 2.0 * 1.4826 * mad
+        if peak <= max(1e-6, noise_floor):
+            results.append(
+                {
+                    "hint_index": hint_index,
+                    "status": "skipped",
+                    "object_id": None,
+                    "message": "no image-supported signal was found",
+                }
+            )
+            continue
+        varying = signal[signal > 0]
+        adaptive = (
+            float(threshold_otsu(varying))
+            if varying.size > 1 and float(varying.max()) > float(varying.min())
+            else peak
+        )
+        local_points = _local_points(tuple(hint["points"]), hint_bbox)
+        hint_2d = _disk_mask(tuple(signal.shape[1:]), local_points, brush_radius)
+        local_z = int(hint["z_index"]) - hint_bbox[0]
+        seed_support = np.zeros(signal.shape, dtype=bool)
+        seed_support[local_z, hint_2d] = True
+        seed_values = signal[seed_support]
+        seed_peak = float(seed_values.max(initial=0.0))
+        if seed_peak <= max(1e-6, noise_floor):
+            results.append(
+                {
+                    "hint_index": hint_index,
+                    "status": "skipped",
+                    "object_id": None,
+                    "message": "the hint did not touch signal above local background",
+                }
+            )
+            continue
+        threshold = max(
+            1e-6,
+            noise_floor,
+            preprocessing_threshold / max(0.25, sensitivity),
+            min(adaptive / max(0.25, sensitivity), seed_peak * 0.65),
+        )
+        candidate = signal >= threshold
+        candidate = ndimage.binary_closing(
+            candidate, structure=np.ones((1, 3, 3), dtype=bool)
+        )
+        candidate &= target_patch[relative] == 0
+        if object_type == "spine" and dendrite_patch is not None:
+            candidate &= dendrite_patch[relative] == 0
+        supported = np.argwhere(candidate & seed_support)
+        if not len(supported):
+            results.append(
+                {
+                    "hint_index": hint_index,
+                    "status": "skipped",
+                    "object_id": None,
+                    "message": "no unlabelled image-supported seed remained at the hint",
+                }
+            )
+            continue
+        ranked = sorted(
+            supported,
+            key=lambda coordinate: float(signal[tuple(coordinate)]),
+            reverse=True,
+        )
+        chosen: tuple[int, int, int] | None = None
+        for coordinate in ranked:
+            local_coordinate = tuple(int(value) for value in coordinate)
+            group_coordinate = (
+                local_coordinate[0] + hint_bbox[0] - group_bbox[0],
+                local_coordinate[1] + hint_bbox[2] - group_bbox[2],
+                local_coordinate[2] + hint_bbox[4] - group_bbox[4],
+            )
+            if group_coordinate not in occupied_markers:
+                chosen = group_coordinate
+                break
+        if chosen is None:
+            results.append(
+                {
+                    "hint_index": hint_index,
+                    "status": "skipped",
+                    "object_id": None,
+                    "message": "this hint duplicated another seed exactly",
+                }
+            )
+            continue
+        occupied_markers.add(chosen)
+        marker_number = len(marker_hints) + 1
+        markers[chosen] = marker_number
+        marker_hints.append(hint)
+        candidate_union[relative] |= candidate
+        combined_signal[relative] = np.maximum(combined_signal[relative], signal)
+
+    if not marker_hints:
+        return target_patch.copy(), next_id, results
+    separated = watershed(
+        -combined_signal,
+        markers=markers,
+        mask=candidate_union,
+        connectivity=np.ones((3, 3, 3), dtype=bool),
+    )
+    output = target_patch.copy()
+    for marker_number, hint in enumerate(marker_hints, start=1):
+        hint_index = int(hint["index"])
+        region = separated == marker_number
+        if int(region.sum()) < 5:
+            results.append(
+                {
+                    "hint_index": hint_index,
+                    "status": "skipped",
+                    "object_id": None,
+                    "message": "the image-supported region was too small",
+                }
+            )
+            continue
+        object_id = next_id
+        next_id += 1
+        output[region] = object_id
+        results.append(
+            {
+                "hint_index": hint_index,
+                "status": "created",
+                "object_id": object_id,
+                "message": f"created object {object_id}",
+            }
+        )
+    return output, next_id, results
 
 
 def _status_changes(
@@ -408,6 +681,213 @@ def _status_changes(
         previous[key] = statuses.get(key)
         statuses[key] = status
     return previous
+
+
+def _apply_add_hints(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    action: ReviewAction,
+    group: zarr.Group,
+    target: zarr.Array,
+    *,
+    progress: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
+) -> ReviewResult:
+    specimen = manifest["specimens"][specimen_index]
+    strokes = action.hint_strokes()
+    processed = _processed_dendrite_data(manifest, specimen_index)
+    xy = float(manifest["calibration"]["xy_um_per_pixel"])
+    margin = max(
+        action.brush_radius_pixels + 4,
+        int(round(float(manifest["review_settings"]["local_margin_um"]) / xy)),
+    )
+    z_radius = max(
+        int(manifest["review_settings"].get("z_radius_slices", 2)),
+        int(manifest["review_settings"].get("add_z_radius_slices", 6)),
+    )
+    hints: list[dict[str, object]] = []
+    for hint_index, stroke in enumerate(strokes, start=1):
+        effective_z = (
+            _brightest_processed_projection_z(
+                processed, stroke, action.brush_radius_pixels
+            )
+            if action.projection_hint
+            else action.z_index
+        )
+        bbox = _local_bbox(
+            tuple(target.shape), effective_z, stroke, margin, z_radius
+        )
+        hints.append(
+            {
+                "index": hint_index,
+                "points": stroke,
+                "z_index": effective_z,
+                "bbox": bbox,
+            }
+        )
+    grouped = _group_overlapping_hint_bboxes(hints)
+    next_key = f"next_{action.object_type}_id"
+    count_key = f"{action.object_type}_count"
+    original_next_id = int(group.attrs[next_key])
+    original_count = int(group.attrs[count_key])
+    next_id = original_next_id
+    sensitivity = float(
+        manifest["detection"]["settings"]["dendrite_sensitivity"]
+    )
+    preprocessing_threshold = float(
+        processed.attrs["statistics"]["applied_threshold"]
+    )
+    updates: list[
+        tuple[
+            tuple[int, int, int, int, int, int], np.ndarray, np.ndarray
+        ]
+    ] = []
+    hint_results: list[dict[str, object]] = []
+    for group_index, hint_group in enumerate(grouped, start=1):
+        _cancel_if_requested(cancel_event)
+        bbox = tuple(int(value) for value in hint_group["bbox"])
+        _enforce_review_ram_policy(manifest, bbox)
+        slices = _bbox_slices(bbox)
+        before = np.asarray(target[slices])
+        dendrite_patch = (
+            np.asarray(group["dendrite_labels"][slices])
+            if action.object_type == "spine"
+            else None
+        )
+        output, next_id, results = _segment_add_hint_group(
+            np.asarray(processed[slices]),
+            before,
+            dendrite_patch,
+            bbox,
+            list(hint_group["hints"]),
+            object_type=action.object_type,
+            brush_radius=action.brush_radius_pixels,
+            sensitivity=sensitivity,
+            preprocessing_threshold=preprocessing_threshold,
+            next_id=next_id,
+        )
+        hint_results.extend(results)
+        if np.any(output != before):
+            updates.append((bbox, before, output))
+        if progress:
+            progress(
+                "Resegmenting independent hints",
+                group_index,
+                len(grouped),
+                f"local region {group_index}/{len(grouped)}",
+            )
+    hint_results.sort(key=lambda item: int(item["hint_index"]))
+    created_ids = tuple(
+        int(item["object_id"])
+        for item in hint_results
+        if item["status"] == "created"
+    )
+    if not created_ids:
+        return ReviewResult(
+            specimen_index=specimen_index,
+            action_id="",
+            operation="add",
+            object_type=action.object_type,
+            affected_ids=(),
+            new_ids=(),
+            edit_count=int(
+                specimen["checkpoints"]["review"].get("edit_count", 0)
+            ),
+            dendrite_count=original_count
+            if action.object_type == "dendrite"
+            else int(group.attrs["dendrite_count"]),
+            spine_count=original_count
+            if action.object_type == "spine"
+            else int(group.attrs["spine_count"]),
+            checkpoint_written=False,
+            hint_results=tuple(hint_results),
+        )
+
+    action_id = uuid.uuid4().hex
+    undo_patches = [(bbox, before) for bbox, before, _output in updates]
+    _store_undo_patches(group, action_id, f"{action.object_type}_labels", undo_patches)
+    written: list[tuple[tuple[int, int, int, int, int, int], np.ndarray]] = []
+    try:
+        for bbox, before, output in updates:
+            target[_bbox_slices(bbox)] = output
+            written.append((bbox, before))
+        group.attrs[next_key] = next_id
+        group.attrs[count_key] = original_count + len(created_ids)
+    except Exception:
+        for bbox, before in written:
+            target[_bbox_slices(bbox)] = before
+        group.attrs[next_key] = original_next_id
+        group.attrs[count_key] = original_count
+        undo_key = f"undo/{action_id}"
+        if undo_key in group:
+            del group[undo_key]
+        raise
+
+    history_entry = {
+        "action_id": action_id,
+        "timestamp": time.time(),
+        "operation": "add",
+        "object_type": action.object_type,
+        "z_index": action.z_index,
+        "effective_z_by_hint": [int(hint["z_index"]) for hint in hints],
+        "projection_hint": action.projection_hint,
+        "hint_point_count": len(action.points),
+        "hint_count": len(strokes),
+        "hint_results": hint_results,
+        "brush_radius_pixels": action.brush_radius_pixels,
+        "affected_ids": list(created_ids),
+        "new_ids": list(created_ids),
+        "bbox": None,
+        "bboxes": [list(bbox) for bbox, _before, _output in updates],
+        "count_delta": len(created_ids),
+        "previous_status": {},
+        "undone": False,
+        "undo_available": True,
+    }
+    specimen["review"]["history"].append(history_entry)
+    maximum_undo = int(manifest["review_settings"].get("maximum_undo_actions", 100))
+    mask_undo_entries = [
+        item
+        for item in specimen["review"]["history"]
+        if (item.get("bbox") is not None or item.get("bboxes"))
+        and not item.get("undone")
+        and item.get("undo_available", True)
+    ]
+    while len(mask_undo_entries) > maximum_undo:
+        expired = mask_undo_entries.pop(0)
+        undo_key = f"undo/{expired['action_id']}"
+        if undo_key in group:
+            del group[undo_key]
+        expired["undo_available"] = False
+    specimen["review"]["state"] = "in_progress"
+    checkpoint = specimen["checkpoints"]["review"]
+    checkpoint.update(
+        {
+            "state": "in_progress",
+            "updated_at": time.time(),
+            "edit_count": int(checkpoint.get("edit_count", 0)) + 1,
+            "cache_path": str(review_cache_path(manifest)),
+            "detection_signature": group.attrs["detection_signature"],
+        }
+    )
+    specimen["checkpoints"].setdefault("measurements", {}).update(
+        {"state": "not_started", "updated_at": time.time()}
+    )
+    save_project(project_path, manifest)
+    return ReviewResult(
+        specimen_index=specimen_index,
+        action_id=action_id,
+        operation="add",
+        object_type=action.object_type,
+        affected_ids=created_ids,
+        new_ids=created_ids,
+        edit_count=int(checkpoint["edit_count"]),
+        dendrite_count=int(group.attrs["dendrite_count"]),
+        spine_count=int(group.attrs["spine_count"]),
+        checkpoint_written=True,
+        hint_results=tuple(hint_results),
+    )
 
 
 def apply_review_action(
@@ -433,6 +913,17 @@ def apply_review_action(
     target = group[dataset_name]
     if not 0 <= action.z_index < target.shape[0]:
         raise ValueError("The selected Z slice is outside the stack.")
+    if action.operation == "add":
+        return _apply_add_hints(
+            manifest,
+            project_path,
+            specimen_index,
+            action,
+            group,
+            target,
+            progress=progress,
+            cancel_event=cancel_event,
+        )
     if action.projection_hint:
         selected_ids = _sample_ids_projection(
             target, action.points, action.brush_radius_pixels
@@ -440,12 +931,6 @@ def apply_review_action(
         if selected_ids:
             effective_z = _best_projection_z(
                 target, selected_ids, action.points, action.brush_radius_pixels
-            )
-        elif action.operation == "add":
-            effective_z = _brightest_projection_z(
-                _processed_dendrite_data(manifest, specimen_index),
-                action.points,
-                action.brush_radius_pixels,
             )
         else:
             effective_z = action.z_index
@@ -591,34 +1076,14 @@ def apply_review_action(
                 dendrite_patch = np.asarray(group["dendrite_labels"][slices])
                 candidate &= dendrite_patch == 0
             candidate |= hint_3d
-            if action.operation == "expand":
-                object_id = selected_ids[0]
-                seed = (patch == object_id) | hint_3d
-                candidate |= patch == object_id
-                region = ndimage.binary_propagation(
-                    seed, structure=np.ones((3, 3, 3), dtype=bool), mask=candidate
-                )
-                region &= (patch == 0) | (patch == object_id)
-                patch[region] = object_id
-            else:
-                region = ndimage.binary_propagation(
-                    hint_3d,
-                    structure=np.ones((3, 3, 3), dtype=bool),
-                    mask=candidate,
-                )
-                region &= patch == 0
-                if int(region.sum()) < 5:
-                    raise ValueError(
-                        "No image-supported object was found around the hint. "
-                        "Increase sensitivity or draw farther inside the signal."
-                    )
-                next_key = f"next_{action.object_type}_id"
-                object_id = int(group.attrs[next_key])
-                group.attrs[next_key] = object_id + 1
-                patch[region] = object_id
-                new_ids = (object_id,)
-                affected_ids = (object_id,)
-                count_delta = 1
+            object_id = selected_ids[0]
+            seed = (patch == object_id) | hint_3d
+            candidate |= patch == object_id
+            region = ndimage.binary_propagation(
+                seed, structure=np.ones((3, 3, 3), dtype=bool), mask=candidate
+            )
+            region &= (patch == 0) | (patch == object_id)
+            patch[region] = object_id
         _store_undo_patch(group, action_id, dataset_name, bbox, before)
         target[slices] = patch
 
@@ -650,7 +1115,7 @@ def apply_review_action(
     mask_undo_entries = [
         item
         for item in specimen["review"]["history"]
-        if item.get("bbox") is not None
+        if (item.get("bbox") is not None or item.get("bboxes"))
         and not item.get("undone")
         and item.get("undo_available", True)
     ]
@@ -706,8 +1171,16 @@ def undo_last_review_action(
     root = zarr.open_group(str(review_cache_path(manifest)), mode="a")
     group = root[_review_group_key(specimen_index)]
     action_id = str(entry["action_id"])
-    if entry.get("bbox") is not None:
-        undo = group[f"undo/{action_id}"]
+    undo = group[f"undo/{action_id}"] if (entry.get("bbox") is not None or entry.get("bboxes")) else None
+    if entry.get("bboxes") and undo is not None:
+        patch_group = undo["patches"]
+        for name in sorted(patch_group.keys()):
+            saved = patch_group[name]
+            bbox = tuple(int(value) for value in saved.attrs["bbox"])
+            group[str(undo.attrs["dataset_name"])][_bbox_slices(bbox)] = np.asarray(
+                saved
+            )
+    elif entry.get("bbox") is not None and undo is not None:
         bbox = tuple(int(value) for value in undo.attrs["bbox"])
         group[str(undo.attrs["dataset_name"])][_bbox_slices(bbox)] = np.asarray(
             undo["before"]
@@ -776,9 +1249,8 @@ def load_review_slice(
         for value in specimen["channels"][background_channel]["metadata"]["shape"]
     )
     z_count = 1 if len(shape) == 2 else shape[0]
-    source = (
-        Path(str(manifest["source_directory"]))
-        / specimen["channels"][background_channel]["filename"]
+    source = channel_source_path(
+        manifest, specimen["channels"][background_channel]
     )
     with tifffile.TiffFile(source) as tiff:
         series = tiff.series[0]

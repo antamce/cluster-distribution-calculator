@@ -107,6 +107,12 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
         for row in spine
         if (str(row.get("experimental_group", "")), str(row.get("specimen_id", "")), int(row["spine_id"])) in invalid_ids
     ]
+    reviewed_spines = [
+        row
+        for row in spine
+        if bool(row.get("validity_reviewed", False))
+        or bool(row.get("distribution_reviewed", False))
+    ]
     settings = [
         {"section": "calibration", **dict(manifest["calibration"])},
         {"section": "measurements", **dict(manifest["measurements"]["settings"])},
@@ -130,6 +136,7 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
         "Distribution_Group": distribution_group,
         "Distribution_Excluded": excluded,
         "Invalid_Spines": invalid,
+        "Spine_Review_Audit": reviewed_spines,
         "Group_Summary": _group_summary(specimen),
         "Settings": settings,
     }

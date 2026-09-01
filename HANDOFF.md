@@ -3,7 +3,7 @@
 ## Current state
 
 Synpo is a Python/PySide6 desktop application for paired-channel, registered 3D
-microscopy TIFF stacks. Version `0.6.1` implements:
+microscopy TIFF stacks. Version `0.7.0 Beta` implements:
 
 - Stage 1: batch import, filename parsing, pairing, validation, calibration,
   project manifests, fingerprints, reopening, verification, and relinking;
@@ -20,11 +20,16 @@ microscopy TIFF stacks. Version `0.6.1` implements:
 - Stage 6: calibrated curved-centerline protein distribution, ten voxel-assigned
   shaft-to-tip parts, distribution/invalid-spine review, specimen-weighted group
   profiles with SEM, Excel/CSV exports, and optional validation/audit PDFs
-  (implemented and awaiting user testing).
+  (user-approved);
+- Beta additions: zoomable viewers, expanded sensitivity ranges, precise 3D
+  rotation controls, one-object-per-hint preprocessed-signal resegmentation,
+  cluster-positive and optional cluster-less spine review, numbered full-field
+  spine maps, flexible/manual multi-folder import, per-file relinking, and batch
+  progress bars with approximate ETAs (user-approved).
 
 All settings and actions except the Z slider are in scrollable side panels. Do not
-skip the staged approval process: let the user test Stage 6 and wait for approval
-before proceeding to the remaining final-export work.
+skip the staged approval process. The current beta workflow is approved; wait for
+explicit user direction before expanding the remaining final-export work.
 
 ## Running and testing
 

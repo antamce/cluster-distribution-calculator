@@ -20,7 +20,7 @@ from .detection import detection_cache_path
 from .distribution import calculate_spine_distribution, distribution_row
 from .models import ProgressCallback
 from .preprocessing import ProcessingCancelled, project_cache_path
-from .project import save_project
+from .project import channel_source_path, save_project
 from .review import review_cache_path
 
 
@@ -100,6 +100,17 @@ class DistributionPreview:
     axis_points_local_zyx: tuple[tuple[int, int, int], ...]
     base_point_local_zyx: tuple[int, int, int] | None
     endpoint_local_zyx: tuple[int, int, int] | None
+    crop_origin_yx: tuple[int, int]
+    spine_z_range: tuple[int, int]
+    row: dict[str, object]
+
+
+@dataclass(frozen=True)
+class SpineReviewPreview:
+    dendrite_projection: np.ndarray
+    protein_projection: np.ndarray
+    spine_projection: np.ndarray
+    cluster_projection: np.ndarray
     crop_origin_yx: tuple[int, int]
     spine_z_range: tuple[int, int]
     row: dict[str, object]
@@ -434,6 +445,9 @@ def set_distribution_review(
     decision.update(
         {
             "reviewed": True,
+            "distribution_reviewed": True,
+            "validity_reviewed": True,
+            "review_kind": "cluster_positive",
             "distribution_included": bool(distribution_included and not invalid_spine),
             "invalid_spine": bool(invalid_spine),
             "note": str(note).strip(),
@@ -458,11 +472,67 @@ def set_distribution_review(
         if int(row["spine_id"]) == spine_id:
             row["spine_valid"] = not invalid_spine
             row["validity_note"] = decision["note"] if invalid_spine else ""
+            row["validity_reviewed"] = True
+            row["review_kind"] = "cluster_positive"
     if not found:
         raise ValueError("This spine has no cluster-positive distribution row.")
     _refresh_result_summaries(result)
     _write_result(measurement_result_path(manifest, specimen_index), result)
     specimen["checkpoints"].setdefault("measurements", {})["review_updated_at"] = time.time()
+    save_project(project_path, manifest)
+    return result
+
+
+def set_spine_quality_review(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    spine_id: int,
+    *,
+    invalid_spine: bool,
+    note: str = "",
+) -> dict[str, object]:
+    """Checkpoint a validity decision for a spine without a distribution row."""
+    specimen = manifest["specimens"][specimen_index]
+    reviews = specimen.setdefault(
+        "distribution_review", {"spines": {}, "updated_at": None}
+    ).setdefault("spines", {})
+    decision = reviews.setdefault(str(spine_id), {})
+    decision.update(
+        {
+            "validity_reviewed": True,
+            "review_kind": "cluster_less",
+            "invalid_spine": bool(invalid_spine),
+            "note": str(note).strip(),
+            "updated_at": time.time(),
+        }
+    )
+    specimen["distribution_review"]["updated_at"] = decision["updated_at"]
+    result = load_measurement_result(manifest, specimen_index)
+    found = False
+    for row in result.get("spine_rows", []):
+        if int(row["spine_id"]) == spine_id:
+            if bool(row.get("has_protein_cluster", False)):
+                raise ValueError(
+                    "This spine is now cluster-positive; review it in the protein-positive queue."
+                )
+            row.update(
+                {
+                    "spine_valid": not invalid_spine,
+                    "validity_reviewed": True,
+                    "validity_note": decision["note"] if invalid_spine else decision["note"],
+                    "review_kind": "cluster_less",
+                }
+            )
+            found = True
+            break
+    if not found:
+        raise ValueError("This spine is no longer present in the measurement result.")
+    _refresh_result_summaries(result)
+    _write_result(measurement_result_path(manifest, specimen_index), result)
+    specimen["checkpoints"].setdefault("measurements", {})[
+        "review_updated_at"
+    ] = time.time()
     save_project(project_path, manifest)
     return result
 
@@ -542,6 +612,7 @@ def _recalculate_distribution_spine(
                 }
             )
         decision["reviewed"] = False
+        decision["distribution_reviewed"] = False
     decision["centerline_endpoint_hint_valid"] = hint_valid
     xy_size = float(manifest["calibration"]["xy_um_per_pixel"])
     z_step = float(manifest["calibration"]["z_step_um"])
@@ -563,7 +634,12 @@ def _recalculate_distribution_spine(
     )
     recalculated.update(
         {
-            "distribution_reviewed": bool(decision.get("reviewed", row.get("distribution_reviewed", False))),
+            "distribution_reviewed": bool(
+                decision.get(
+                    "distribution_reviewed",
+                    decision.get("reviewed", row.get("distribution_reviewed", False)),
+                )
+            ),
             "distribution_included": bool(row.get("distribution_included", False)),
             "spine_valid": bool(row.get("spine_valid", True)),
             "review_note": str(decision.get("note", row.get("review_note", ""))),
@@ -790,10 +866,7 @@ def load_cluster_trim_preview(
     role_channels = {role: channel for channel, role in manifest["channel_roles"].items()}
     protein_channel = role_channels["protein_clusters"]
     specimen = manifest["specimens"][specimen_index]
-    source = (
-        Path(str(manifest["source_directory"]))
-        / specimen["channels"][protein_channel]["filename"]
-    )
+    source = channel_source_path(manifest, specimen["channels"][protein_channel])
     with tifffile.TiffFile(source) as tiff:
         series = tiff.series[0]
         for z_index in range(z_count):
@@ -908,7 +981,7 @@ def load_distribution_preview(
     dendrite_stack = np.zeros(spine.shape, dtype=np.uint16)
     for role in ("dendrite_spines", "protein_clusters"):
         channel = role_channels[role]
-        source = Path(str(manifest["source_directory"])) / specimen["channels"][channel]["filename"]
+        source = channel_source_path(manifest, specimen["channels"][channel])
         projection = np.zeros(spine.shape[1:], dtype=np.uint16)
         try:
             stack = np.squeeze(tifffile.memmap(source))
@@ -970,6 +1043,79 @@ def load_distribution_preview(
         endpoint_local_zyx=endpoint_local,
         crop_origin_yx=(y_slice.start, x_slice.start),
         spine_z_range=z_range,
+        row=dict(row),
+    )
+
+
+def load_spine_review_preview(
+    manifest: dict[str, object],
+    specimen_index: int,
+    spine_id: int,
+    *,
+    margin_um: float = 1.0,
+) -> SpineReviewPreview:
+    """Load a compact two-channel crop for validity review of any spine."""
+    result = load_measurement_result(manifest, specimen_index)
+    row = next(
+        (item for item in result.get("spine_rows", []) if int(item["spine_id"]) == spine_id),
+        None,
+    )
+    if row is None:
+        raise ValueError("This spine is no longer present in the measurement result.")
+    editable, detection, _corrected, _signature = _mask_sources(
+        manifest, specimen_index
+    )
+    labels = editable["spine_labels"]
+    z_count, y_count, x_count = (int(value) for value in labels.shape)
+    z_min, z_max = z_count, -1
+    y_min, y_max = y_count, -1
+    x_min, x_max = x_count, -1
+    for z_index in range(z_count):
+        yy, xx = np.nonzero(np.asarray(labels[z_index]) == spine_id)
+        if not len(xx):
+            continue
+        z_min = min(z_min, z_index)
+        z_max = max(z_max, z_index)
+        y_min = min(y_min, int(yy.min()))
+        y_max = max(y_max, int(yy.max()))
+        x_min = min(x_min, int(xx.min()))
+        x_max = max(x_max, int(xx.max()))
+    if z_max < 0:
+        raise ValueError("The selected spine is no longer present in the saved masks.")
+    xy_size = float(manifest["calibration"]["xy_um_per_pixel"])
+    margin = max(0, int(np.ceil(margin_um / xy_size)))
+    y_slice = slice(max(0, y_min - margin), min(y_count, y_max + margin + 1))
+    x_slice = slice(max(0, x_min - margin), min(x_count, x_max + margin + 1))
+    spine_stack = np.asarray(labels[:, y_slice, x_slice], dtype=np.uint32)
+    cluster_stack = np.asarray(
+        detection["cluster_labels"][:, y_slice, x_slice], dtype=np.uint32
+    )
+
+    role_channels = {role: channel for channel, role in manifest["channel_roles"].items()}
+    specimen = manifest["specimens"][specimen_index]
+    projections: dict[str, np.ndarray] = {}
+    for role in ("dendrite_spines", "protein_clusters"):
+        channel = role_channels[role]
+        source = channel_source_path(manifest, specimen["channels"][channel])
+        try:
+            stack = np.squeeze(tifffile.memmap(source))
+        except ValueError:
+            stack = np.squeeze(tifffile.imread(source, out="memmap"))
+        cropped = (
+            np.asarray(stack[y_slice, x_slice], dtype=np.uint16)[None]
+            if stack.ndim == 2
+            else np.asarray(stack[:, y_slice, x_slice], dtype=np.uint16)
+        )
+        projections[role] = np.max(cropped, axis=0).astype(np.uint16, copy=False)
+    return SpineReviewPreview(
+        dendrite_projection=projections["dendrite_spines"],
+        protein_projection=projections["protein_clusters"],
+        spine_projection=np.max(
+            np.where(spine_stack == spine_id, spine_id, 0), axis=0
+        ).astype(np.uint32),
+        cluster_projection=np.max(cluster_stack, axis=0).astype(np.uint32),
+        crop_origin_yx=(y_slice.start, x_slice.start),
+        spine_z_range=(z_min, z_max),
         row=dict(row),
     )
 
@@ -1198,6 +1344,7 @@ def measure_specimen(
                         }
                     )
                 decision["reviewed"] = False
+                decision["distribution_reviewed"] = False
         decision["centerline_endpoint_hint_valid"] = hint_valid
         calculated = calculate_spine_distribution(
             local_spine,
@@ -1221,7 +1368,9 @@ def measure_specimen(
         }
         row.update(
             {
-                "distribution_reviewed": bool(decision.get("reviewed", False)),
+                "distribution_reviewed": bool(
+                    decision.get("distribution_reviewed", decision.get("reviewed", False))
+                ),
                 "distribution_included": bool(
                     decision.get("distribution_included", default_include)
                 ),
@@ -1276,6 +1425,18 @@ def measure_specimen(
                 ),
                 "spine_valid": not bool(
                     saved_reviews.get(str(spine_id), {}).get("invalid_spine", False)
+                ),
+                "validity_reviewed": bool(
+                    saved_reviews.get(str(spine_id), {}).get(
+                        "validity_reviewed",
+                        saved_reviews.get(str(spine_id), {}).get("reviewed", False),
+                    )
+                ),
+                "validity_note": str(
+                    saved_reviews.get(str(spine_id), {}).get("note", "")
+                ),
+                "review_kind": str(
+                    saved_reviews.get(str(spine_id), {}).get("review_kind", "")
                 ),
             }
         )
@@ -1427,7 +1588,16 @@ def measure_project(
     if not eligible:
         raise ValueError("No detected specimens are ready for measurement.")
     summaries: list[dict[str, object]] = []
-    for position, specimen_index in enumerate(eligible):
+    work_units: dict[int, int] = {}
+    for specimen_index in eligible:
+        editable, _detection, _corrected, _signature = _mask_sources(
+            manifest, specimen_index
+        )
+        z_count = int(editable["spine_labels"].shape[0])
+        work_units[specimen_index] = z_count * 2
+    total_work = sum(work_units.values())
+    completed_work = 0
+    for specimen_index in eligible:
         _cancel_if_requested(cancel_event)
         specimen = manifest["specimens"][specimen_index]
         checkpoint = specimen["checkpoints"].setdefault("measurements", {})
@@ -1437,8 +1607,8 @@ def measure_project(
             if progress:
                 progress(
                     phase,
-                    position * total + current,
-                    len(eligible) * total,
+                    completed_work + min(current, work_units[specimen_index]),
+                    total_work,
                     detail,
                 )
 
@@ -1460,4 +1630,19 @@ def measure_project(
         )
         save_project(project_path, manifest)
         summaries.append(asdict(summary))
+        completed_work += work_units[specimen_index]
+        if progress:
+            progress(
+                "Measurement checkpoint",
+                completed_work,
+                total_work,
+                f"{specimen['specimen_id']} saved",
+            )
+    if progress:
+        progress(
+            "Measurements complete",
+            total_work,
+            total_work,
+            f"{len(eligible)} specimen pair(s) checkpointed",
+        )
     return {"settings": settings.to_dict(), "summaries": summaries}

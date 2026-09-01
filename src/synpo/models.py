@@ -92,6 +92,7 @@ class SpecimenPair:
     specimen_id: str
     channels: dict[str, ChannelFile] = field(default_factory=dict)
     issues: list[ImportIssue] = field(default_factory=list)
+    import_mode: str = "strict"
 
     @property
     def valid(self) -> bool:
@@ -126,6 +127,11 @@ class ScanReport:
     source_directory: Path
     pairs: list[SpecimenPair]
     issues: list[ImportIssue] = field(default_factory=list)
+    import_mode: str = "strict"
+    channel_markers: dict[str, str] = field(
+        default_factory=lambda: {"ChanA": "ChanA", "ChanB": "ChanB"}
+    )
+    default_experimental_group: str = "Experiment"
 
     @property
     def valid(self) -> bool:

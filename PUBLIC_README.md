@@ -4,44 +4,48 @@
   <img src="src/synpo/assets/synpo-icon.png" alt="Synpo icon" width="180">
 </p>
 
-Synpo is a Windows desktop application for processing paired-channel, 3D microscopy recordings of dendrites, dendritic spines, and protein clusters. It supports batch import, preprocessing, automatic segmentation, optional guided corrections, measurement, distribution review, and tabular export.
+Synpo is a Windows desktop application for processing paired-channel, 3D microscopy recordings of dendrites, dendritic spines, and protein clusters. It supports large batches from TIFF import through preprocessing, automatic 3D segmentation, optional guided correction, measurement, spine-distribution review, and Excel/CSV export.
 
-This is an alpha release intended for supervised scientific use. Review segmentation and centerline results before relying on exported measurements.
+This is the **0.7.0 beta release**. It is intended for supervised scientific use: review segmentation and centerline results before relying on exported measurements.
 
-## What Synpo does
+## Main features
 
-- Imports folders containing paired, registered 16-bit TIFF Z-stacks.
-- Automatically pairs channel A and channel B files and organizes specimens by experimental group.
-- Applies adaptive, per-stack background correction and smoothing without altering the source TIFFs.
-- Detects dendrites, spines, and protein clusters in 3D.
-- Lets you review Z slices, maximum projections, linked XZ/YZ views, and cropped rotatable 3D surfaces.
-- Supports optional drawing hints for local resegmentation rather than requiring hand-drawn masks.
-- Measures dendrites, individual spines, and qualifying clusters using the original 16-bit intensities.
-- Measures protein distribution in ten equal-length parts along each spine's curved centerline.
-- Lets you correct a spine's distal centerline endpoint with a single optional point hint.
+- Imports registered, paired 16-bit TIFF Z-stacks with identical dimensions.
+- Supports the original metadata filename schema, configurable channel markers such as `cy`/`cl`, and manually selected A/B files from the same or different folders.
+- Organizes parsed specimens into experimental groups; metadata-free batches can use one editable fallback group.
+- Applies adaptive per-stack background correction, threshold estimation, and Gaussian smoothing without modifying source TIFFs.
+- Detects dendrites, closely touching spine candidates, and protein-cluster candidates in 3D.
+- Shows scrollable Z slices, XY/XZ/YZ maximum projections, linked orthogonal views, zoom/pan controls, and cropped rotatable 3D surfaces.
+- Provides separate X/Y/Z rotation controls, adjustable Z-layer spacing, colors, and surface opacity for publication-oriented 3D snapshots.
+- Accepts optional drawing hints for local resegmentation. Each missed-object hint produces a separate object whose boundary follows the preprocessed image signal.
+- Measures dendrites, individual spines, and qualifying clusters. Intensity measurements always use the original 16-bit voxels.
+- Measures protein distribution in ten equal-length parts along each spine's curved 3D centerline.
+- Allows an optional point hint to correct the distal centerline endpoint while preserving the automatically detected base.
+- Provides protein-cluster-positive and optional cluster-less spine review, invalid-spine exclusion, stable spine numbering, full-field context, and a filterable numbered spine map.
 - Displays experimental-group distribution profiles with SEM error bars.
-- Exports Excel and CSV tables, settings, audit information, and optional validation PDFs.
+- Shows responsive batch progress bars with completed work, elapsed time, and a rough remaining-time estimate for preprocessing, detection, and measurement.
+- Exports verified Excel and CSV tables, settings, audit information, and optional validation PDFs.
 
-Synpo calculates measurements only; statistical hypothesis testing should be performed in separate statistics software.
+Synpo calculates measurements only. Perform statistical hypothesis testing in separate statistics software.
 
 ## Requirements
 
 - Windows 10 or Windows 11
 - Anaconda or Miniconda
-- Enough free disk space for a compressed processing cache and exported results
+- Sufficient free disk space for the compressed project cache and exports
 
-The application is designed to work on ordinary laptop hardware and limits itself to at most 80% of available RAM. A macOS build is not included in this alpha release.
+Synpo is designed for ordinary laptop hardware and limits itself to at most 80% of available RAM. A macOS build is not included in this beta release.
 
 ## Installation
 
-Download or clone this repository, then open an **Anaconda Prompt** in its folder and run:
+Download or clone this repository. Open an **Anaconda Prompt** in the downloaded folder and run:
 
 ```powershell
 conda env create -f environment.yml
 launch_synpo.bat
 ```
 
-The environment is named `synpo-microscopy`. If it already exists, update it with:
+The environment is named `synpo-microscopy`. If it already exists, update it before launching:
 
 ```powershell
 conda env update -n synpo-microscopy -f environment.yml --prune
@@ -50,69 +54,96 @@ launch_synpo.bat
 
 The launcher also works when `conda` is not recognized in an ordinary Command Prompt, provided Miniconda or Anaconda is installed in its usual location.
 
-To create a Synpo desktop shortcut with the supplied icon, run:
+To create a Synpo desktop shortcut with the supplied icon, run once:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\create_desktop_shortcut.ps1
 ```
 
-## Input files
+## Importing TIFF files
 
-Place all TIFFs for one batch directly in a single folder. Each specimen must have a registered channel pair with identical dimensions:
+All recordings must be registered 3D stacks. The two files in a specimen pair must have identical dimensions.
+
+Synpo supports three import methods.
+
+### Original metadata filenames
 
 ```text
 <batch prefix>_<experimental group>_<specimen ID>_ChanA_registered.tif
 <batch prefix>_<experimental group>_<specimen ID>_ChanB_registered.tif
 ```
 
-In the current workflow:
+### Configurable channel markers
 
-- Channel A contains protein clusters.
-- Channel B contains dendrites and spines.
+Enter the marker used for each channel before scanning a folder. For example, markers `cy` and `cl` pair:
 
-Channel roles can be confirmed for each batch. Always confirm the XY pixel size and Z step when starting a project; TIFF calibration metadata can be overridden and named presets can be reused.
+```text
+Untitled001cy.tif
+Untitled001cl.tif
+```
+
+When the other metadata fields are absent, the batch is placed in the selected fallback experimental group and the paired filename becomes the editable specimen name. The `_registered` flag is optional in this mode.
+
+### Manual pairing
+
+Select **Manually choose one Channel A file and one Channel B file** to pair two individual TIFFs. The files may be in different folders. Synpo stores and verifies each source path independently; relinking can search a selected parent folder and its subfolders.
+
+Channel roles are confirmed for every batch. By default, Channel A contains protein clusters and Channel B contains dendrites and spines. Always confirm the XY pixel size and Z step when starting a project; TIFF calibration metadata can be overridden and named presets reused.
 
 ## Typical workflow
 
-1. Select the folder containing the paired TIFF stacks.
-2. Confirm channel roles, voxel calibration, and output location.
-3. Review the automatically paired files and parsed experimental groups.
-4. Tune preprocessing on one or more representative specimens.
-5. Preprocess the batch and run automatic detection.
-6. Review detected specimens and optionally apply local corrections.
-7. Review spine distributions, then export results.
+1. Select and scan a TIFF folder, or manually choose one channel pair.
+2. Confirm channel markers and roles, voxel calibration, experimental groups, specimen names, and output location.
+3. Tune preprocessing on one or more representative specimens.
+4. Preprocess the entire batch and run automatic detection.
+5. Review detected specimens and optionally apply local corrections.
+6. Calculate measurements and review protein-cluster-positive spines.
+7. Optionally review cluster-less spines and exclude invalid detections.
+8. Export the workbook, CSV tables, and any requested validation PDFs.
 
-Automatic checkpoints are written after preprocessing, detection, and review. Detection can continue in the background while completed specimens become available for correction.
+Automatic checkpoints are written throughout preprocessing, detection, correction, and measurement. Completed specimens remain available if a later batch operation is cancelled or interrupted.
 
-## Centerline endpoint hints
+## Review and visualization
 
-The distribution-review screen normally uses the automatically detected base and distal endpoint. If a centerline is already correct, no action is required.
+The correction canvas can show an individual Z slice or a drawable XY maximum projection. Drawn hints are instructions rather than final masks. Add, exclude, split, merge, expand, and trim operations run local image-guided resegmentation. Multiple missed-object hints remain separate objects. Protein clusters are detected automatically and are not manually redrawn.
 
-To correct only its distal endpoint:
+Maximum projections and 3D context are available during detection and correction. Before creating a 3D surface, select a rectangular area on the XY projection to control memory use. Dendrite and spine surfaces can be translucent while protein clusters remain opaque. Colors, opacity, rotation on all three axes, and displayed Z spacing are adjustable; these display settings never alter masks or measurements.
+
+## Spine distribution review
+
+Protein-cluster-positive spines are divided voxel-by-voxel into ten parts along a calibrated curved centerline from the shaft contact to the distal endpoint. For each part, Synpo saves spine volume, inside-cluster volume, and their ratio.
+
+If the automatic centerline endpoint is correct, no action is required. Otherwise:
 
 1. Select **Centerline end hint**.
-2. Use the cropped Z viewer; its slider is limited to slices occupied by the current spine.
+2. Use the cropped Z viewer, whose slider is limited to slices occupied by that spine.
 3. Click the desired distal endpoint on the spine.
 
-The point snaps to the nearest voxel belonging to that spine, the curved centerline is rebuilt from the automatic base, and the view returns to the maximum projection. **Clear end hint** restores automatic endpoint detection. Status messages appear without interrupting review.
+The point snaps to the nearest voxel belonging to the selected spine, the centerline is rebuilt from the automatic base, and the review returns to the maximum projection. **Clear end hint** restores automatic endpoint detection.
+
+Clicking either cropped channel view opens the full-specimen projection with the current spine highlighted. **Open numbered spine map** shows all stable spine IDs with zoom, optional single-Z viewing, and filters for cluster-positive, cluster-less, valid, or invalid spines.
+
+Cluster-less spine review is optional and never blocks export. Marking a spine invalid excludes it from all subsequent metrics, including spine density and the protein-inclusion percentage denominator, while preserving an auditable decision row.
 
 ## Results
 
-The verified export includes:
+The verified export contains:
 
-- An Excel workbook containing specimen-, dendrite-, spine-, cluster-, and distribution-level sheets.
-- CSV copies of the workbook tables.
-- Individual ten-part distributions for every qualifying spine.
-- Specimen and experimental-group summaries, including counts, means, variability, and inclusion percentages.
-- Settings and review/audit records needed to interpret the result.
-- Optional two-panel PDF pages showing each reviewed spine and its distribution profile.
+- Master specimen-, dendrite-, spine-, and cluster-level measurements.
+- One row per individual included cluster plus per-spine cluster sums.
+- Individual ten-part protein distributions for every qualifying spine.
+- Specimen and experimental-group summaries with counts, means, variability, inclusion percentages, and SEM profiles.
+- Excluded-distribution, invalid-spine, and spine-review audit tables.
+- Calibration, measurement, and distribution settings.
+- Optional two-panel PDF pages showing reviewed spines and distribution profiles.
 
-Source TIFFs are never modified. Intensity-based measurements always use their original 16-bit voxel values. The compressed project cache can be removed after final export has been verified.
+Source TIFFs are never modified. The compressed project cache can be removed after final export has been verified.
 
-## Alpha-release notes
+## Beta-release notes
 
 - Closely touching structures and unusual morphology may require review or correction.
 - Filopodia are retained as candidates and can be excluded during review.
-- Parts of somata and axons should be excluded with review tools when automatically retained.
-- Segmentation-mask and ImageJ ROI ZIP export are not yet included in this alpha release.
+- Automatically retained somata and axons should be removed with the correction tools.
+- Remaining-time estimates are approximate and stabilize after several slices or specimens.
+- Segmentation-mask and ImageJ ROI ZIP export are not yet included in this beta release.
 - Report problems or suggestions through this repository's GitHub Issues page.
