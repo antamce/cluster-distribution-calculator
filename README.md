@@ -7,7 +7,7 @@ review. Raw TIFFs are never modified or copied.
 
 ## Current project status
 
-The current version is `0.7.0 Beta`. The end-to-end workflow through flexible
+The current version is `0.8.0 Beta`. The end-to-end workflow through flexible
 import, preprocessing, detection, correction, measurement, spine review, and
 tabular/PDF export is user-approved. See [HANDOFF.md](HANDOFF.md) for architecture,
 scientific constraints, and development history.
@@ -245,7 +245,12 @@ final-export stage.
 
 ## Beta workflow additions
 
-Version 0.7.0 adds zoomable preprocessing, detection, correction, projection, and
+Version 0.8.0 adds automatic low-memory detection for stacks that exceed the RAM
+safety ceiling, a per-project option to use that strategy for every specimen,
+cross-slab object reconciliation, disk-space preflight, retryable skipped/failed
+states, and specimen-level batch failure isolation.
+
+Version 0.7.0 added zoomable preprocessing, detection, correction, projection, and
 spine-context views; larger sensitivity ranges; independent X/Y/Z 3D rotation
 controls; and screen-aware persistent window sizing. Missed-object correction
 strokes now produce separate objects and use preprocessed signal for image-guided

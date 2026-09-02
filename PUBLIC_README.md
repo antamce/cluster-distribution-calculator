@@ -6,7 +6,7 @@
 
 Synpo is a Windows desktop application for processing paired-channel, 3D microscopy recordings of dendrites, dendritic spines, and protein clusters. It supports large batches from TIFF import through preprocessing, automatic 3D segmentation, optional guided correction, measurement, spine-distribution review, and Excel/CSV export.
 
-This is the **0.7.0 beta release**. It is intended for supervised scientific use: review segmentation and centerline results before relying on exported measurements.
+This is the **0.8.0 beta release**. It is intended for supervised scientific use: review segmentation and centerline results before relying on exported measurements.
 
 ## Main features
 
