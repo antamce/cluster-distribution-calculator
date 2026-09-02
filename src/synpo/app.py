@@ -62,6 +62,8 @@ from .preprocessing import (
     process_project_cache,
 )
 from .detection import (
+    ALWAYS_LOW_MEMORY_MODE,
+    AUTOMATIC_MEMORY_MODE,
     DetectionSettings,
     DetectionSlice,
     detect_project,
@@ -2762,6 +2764,18 @@ class MainWindow(QMainWindow):
         settings_layout.addRow(
             "Minimum protein-cluster volume (voxels):", self.minimum_cluster_voxels
         )
+        self.detection_memory_mode = QComboBox()
+        self.detection_memory_mode.addItem(
+            "Automatic (fast when safe)", AUTOMATIC_MEMORY_MODE
+        )
+        self.detection_memory_mode.addItem(
+            "Always use low-memory detection", ALWAYS_LOW_MEMORY_MODE
+        )
+        self.detection_memory_mode.setToolTip(
+            "Automatic mode switches large specimens to slower disk-backed detection. "
+            "This execution setting does not invalidate completed masks."
+        )
+        settings_layout.addRow("Memory strategy:", self.detection_memory_mode)
         self.apply_detection_button = QPushButton("Save these detection settings")
         self.apply_detection_button.setMinimumHeight(34)
         self.apply_detection_button.clicked.connect(self._apply_detection_settings)
@@ -3782,6 +3796,11 @@ class MainWindow(QMainWindow):
             widget.setValue(value)
             widget.blockSignals(False)
         self._update_sensitivity_warnings()
+        memory_mode = str(
+            self.manifest["detection"].get("memory_mode", AUTOMATIC_MEMORY_MODE)
+        )
+        memory_index = self.detection_memory_mode.findData(memory_mode)
+        self.detection_memory_mode.setCurrentIndex(max(0, memory_index))
 
         current = self.detection_specimen.currentData()
         self.detection_specimen.blockSignals(True)
@@ -3813,9 +3832,18 @@ class MainWindow(QMainWindow):
             specimen["checkpoints"]["detection"].get("state") == "complete"
             for specimen in self.manifest["specimens"]
         )
+        skipped = sum(
+            specimen["checkpoints"]["detection"].get("state") == "skipped"
+            for specimen in self.manifest["specimens"]
+        )
+        failed = sum(
+            specimen["checkpoints"]["detection"].get("state") == "failed"
+            for specimen in self.manifest["specimens"]
+        )
         self.detection_status.setText(
             f"Detection checkpoints: {complete}/{len(self.manifest['specimens'])} complete; "
-            f"{eligible} pair(s) currently eligible. Automatic candidates remain unreviewed."
+            f"{skipped} skipped; {failed} failed; {eligible} pair(s) currently eligible. "
+            "Skipped and failed specimens are retried on the next run."
         )
         if self._job_thread is None:
             self.apply_detection_button.setEnabled(True)
@@ -3842,6 +3870,9 @@ class MainWindow(QMainWindow):
             self.manifest["detection"]["settings"] = (
                 self._current_detection_settings().to_dict()
             )
+            self.manifest["detection"]["memory_mode"] = str(
+                self.detection_memory_mode.currentData() or AUTOMATIC_MEMORY_MODE
+            )
             save_project(self.project_path, self.manifest)
             self.detection_status.setText(
                 "Detection settings saved. Running again will replace stale automatic masks."
@@ -3857,6 +3888,9 @@ class MainWindow(QMainWindow):
             self._sync_manifest_edits()
             self.manifest["detection"]["settings"] = (
                 self._current_detection_settings().to_dict()
+            )
+            self.manifest["detection"]["memory_mode"] = str(
+                self.detection_memory_mode.currentData() or AUTOMATIC_MEMORY_MODE
             )
             save_project(self.project_path, self.manifest)
         except (ValueError, OSError) as exc:
@@ -3880,12 +3914,35 @@ class MainWindow(QMainWindow):
     def _detection_pair_completed(
         self, specimen_index: int, summary: dict[str, object]
     ) -> None:
+        outcome = str(summary.get("outcome", "complete"))
+        if outcome != "complete":
+            specimen = self.manifest["specimens"][specimen_index]
+            self.detection_status.setText(
+                f"Pair {specimen_index + 1} {outcome}: "
+                f"{summary.get('reason', 'Unknown error')}. Detection continues."
+            )
+            row = self.detection_specimen.findData(specimen_index)
+            if row >= 0:
+                self.detection_specimen.setItemText(
+                    row,
+                    f"{specimen['experimental_group']} / {specimen['specimen_id']} "
+                    f"[{outcome}]",
+                )
+            if self.detection_specimen.currentData() == specimen_index:
+                self._detection_specimen_changed()
+            return
         if not bool(summary.get("skipped", False)):
             self._invalidate_context_views(specimen_index, corrected_only=False)
         self.detection_status.setText(
             f"Completed pair {specimen_index + 1}: {summary['dendrite_count']} dendrite "
             f"field(s), {summary['spine_count']} spine candidates, "
             f"{summary['cluster_count']} cluster candidates. Detection continues in background."
+        )
+        mode = str(summary.get("processing_mode", "standard")).replace("_", " ")
+        reused = "reused, " if bool(summary.get("reused", False)) else ""
+        self.detection_status.setText(
+            f"Completed pair {specimen_index + 1} ({reused}{mode}). "
+            "Detection continues in the background."
         )
         row = self.detection_specimen.findData(specimen_index)
         if row >= 0:
@@ -3902,8 +3959,10 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _detection_completed(self, result: dict[str, object]) -> None:
         self.detection_status.setText(
-            f"Automatic detection complete for {result['eligible_pairs']} pair(s) in "
-            f"{float(result['elapsed_seconds']) / 60:.1f} min. All candidates are awaiting review."
+            f"Detection batch finished in {float(result['elapsed_seconds']) / 60:.1f} min: "
+            f"{result['completed_pairs']} complete "
+            f"({result['low_memory_pairs']} newly processed in low-memory mode), "
+            f"{result['skipped_pairs']} skipped, {result['failed_pairs']} failed."
         )
         self._prepare_detection_tab()
         self._prepare_review_tab()
@@ -3950,8 +4009,13 @@ class MainWindow(QMainWindow):
             self.detection_projections_button.setEnabled(False)
             self.detection_3d_button.setEnabled(False)
             self._last_detection = None
-            self.detection_counts.setText("No completed detection for this specimen.")
-            self.detection_view.setText("Detection is not complete for this specimen.")
+            state = str(checkpoint.get("state", "not_started"))
+            reason = str(checkpoint.get("reason", "")).strip()
+            detail = f" Reason: {reason}" if reason else ""
+            self.detection_counts.setText(f"Detection state: {state}.{detail}")
+            self.detection_view.setText(
+                f"Detection is not complete for this specimen.{detail}"
+            )
 
     def _detection_z_changed(self, value: int) -> None:
         self.detection_z_label.setText(

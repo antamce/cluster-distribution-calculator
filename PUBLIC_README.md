@@ -15,6 +15,7 @@ This is the **0.7.0 beta release**. It is intended for supervised scientific use
 - Organizes parsed specimens into experimental groups; metadata-free batches can use one editable fallback group.
 - Applies adaptive per-stack background correction, threshold estimation, and Gaussian smoothing without modifying source TIFFs.
 - Detects dendrites, closely touching spine candidates, and protein-cluster candidates in 3D.
+- Automatically switches oversized specimens to slower disk-backed detection when the ordinary method would exceed the project's 80% RAM ceiling. A per-project setting can use low-memory detection for every specimen.
 - Shows scrollable Z slices, XY/XZ/YZ maximum projections, linked orthogonal views, zoom/pan controls, and cropped rotatable 3D surfaces.
 - Provides separate X/Y/Z rotation controls, adjustable Z-layer spacing, colors, and surface opacity for publication-oriented 3D snapshots.
 - Accepts optional drawing hints for local resegmentation. Each missed-object hint produces a separate object whose boundary follows the preprocessed image signal.
@@ -32,9 +33,9 @@ Synpo calculates measurements only. Perform statistical hypothesis testing in se
 
 - Windows 10 or Windows 11
 - Anaconda or Miniconda
-- Sufficient free disk space for the compressed project cache and exports
+- Sufficient free disk space for the compressed project cache, exports, and temporary low-memory detection data
 
-Synpo is designed for ordinary laptop hardware and limits itself to at most 80% of available RAM. A macOS build is not included in this beta release.
+Synpo is designed for ordinary laptop hardware and limits itself to at most 80% of available RAM. Large stacks are processed with a disk-backed Z-slab method that merges objects crossing slab boundaries. Synpo checks the required temporary space before starting each such specimen. If space is insufficient, that specimen remains retryable and the rest of the batch continues. A macOS build is not included in this beta release.
 
 ## Installation
 
@@ -102,6 +103,8 @@ Channel roles are confirmed for every batch. By default, Channel A contains prot
 8. Export the workbook, CSV tables, and any requested validation PDFs.
 
 Automatic checkpoints are written throughout preprocessing, detection, correction, and measurement. Completed specimens remain available if a later batch operation is cancelled or interrupted.
+
+Detection uses **Automatic (fast when safe)** by default. Choose **Always use low-memory detection** in Stage 3 to use the disk-backed method for every pending specimen in that project. This execution choice does not invalidate completed masks. Detection reports completed, low-memory, skipped, and failed specimens separately; skipped or failed specimens are retried when the batch is run again.
 
 ## Review and visualization
 

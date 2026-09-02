@@ -36,6 +36,7 @@ def default_preprocessing_manifest() -> dict[str, object]:
 def default_detection_manifest() -> dict[str, object]:
     return {
         "algorithm_version": 2,
+        "memory_mode": "automatic",
         "settings": {
             "dendrite_sensitivity": 1.25,
             "cluster_sensitivity": 0.65,
@@ -81,6 +82,7 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     manifest.setdefault("resource_policy", {"maximum_ram_fraction": 0.8})
     manifest.setdefault("preprocessing", default_preprocessing_manifest())
     manifest.setdefault("detection", default_detection_manifest())
+    manifest["detection"].setdefault("memory_mode", "automatic")
     review_settings = manifest.setdefault("review_settings", default_review_manifest())
     review_settings["algorithm_version"] = 2
     review_settings.setdefault("add_z_radius_slices", 6)

@@ -11,7 +11,7 @@ from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import QApplication
 
 from synpo.app import MainWindow, SliceView, SpineMapView
-from synpo.detection import DetectionSettings
+from synpo.detection import ALWAYS_LOW_MEMORY_MODE, DetectionSettings
 from synpo.preprocessing import PreprocessingSettings
 
 
@@ -71,6 +71,9 @@ class Stage7AUiTests(unittest.TestCase):
         self.assertEqual(window.sensitivity_spin.maximum(), 10.0)
         self.assertEqual(window.dendrite_detection_sensitivity.maximum(), 10.0)
         self.assertEqual(window.cluster_detection_sensitivity.maximum(), 10.0)
+        self.assertEqual(
+            window.detection_memory_mode.itemData(1), ALWAYS_LOW_MEMORY_MODE
+        )
         window.sensitivity_spin.setValue(3.5)
         window.cluster_detection_sensitivity.setValue(4.0)
         self.assertIn("High-sensitivity", window.preprocessing_sensitivity_warning.text())

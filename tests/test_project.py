@@ -97,6 +97,7 @@ class ProjectTests(unittest.TestCase):
             manifest["specimens"][0]["checkpoints"]["preprocessing"] = "not_started"
             loaded = load_project(save_project(root / "old.synpo.json", manifest))
             self.assertIn("preprocessing", loaded)
+            self.assertEqual(loaded["detection"]["memory_mode"], "automatic")
             self.assertIsInstance(
                 loaded["specimens"][0]["checkpoints"]["preprocessing"], dict
             )

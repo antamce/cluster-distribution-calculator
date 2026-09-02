@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -24,6 +25,30 @@ from .project import channel_source_path, save_project
 
 
 ALGORITHM_VERSION = 2
+AUTOMATIC_MEMORY_MODE = "automatic"
+ALWAYS_LOW_MEMORY_MODE = "always_low_memory"
+VALID_MEMORY_MODES = {AUTOMATIC_MEMORY_MODE, ALWAYS_LOW_MEMORY_MODE}
+_MIB = 1024 * 1024
+
+
+class InsufficientDetectionDiskSpace(OSError):
+    def __init__(self, required_bytes: int, free_bytes: int) -> None:
+        self.required_bytes = int(required_bytes)
+        self.free_bytes = int(free_bytes)
+        super().__init__(
+            "Low-memory detection needs "
+            f"{_format_bytes(self.required_bytes)} of free temporary space, but only "
+            f"{_format_bytes(self.free_bytes)} is available."
+        )
+
+
+def _format_bytes(value: int) -> str:
+    amount = float(max(0, value))
+    for suffix in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024.0 or suffix == "TiB":
+            return f"{amount:.1f} {suffix}"
+        amount /= 1024.0
+    return f"{amount:.1f} TiB"
 
 
 @dataclass(frozen=True)
@@ -81,6 +106,7 @@ class DetectionSummary:
     flagged_cluster_count: int
     elapsed_seconds: float
     skipped: bool = False
+    processing_mode: str = "standard"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -133,19 +159,82 @@ def _role_channels(manifest: dict[str, object]) -> tuple[str, str]:
         raise ValueError("The project must assign one dendrite/spine and one protein channel.") from exc
 
 
-def _enforce_ram_policy(
-    shape: tuple[int, int, int], maximum_ram_fraction: float
-) -> None:
+def _validate_ram_fraction(maximum_ram_fraction: float) -> None:
     if not 0 < maximum_ram_fraction <= 0.8:
         raise ValueError("Maximum RAM fraction must be greater than zero and no more than 0.8.")
+
+
+def _standard_detection_extra_bytes(shape: tuple[int, int, int]) -> int:
     voxels = int(np.prod(shape))
-    estimated_extra = voxels * 12 + shape[1] * shape[2] * 48 + 256 * 1024 * 1024
+    return voxels * 12 + shape[1] * shape[2] * 48 + 256 * _MIB
+
+
+def _standard_detection_fits(
+    shape: tuple[int, int, int], maximum_ram_fraction: float
+) -> bool:
+    _validate_ram_fraction(maximum_ram_fraction)
+    estimated_extra = _standard_detection_extra_bytes(shape)
+    limit = int(psutil.virtual_memory().total * maximum_ram_fraction)
+    return psutil.Process().memory_info().rss + estimated_extra <= limit
+
+
+def _enforce_low_memory_projection_policy(
+    shape: tuple[int, int, int], maximum_ram_fraction: float
+) -> None:
+    _validate_ram_fraction(maximum_ram_fraction)
+    # The scientific dendrite/spine algorithm operates on a 2-D projection. The
+    # source volume is streamed, but these 2-D working arrays must still fit.
+    estimated_extra = shape[1] * shape[2] * 64 + 192 * _MIB
     limit = int(psutil.virtual_memory().total * maximum_ram_fraction)
     if psutil.Process().memory_info().rss + estimated_extra > limit:
         raise MemoryError(
-            "Detection would exceed Synpo's RAM safety limit for this stack. "
-            "Close other Synpo views or process on a device with more RAM."
+            "Even low-memory detection cannot safely hold this stack's XY projection "
+            "within Synpo's RAM limit. Close other Synpo views and try again."
         )
+
+
+def _low_memory_required_disk_bytes(shape: tuple[int, int, int]) -> int:
+    # Three final uint32 masks plus one provisional uint32 component volume,
+    # with a conservative allowance for metadata and poorly compressible data.
+    return int(np.prod(shape)) * 16 + 512 * _MIB
+
+
+def _preflight_low_memory_disk(path: Path, shape: tuple[int, int, int]) -> tuple[int, int]:
+    path.mkdir(parents=True, exist_ok=True)
+    required = _low_memory_required_disk_bytes(shape)
+    free = int(shutil.disk_usage(path).free)
+    if free < required:
+        raise InsufficientDetectionDiskSpace(required, free)
+    return required, free
+
+
+def _memory_mode(manifest: dict[str, object]) -> str:
+    mode = str(manifest.get("detection", {}).get("memory_mode", AUTOMATIC_MEMORY_MODE))
+    if mode not in VALID_MEMORY_MODES:
+        raise ValueError(f"Unknown detection memory mode: {mode!r}.")
+    return mode
+
+
+def _percentile_projection_streamed(
+    data: zarr.Array,
+    percentile: float,
+    *,
+    cancel_event: Event | None,
+) -> np.ndarray:
+    z_count, y_count, x_count = (int(value) for value in data.shape)
+    projection = np.empty((y_count, x_count), dtype=np.float32)
+    # Bound the source block near 64 MiB. np.percentile may make an additional
+    # work copy, so deliberately leave most of the low-memory budget untouched.
+    bytes_per_row = max(1, z_count * x_count * int(np.dtype(data.dtype).itemsize))
+    rows_per_block = max(1, min(y_count, (64 * _MIB) // bytes_per_row))
+    for y0 in range(0, y_count, rows_per_block):
+        _cancel_if_requested(cancel_event)
+        y1 = min(y_count, y0 + rows_per_block)
+        block = np.asarray(data[:, y0:y1, :])
+        projection[y0:y1] = np.percentile(block, percentile, axis=0).astype(
+            np.float32, copy=False
+        )
+    return projection
 
 
 def _remove_small_labels(mask: np.ndarray, minimum_size: int) -> np.ndarray:
@@ -172,12 +261,18 @@ def _segment_dendrites_and_spines(
     *,
     xy_um_per_pixel: float,
     cancel_event: Event | None,
+    low_memory: bool = False,
     phase_callback: Callable[[str], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     _cancel_if_requested(cancel_event)
-    stack = np.asarray(data)
-    projection = np.percentile(stack, 95, axis=0).astype(np.float32)
-    del stack
+    if low_memory:
+        projection = _percentile_projection_streamed(
+            data, 95, cancel_event=cancel_event
+        )
+    else:
+        stack = np.asarray(data)
+        projection = np.percentile(stack, 95, axis=0).astype(np.float32)
+        del stack
     if phase_callback:
         phase_callback("projection")
     segmentation_projection = ndimage.gaussian_filter(projection, sigma=2.0)
@@ -450,6 +545,233 @@ def _detect_clusters(
     return cluster_count, flagged, cluster_voxels, first_z, last_z
 
 
+def _union_component_pair(
+    parent: np.ndarray, rank: np.ndarray, first: int, second: int
+) -> None:
+    while parent[first] != first:
+        parent[first] = parent[parent[first]]
+        first = int(parent[first])
+    while parent[second] != second:
+        parent[second] = parent[parent[second]]
+        second = int(parent[second])
+    if first == second:
+        return
+    if rank[first] < rank[second]:
+        first, second = second, first
+    parent[second] = first
+    if rank[first] == rank[second]:
+        rank[first] += 1
+
+
+def _merge_slab_boundary_components(
+    parent: np.ndarray,
+    rank: np.ndarray,
+    previous: np.ndarray,
+    current: np.ndarray,
+) -> None:
+    """Union all 26-connected provisional labels across one Z seam."""
+    height, width = previous.shape
+    for dy in (-1, 0, 1):
+        previous_y0 = max(0, -dy)
+        previous_y1 = min(height, height - dy)
+        current_y0 = previous_y0 + dy
+        current_y1 = previous_y1 + dy
+        for dx in (-1, 0, 1):
+            previous_x0 = max(0, -dx)
+            previous_x1 = min(width, width - dx)
+            current_x0 = previous_x0 + dx
+            current_x1 = previous_x1 + dx
+            first = previous[
+                previous_y0:previous_y1, previous_x0:previous_x1
+            ]
+            second = current[current_y0:current_y1, current_x0:current_x1]
+            valid = (first > 0) & (second > 0) & (first != second)
+            if not np.any(valid):
+                continue
+            keys = (
+                first[valid].astype(np.uint64) << np.uint64(32)
+            ) | second[valid].astype(np.uint64)
+            for key in np.unique(keys):
+                _union_component_pair(
+                    parent,
+                    rank,
+                    int(key >> np.uint64(32)),
+                    int(key & np.uint64(0xFFFFFFFF)),
+                )
+
+
+def _low_memory_slab_depth(
+    shape: tuple[int, int, int], maximum_ram_fraction: float
+) -> int:
+    limit = int(psutil.virtual_memory().total * maximum_ram_fraction)
+    current_rss = psutil.Process().memory_info().rss
+    bytes_per_plane = max(1, shape[1] * shape[2] * 10)
+    if current_rss + bytes_per_plane + 64 * _MIB > limit:
+        raise MemoryError(
+            "Low-memory cluster detection cannot safely fit even one Z plane "
+            "within Synpo's RAM limit."
+        )
+    available = limit - current_rss
+    target = min(256 * _MIB, max(32 * _MIB, available // 4))
+    return max(1, min(shape[0], target // bytes_per_plane))
+
+
+def _detect_clusters_low_memory(
+    processed: zarr.Array,
+    group: zarr.Group,
+    settings: DetectionSettings,
+    *,
+    maximum_ram_fraction: float,
+    progress: ProgressCallback | None,
+    progress_offset: int,
+    progress_total: int,
+    cancel_event: Event | None,
+) -> tuple[int, list[int], np.ndarray, np.ndarray, np.ndarray]:
+    """Label clusters in Z slabs and reconcile objects crossing slab seams."""
+    _cancel_if_requested(cancel_event)
+    shape = tuple(int(value) for value in processed.shape)
+    slab_depth = _low_memory_slab_depth(shape, maximum_ram_fraction)
+    threshold = (
+        float(processed.attrs["statistics"]["applied_threshold"])
+        / settings.cluster_sensitivity
+    )
+    if "_cluster_work" in group:
+        del group["_cluster_work"]
+    work = group.require_group("_cluster_work")
+    provisional = work.create_dataset(
+        "provisional_labels",
+        shape=shape,
+        chunks=(1, min(512, shape[1]), min(512, shape[2])),
+        dtype="uint32",
+        compressor=_compressor(),
+        overwrite=True,
+    )
+    component_sizes: list[np.ndarray] = []
+    total_components = 0
+    slab_starts = list(range(0, shape[0], slab_depth))
+
+    for slab_number, z0 in enumerate(slab_starts, start=1):
+        _cancel_if_requested(cancel_event)
+        z1 = min(shape[0], z0 + slab_depth)
+        data = np.asarray(processed[z0:z1, :, :])
+        mask = data >= threshold
+        del data
+        mask = ndimage.binary_closing(
+            mask, structure=np.ones((1, 3, 3), dtype=bool), iterations=1
+        )
+        labels, count = ndimage.label(
+            mask, structure=np.ones((3, 3, 3), dtype=bool)
+        )
+        del mask
+        if total_components + count > np.iinfo(np.uint32).max:
+            raise MemoryError("This stack contains too many cluster components to label.")
+        sizes = np.bincount(labels.ravel(), minlength=count + 1)[1:].astype(
+            np.int64, copy=False
+        )
+        component_sizes.append(sizes)
+        if total_components:
+            foreground = labels > 0
+            labels[foreground] += total_components
+        provisional[z0:z1, :, :] = labels.astype(np.uint32, copy=False)
+        total_components += int(count)
+        if progress:
+            current = progress_offset + max(
+                1, int(round((z1 / shape[0]) * shape[0] / 3))
+            )
+            progress(
+                "Detecting protein clusters (low memory)",
+                current,
+                progress_total,
+                f"labeling slab {slab_number}/{len(slab_starts)}",
+            )
+
+    reconciliation_bytes = total_components * 28 + 128 * _MIB
+    memory_limit = int(psutil.virtual_memory().total * maximum_ram_fraction)
+    if psutil.Process().memory_info().rss + reconciliation_bytes > memory_limit:
+        raise MemoryError(
+            "This stack contains too many provisional protein-cluster components "
+            "to reconcile safely within Synpo's RAM limit."
+        )
+    parent = np.arange(total_components + 1, dtype=np.uint32)
+    rank = np.zeros(total_components + 1, dtype=np.uint8)
+    seam_count = max(0, len(slab_starts) - 1)
+    for seam_number, z0 in enumerate(slab_starts[1:], start=1):
+        _cancel_if_requested(cancel_event)
+        _merge_slab_boundary_components(
+            parent,
+            rank,
+            np.asarray(provisional[z0 - 1], dtype=np.uint32),
+            np.asarray(provisional[z0], dtype=np.uint32),
+        )
+        if progress:
+            current = progress_offset + shape[0] // 3
+            if seam_count:
+                current += int(round((seam_number / seam_count) * shape[0] / 3))
+            progress(
+                "Detecting protein clusters (low memory)",
+                current,
+                progress_total,
+                f"merging slab seam {seam_number}/{seam_count}",
+            )
+
+    # Compress the union forest vectorially. Union-by-rank keeps this loop short.
+    while True:
+        compressed = parent[parent]
+        if np.array_equal(compressed, parent):
+            break
+        parent = compressed
+    provisional_sizes = np.zeros(total_components + 1, dtype=np.int64)
+    if component_sizes:
+        provisional_sizes[1:] = np.concatenate(component_sizes)
+    root_sizes = np.zeros(total_components + 1, dtype=np.int64)
+    np.add.at(root_sizes, parent, provisional_sizes)
+    selected_roots = np.flatnonzero(
+        root_sizes >= settings.minimum_cluster_voxels
+    )
+    selected_roots = selected_roots[selected_roots > 0]
+    cluster_count = len(selected_roots)
+    final_for_root = np.zeros(total_components + 1, dtype=np.uint32)
+    final_for_root[selected_roots] = np.arange(
+        1, cluster_count + 1, dtype=np.uint32
+    )
+    provisional_to_final = final_for_root[parent]
+    cluster_voxels = np.zeros(cluster_count + 1, dtype=np.int64)
+    if cluster_count:
+        cluster_voxels[1:] = root_sizes[selected_roots]
+    first_z = np.full(cluster_count + 1, shape[0], dtype=np.int32)
+    last_z = np.full(cluster_count + 1, -1, dtype=np.int32)
+    output = _create_mask_dataset(group, "cluster_labels", shape)
+
+    for z_index in range(shape[0]):
+        _cancel_if_requested(cancel_event)
+        plane = provisional_to_final[
+            np.asarray(provisional[z_index], dtype=np.uint32)
+        ]
+        output[z_index] = plane
+        present = np.unique(plane)
+        present = present[present > 0]
+        first_z[present] = np.minimum(first_z[present], z_index)
+        last_z[present] = z_index
+        if progress:
+            current = progress_offset + (2 * shape[0]) // 3
+            current += int(round(((z_index + 1) / shape[0]) * shape[0] / 3))
+            progress(
+                "Detecting protein clusters (low memory)",
+                min(progress_offset + shape[0], current),
+                progress_total,
+                f"writing Z {z_index + 1}/{shape[0]}",
+            )
+
+    spans = last_z - first_z + 1
+    flagged = [
+        label_id
+        for label_id in range(1, cluster_count + 1)
+        if cluster_voxels[label_id] < 100 or spans[label_id] < 3
+    ]
+    del group["_cluster_work"]
+    return cluster_count, flagged, cluster_voxels, first_z, last_z
+
+
 def detect_specimen(
     manifest: dict[str, object],
     specimen_index: int,
@@ -475,11 +797,6 @@ def detect_specimen(
     shape = tuple(int(value) for value in dendrite_data.shape)
     if tuple(cluster_data.shape) != shape:
         raise ValueError("Registered channel cache shapes differ.")
-    maximum_ram_fraction = min(
-        0.8, float(manifest["resource_policy"].get("maximum_ram_fraction", 0.8))
-    )
-    _enforce_ram_policy(shape, maximum_ram_fraction)
-
     signature = detection_signature(manifest, specimen_index, settings)
     root = zarr.open_group(str(detection_cache_path(manifest)), mode="a")
     group_key = f"specimens/{specimen_index:04d}"
@@ -499,97 +816,161 @@ def detect_specimen(
                 flagged_cluster_count=int(saved["flagged_cluster_count"]),
                 elapsed_seconds=time.monotonic() - started,
                 skipped=True,
+                processing_mode=str(
+                    existing.attrs.get(
+                        "processing_mode", saved.get("processing_mode", "standard")
+                    )
+                ),
             )
         del root[group_key]
+
+    maximum_ram_fraction = min(
+        0.8, float(manifest["resource_policy"].get("maximum_ram_fraction", 0.8))
+    )
+    requested_mode = _memory_mode(manifest)
+    use_low_memory = requested_mode == ALWAYS_LOW_MEMORY_MODE or not (
+        _standard_detection_fits(shape, maximum_ram_fraction)
+    )
+    processing_mode = "low_memory" if use_low_memory else "standard"
+    if use_low_memory:
+        _enforce_low_memory_projection_policy(shape, maximum_ram_fraction)
+        _preflight_low_memory_disk(detection_cache_path(manifest).parent, shape)
+
     group = root.require_group(group_key)
     group.attrs.update(
         {
             "complete": False,
             "settings_signature": signature,
             "settings": settings.to_dict(),
+            "processing_mode": processing_mode,
         }
     )
-
-    xy = float(manifest["calibration"]["xy_um_per_pixel"])
-    total_progress = shape[0] * 2 + 2
-    if progress:
-        progress("Detecting dendrite projection", 0, total_progress, "building projection")
-    dendrite_2d, spine_2d, projection_metadata = _segment_dendrites_and_spines(
-        dendrite_data,
-        settings,
-        xy_um_per_pixel=xy,
-        cancel_event=cancel_event,
-        phase_callback=(
-            (lambda detail: progress("Detecting dendrite projection", 0, total_progress, detail))
-            if progress
-            else None
-        ),
-    )
-    if progress:
-        progress("Detecting dendrite projection", 1, total_progress, "shaft and spine candidates separated")
-    (
-        dendrite_count,
-        spine_count,
-        dendrite_voxels,
-        spine_voxels,
-        spine_first_z,
-        spine_last_z,
-    ) = _write_dendrite_and_spine_volumes(
-        dendrite_data,
-        group,
-        dendrite_2d,
-        spine_2d,
-        settings,
-        voxel_threshold=float(projection_metadata["projection_applied_threshold"]),
-        progress=progress,
-        progress_offset=1,
-        progress_total=total_progress,
-        cancel_event=cancel_event,
-    )
-    del dendrite_2d, spine_2d
-    cluster_count, flagged_clusters, cluster_voxels, cluster_first_z, cluster_last_z = (
-        _detect_clusters(
-            cluster_data,
-            group,
+    try:
+        xy = float(manifest["calibration"]["xy_um_per_pixel"])
+        total_progress = shape[0] * 2 + 2
+        if progress:
+            detail = (
+                "large stack detected; building a streamed projection"
+                if use_low_memory
+                else "building projection"
+            )
+            progress("Detecting dendrite projection", 0, total_progress, detail)
+        dendrite_2d, spine_2d, projection_metadata = _segment_dendrites_and_spines(
+            dendrite_data,
             settings,
+            xy_um_per_pixel=xy,
+            cancel_event=cancel_event,
+            low_memory=use_low_memory,
+            phase_callback=(
+                (
+                    lambda detail: progress(
+                        "Detecting dendrite projection", 0, total_progress, detail
+                    )
+                )
+                if progress
+                else None
+            ),
+        )
+        if progress:
+            progress(
+                "Detecting dendrite projection",
+                1,
+                total_progress,
+                "shaft and spine candidates separated",
+            )
+        (
+            dendrite_count,
+            spine_count,
+            dendrite_voxels,
+            spine_voxels,
+            spine_first_z,
+            spine_last_z,
+        ) = _write_dendrite_and_spine_volumes(
+            dendrite_data,
+            group,
+            dendrite_2d,
+            spine_2d,
+            settings,
+            voxel_threshold=float(
+                projection_metadata["projection_applied_threshold"]
+            ),
             progress=progress,
-            progress_offset=shape[0] + 1,
+            progress_offset=1,
             progress_total=total_progress,
             cancel_event=cancel_event,
         )
-    )
+        del dendrite_2d, spine_2d
+        if use_low_memory:
+            cluster_result = _detect_clusters_low_memory(
+                cluster_data,
+                group,
+                settings,
+                maximum_ram_fraction=maximum_ram_fraction,
+                progress=progress,
+                progress_offset=shape[0] + 1,
+                progress_total=total_progress,
+                cancel_event=cancel_event,
+            )
+        else:
+            cluster_result = _detect_clusters(
+                cluster_data,
+                group,
+                settings,
+                progress=progress,
+                progress_offset=shape[0] + 1,
+                progress_total=total_progress,
+                cancel_event=cancel_event,
+            )
+        (
+            cluster_count,
+            flagged_clusters,
+            cluster_voxels,
+            cluster_first_z,
+            cluster_last_z,
+        ) = cluster_result
 
-    spine_spans = spine_last_z - spine_first_z + 1
-    flagged_spines = set(projection_metadata["possible_filopodia_ids"])
-    flagged_spines.update(projection_metadata["possible_dendrite_end_ids"])
-    flagged_spines.update(
-        label_id
-        for label_id in range(1, spine_count + 1)
-        if spine_voxels[label_id] < 20 or spine_spans[label_id] < 2
-    )
-    summary = DetectionSummary(
-        specimen_index=specimen_index,
-        dendrite_count=dendrite_count,
-        spine_count=spine_count,
-        cluster_count=cluster_count,
-        flagged_spine_count=len(flagged_spines),
-        flagged_cluster_count=len(flagged_clusters),
-        elapsed_seconds=time.monotonic() - started,
-    )
-    group.attrs.update(
-        {
-            "complete": True,
-            "completed_at": time.time(),
-            "summary": summary.to_dict(),
-            "projection_metadata": projection_metadata,
-            "flagged_spine_ids": sorted(flagged_spines),
-            "flagged_cluster_ids": flagged_clusters,
-            "candidate_status": "unreviewed",
-        }
-    )
-    if progress:
-        progress("Detection complete", total_progress, total_progress, specimen["specimen_id"])
-    return summary
+        spine_spans = spine_last_z - spine_first_z + 1
+        flagged_spines = set(projection_metadata["possible_filopodia_ids"])
+        flagged_spines.update(projection_metadata["possible_dendrite_end_ids"])
+        flagged_spines.update(
+            label_id
+            for label_id in range(1, spine_count + 1)
+            if spine_voxels[label_id] < 20 or spine_spans[label_id] < 2
+        )
+        summary = DetectionSummary(
+            specimen_index=specimen_index,
+            dendrite_count=dendrite_count,
+            spine_count=spine_count,
+            cluster_count=cluster_count,
+            flagged_spine_count=len(flagged_spines),
+            flagged_cluster_count=len(flagged_clusters),
+            elapsed_seconds=time.monotonic() - started,
+            processing_mode=processing_mode,
+        )
+        group.attrs.update(
+            {
+                "complete": True,
+                "completed_at": time.time(),
+                "summary": summary.to_dict(),
+                "projection_metadata": projection_metadata,
+                "flagged_spine_ids": sorted(flagged_spines),
+                "flagged_cluster_ids": flagged_clusters,
+                "candidate_status": "unreviewed",
+            }
+        )
+        if progress:
+            progress(
+                "Detection complete",
+                total_progress,
+                total_progress,
+                specimen["specimen_id"],
+            )
+        return summary
+    except Exception:
+        # A cancelled or failed specimen always restarts from its beginning.
+        if group_key in root:
+            del root[group_key]
+        raise
 
 
 def detect_project(
@@ -619,6 +1000,11 @@ def detect_project(
         work_units[index] = z_count * 2 + 2
     total_work = sum(work_units.values())
     completed_work = 0
+    completed_pairs = 0
+    reused_pairs = 0
+    low_memory_pairs = 0
+    skipped_pairs = 0
+    failed_pairs = 0
     for specimen_index in eligible:
         _cancel_if_requested(cancel_event)
         specimen = specimens[specimen_index]
@@ -635,13 +1021,84 @@ def detect_project(
                     f"{specimen['specimen_id']}: {detail}",
                 )
 
-        summary = detect_specimen(
-            manifest,
-            specimen_index,
-            settings,
-            progress=specimen_progress,
-            cancel_event=cancel_event,
-        )
+        try:
+            summary = detect_specimen(
+                manifest,
+                specimen_index,
+                settings,
+                progress=specimen_progress,
+                cancel_event=cancel_event,
+            )
+        except ProcessingCancelled:
+            checkpoint.update(
+                {
+                    "state": "not_started",
+                    "updated_at": time.time(),
+                    "reason": "Detection was cancelled; this specimen will restart.",
+                }
+            )
+            save_project(project_path, manifest)
+            raise
+        except InsufficientDetectionDiskSpace as exc:
+            outcome = {
+                "outcome": "skipped",
+                "specimen_index": specimen_index,
+                "reason": str(exc),
+                "required_bytes": exc.required_bytes,
+                "free_bytes": exc.free_bytes,
+            }
+            checkpoint.update(
+                {
+                    "state": "skipped",
+                    "updated_at": time.time(),
+                    "reason": str(exc),
+                    "required_bytes": exc.required_bytes,
+                    "free_bytes": exc.free_bytes,
+                }
+            )
+            save_project(project_path, manifest)
+            summaries.append(outcome)
+            skipped_pairs += 1
+            completed_work += work_units[specimen_index]
+            if progress:
+                progress(
+                    "Detection skipped",
+                    completed_work,
+                    total_work,
+                    f"{specimen['specimen_id']}: {exc}",
+                )
+            if pair_completed:
+                pair_completed(specimen_index, outcome)
+            continue
+        except Exception as exc:
+            outcome = {
+                "outcome": "failed",
+                "specimen_index": specimen_index,
+                "reason": str(exc),
+                "error_type": type(exc).__name__,
+            }
+            checkpoint.update(
+                {
+                    "state": "failed",
+                    "updated_at": time.time(),
+                    "reason": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+            )
+            save_project(project_path, manifest)
+            summaries.append(outcome)
+            failed_pairs += 1
+            completed_work += work_units[specimen_index]
+            if progress:
+                progress(
+                    "Detection failed",
+                    completed_work,
+                    total_work,
+                    f"{specimen['specimen_id']}: {exc}",
+                )
+            if pair_completed:
+                pair_completed(specimen_index, outcome)
+            continue
         current_signature = detection_signature(manifest, specimen_index, settings)
         review_checkpoint = specimen["checkpoints"].get("review", {})
         if (
@@ -666,14 +1123,25 @@ def detect_project(
                 "settings_signature": current_signature,
                 "cache_path": str(detection_cache_path(manifest)),
                 "summary": summary.to_dict(),
+                "processing_mode": summary.processing_mode,
             }
         )
+        for stale_key in ("reason", "required_bytes", "free_bytes", "error_type"):
+            checkpoint.pop(stale_key, None)
         if not summary.skipped:
             specimen["checkpoints"].setdefault("measurements", {}).update(
                 {"state": "not_started", "updated_at": time.time()}
             )
         save_project(project_path, manifest)
-        summaries.append(summary.to_dict())
+        outcome = summary.to_dict()
+        outcome["outcome"] = "complete"
+        outcome["reused"] = summary.skipped
+        summaries.append(outcome)
+        completed_pairs += 1
+        reused_pairs += int(summary.skipped)
+        low_memory_pairs += int(
+            not summary.skipped and summary.processing_mode == "low_memory"
+        )
         if summary.skipped and progress:
             progress(
                 "Detection checkpoint",
@@ -682,17 +1150,22 @@ def detect_project(
                 f"{specimen['specimen_id']}: unchanged result reused",
             )
         if pair_completed:
-            pair_completed(specimen_index, summary.to_dict())
+            pair_completed(specimen_index, outcome)
         completed_work += work_units[specimen_index]
     if progress:
         progress(
             "Detection complete",
             total_work,
             total_work,
-            f"{len(eligible)} specimen pair(s) checkpointed",
+            f"{completed_pairs} complete, {skipped_pairs} skipped, {failed_pairs} failed",
         )
     return {
         "eligible_pairs": len(eligible),
+        "completed_pairs": completed_pairs,
+        "reused_pairs": reused_pairs,
+        "low_memory_pairs": low_memory_pairs,
+        "skipped_pairs": skipped_pairs,
+        "failed_pairs": failed_pairs,
         "elapsed_seconds": time.monotonic() - started,
         "summaries": summaries,
         "cache_path": str(detection_cache_path(manifest)),

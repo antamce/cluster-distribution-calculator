@@ -115,6 +115,16 @@ review. Compressed 3D label masks are stored in `detection.zarr`. A changed
 detection setting produces a new reproducibility signature and replaces only stale
 automatic masks.
 
+Detection uses the fast in-memory algorithm when it fits below the project's 80%
+RAM ceiling. Larger specimens automatically use a slower disk-backed mode that
+streams the percentile projection, labels protein clusters in Z slabs, and merges
+objects across slab boundaries. **Always use low-memory detection** can be saved as
+a per-project execution setting without invalidating completed masks. Synpo checks
+temporary disk requirements before each low-memory specimen; a specimen with
+insufficient space is left retryable and skipped while the rest of the batch
+continues. Other specimen-local failures are likewise recorded without stopping
+unrelated specimens.
+
 On the supplied registered pair, defaults completed in 22.88 seconds, below the
 three-minute target. Reopening an unchanged checkpoint took 0.019 seconds.
 
