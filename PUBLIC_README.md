@@ -95,10 +95,12 @@ Channel roles are confirmed for every batch. By default, Channel A contains prot
 
 1. Select and scan a TIFF folder, or manually choose one channel pair.
 2. Confirm channel markers and roles, voxel calibration, experimental groups, specimen names, and output location.
-3. Tune preprocessing on one or more representative specimens.
+3. Tune preprocessing on representative specimens. Mark unusual pairs for saved
+   per-pair ChanA/ChanB overrides when they need different parameters.
 4. Preprocess the entire batch and run automatic detection.
 5. Review detected specimens and optionally apply local corrections.
-6. Calculate measurements and review protein-cluster-positive spines.
+6. After at least one specimen is marked manual-review complete, calculate its
+   measurements and begin protein-cluster-positive spine review.
 7. Optionally review cluster-less spines and exclude invalid detections.
 8. Export the workbook, CSV tables, and any requested validation PDFs.
 
@@ -108,9 +110,23 @@ Detection uses **Automatic (fast when safe)** by default. Choose **Always use lo
 
 ## Review and visualization
 
-The correction canvas can show an individual Z slice or a drawable XY maximum projection. Drawn hints are instructions rather than final masks. Add, exclude, split, merge, expand, and trim operations run local image-guided resegmentation. Multiple missed-object hints remain separate objects. Protein clusters are detected automatically and are not manually redrawn.
+The correction canvas can show an individual Z slice or a drawable XY maximum projection. Drawn hints are instructions rather than final masks. The brushes are:
 
-Maximum projections and 3D context are available during detection and correction. Before creating a 3D surface, select a rectangular area on the XY projection to control memory use. Dendrite and spine surfaces can be translucent while protein clusters remain opaque. Colors, opacity, rotation on all three axes, and displayed Z spacing are adjustable; these display settings never alter masks or measurements.
+- **Add — green:** draw separately inside each missed object; each stroke seeds an independent 3D object whose boundary follows preprocessed signal.
+- **Exclude — red:** touch an unwanted object to remove that complete 3D object.
+- **Trim — magenta:** draw across excess segmentation; Synpo removes the hint and keeps the largest connected remainder.
+- **Expand — blue:** draw from an existing object toward missed signal so its boundary is regrown locally.
+- **Split — yellow:** draw through a neck or contact to divide one object into separately numbered objects.
+- **Mark as filopodium — purple:** touch a spine to exclude it and record the filopodium decision in the audit trail.
+- **Merge objects — `#ED6291`:** draw through at least two objects to combine them under one stable ID.
+- **Accept — cyan:** retain the mask unchanged and record the object as accepted.
+- **Needs attention — orange:** retain the mask unchanged and explicitly flag it for later review.
+
+Multiple missed-object hints remain separate objects. Protein clusters are detected automatically and are not manually redrawn.
+
+Correction uses ordinary RAM when safe and automatically switches oversized edits to slower disk-backed processing. An **Always use slow low-memory correction** option is available for low-RAM computers, with undo retained in both modes.
+
+Maximum projections and 3D context are available during detection and correction. Their progress and Cancel control appear in the bottom status line instead of a modal popup. Before creating a 3D surface, select a rectangular area on the XY projection to control memory use. Dendrite and spine surfaces can be translucent while protein clusters remain opaque. Colors, opacity, rotation on all three axes, and displayed Z spacing are adjustable; these display settings never alter masks or measurements.
 
 ## Spine distribution review
 
@@ -124,11 +140,14 @@ If the automatic centerline endpoint is correct, no action is required. Otherwis
 
 The point snaps to the nearest voxel belonging to the selected spine, the centerline is rebuilt from the automatic base, and the review returns to the maximum projection. **Clear end hint** restores automatic endpoint detection.
 
-Clicking either cropped channel view opens the full-specimen projection with the current spine highlighted. **Open numbered spine map** shows all stable spine IDs with zoom, optional single-Z viewing, and filters for cluster-positive, cluster-less, valid, or invalid spines.
+Clicking either cropped channel view opens the full-specimen projection with the current spine highlighted by a thick bright-green outline; other spines use thick cyan outlines. **Open numbered spine map** shows all stable spine IDs with zoom, optional single-Z viewing, and filters for cluster-positive, cluster-less, valid, or invalid spines.
 
 Cluster-less spine review is optional and never blocks export. Marking a spine invalid excludes it from all subsequent metrics, including spine density and the protein-inclusion percentage denominator, while preserving an auditable decision row.
 
 ## Results
+
+Partial export is allowed: only pairs with completed measurement checkpoints are
+included, and the measurement panel reports how many unfinished pairs were omitted.
 
 The verified export contains:
 

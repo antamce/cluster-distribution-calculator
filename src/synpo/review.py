@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 import uuid
+import shutil
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Event
@@ -34,6 +36,13 @@ Operation = Literal[
     "accept",
     "needs_attention",
 ]
+
+AUTOMATIC_REVIEW_MEMORY_MODE = "automatic"
+ALWAYS_LOW_MEMORY_REVIEW_MODE = "always_low_memory"
+VALID_REVIEW_MEMORY_MODES = {
+    AUTOMATIC_REVIEW_MEMORY_MODE,
+    ALWAYS_LOW_MEMORY_REVIEW_MODE,
+}
 
 
 @dataclass(frozen=True)
@@ -86,6 +95,7 @@ class ReviewResult:
     spine_count: int
     checkpoint_written: bool = True
     hint_results: tuple[dict[str, object], ...] = ()
+    processing_mode: str = "standard"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -329,10 +339,10 @@ def _bbox_slices(
     return slice(z0, z1), slice(y0, y1), slice(x0, x1)
 
 
-def _enforce_review_ram_policy(
+def _standard_review_fits(
     manifest: dict[str, object],
     bbox: tuple[int, int, int, int, int, int],
-) -> None:
+) -> bool:
     z0, z1, y0, y1, x0, x1 = bbox
     voxels = (z1 - z0) * (y1 - y0) * (x1 - x0)
     # Covers label copies, boolean candidates, component labels, and working space.
@@ -343,11 +353,149 @@ def _enforce_review_ram_policy(
     if not 0 < fraction <= 0.8:
         raise ValueError("Maximum RAM fraction must be above zero and at most 0.8.")
     limit = int(psutil.virtual_memory().total * fraction)
-    if psutil.Process().memory_info().rss + estimated_extra > limit:
-        raise MemoryError(
-            "This correction would exceed Synpo's RAM safety limit. Narrow the hint "
-            "or split/exclude the object in smaller local steps."
+    return psutil.Process().memory_info().rss + estimated_extra <= limit
+
+
+def _review_memory_mode(manifest: dict[str, object]) -> str:
+    mode = str(
+        manifest.get("review_settings", {}).get(
+            "memory_mode", AUTOMATIC_REVIEW_MEMORY_MODE
         )
+    )
+    if mode not in VALID_REVIEW_MEMORY_MODES:
+        raise ValueError(f"Unknown correction memory mode: {mode!r}.")
+    return mode
+
+
+def _use_low_memory_review(
+    manifest: dict[str, object],
+    bbox: tuple[int, int, int, int, int, int],
+) -> bool:
+    return (
+        _review_memory_mode(manifest) == ALWAYS_LOW_MEMORY_REVIEW_MODE
+        or not _standard_review_fits(manifest, bbox)
+    )
+
+
+def _preflight_low_memory_review(
+    manifest: dict[str, object],
+    bbox: tuple[int, int, int, int, int, int],
+) -> Path:
+    z0, z1, y0, y1, x0, x1 = bbox
+    voxels = (z1 - z0) * (y1 - y0) * (x1 - x0)
+    required = voxels * 18 + 256 * 1024 * 1024
+    directory = review_cache_path(manifest).parent
+    directory.mkdir(parents=True, exist_ok=True)
+    free = int(shutil.disk_usage(directory).free)
+    if free < required:
+        raise MemoryError(
+            "Slow low-memory correction needs "
+            f"{required / (1024 ** 3):.2f} GiB of temporary disk space, but only "
+            f"{free / (1024 ** 3):.2f} GiB is free."
+        )
+    return directory
+
+
+class _DiskWorkspace:
+    def __init__(self, parent: Path) -> None:
+        self.path = parent / f".synpo-review-{uuid.uuid4().hex}"
+        self.path.mkdir(parents=True)
+        self.arrays: list[np.memmap] = []
+
+    def array(
+        self, name: str, shape: tuple[int, ...], dtype: np.dtype | type
+    ) -> np.memmap:
+        result = np.memmap(
+            self.path / name, mode="w+", dtype=dtype, shape=shape
+        )
+        self.arrays.append(result)
+        return result
+
+    def close(self) -> None:
+        for array in reversed(self.arrays):
+            try:
+                array.flush()
+                array._mmap.close()
+            except (AttributeError, OSError, ValueError):
+                pass
+        self.arrays.clear()
+        shutil.rmtree(self.path, ignore_errors=True)
+
+
+@contextmanager
+def _editable_review_patch(
+    manifest: dict[str, object],
+    target: zarr.Array,
+    bbox: tuple[int, int, int, int, int, int],
+    *,
+    low_memory: bool,
+    cancel_event: Event | None,
+):
+    slices = _bbox_slices(bbox)
+    if not low_memory:
+        before = np.asarray(target[slices])
+        yield before, before.copy(), None
+        return
+    directory = _preflight_low_memory_review(manifest, bbox)
+    shape = tuple(item.stop - item.start for item in slices)
+    workspace = _DiskWorkspace(directory)
+    try:
+        before = workspace.array("before.dat", shape, np.uint32)
+        patch = workspace.array("patch.dat", shape, np.uint32)
+        for local_z, source_z in enumerate(range(bbox[0], bbox[1])):
+            _cancel_if_requested(cancel_event)
+            plane = np.asarray(
+                target[source_z, slices[1], slices[2]], dtype=np.uint32
+            )
+            before[local_z] = plane
+            patch[local_z] = plane
+        before.flush()
+        patch.flush()
+        yield before, patch, workspace
+        patch.flush()
+    finally:
+        workspace.close()
+
+
+def _write_review_patch(
+    target: zarr.Array,
+    bbox: tuple[int, int, int, int, int, int],
+    patch: np.ndarray,
+) -> None:
+    y_slice = slice(bbox[2], bbox[3])
+    x_slice = slice(bbox[4], bbox[5])
+    for local_z, target_z in enumerate(range(bbox[0], bbox[1])):
+        target[target_z, y_slice, x_slice] = np.asarray(patch[local_z])
+
+
+def _disk_backed_array(
+    workspace: _DiskWorkspace,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: np.dtype | type,
+) -> np.memmap:
+    return workspace.array(name, shape, dtype)
+
+
+def _label_disk_backed_mask(
+    mask: np.memmap, workspace: _DiskWorkspace
+) -> tuple[np.memmap, int, np.ndarray]:
+    components = _disk_backed_array(
+        workspace, "components.dat", tuple(mask.shape), np.int32
+    )
+    count = int(
+        ndimage.label(
+            mask,
+            structure=np.ones((3, 3, 3), dtype=bool),
+            output=components,
+        )
+    )
+    sizes = np.zeros(count + 1, dtype=np.int64)
+    for z_index in range(mask.shape[0]):
+        sizes += np.bincount(
+            np.asarray(components[z_index]).ravel(), minlength=count + 1
+        )
+    return components, count, sizes
 
 
 def _local_points(
@@ -365,13 +513,19 @@ def _store_undo_patch(
     patch: np.ndarray,
 ) -> None:
     undo = group.require_group("undo").require_group(action_id)
-    undo.create_dataset(
+    dataset = undo.create_dataset(
         "before",
-        data=np.asarray(patch, dtype=np.uint32),
+        shape=patch.shape,
+        dtype="uint32",
         chunks=(1, min(256, patch.shape[1]), min(256, patch.shape[2])),
         compressor=_compressor(),
         overwrite=True,
     )
+    if isinstance(patch, np.memmap):
+        for z_index in range(patch.shape[0]):
+            dataset[z_index] = np.asarray(patch[z_index], dtype=np.uint32)
+    else:
+        dataset[:] = np.asarray(patch, dtype=np.uint32)
     undo.attrs.update({"dataset_name": dataset_name, "bbox": list(bbox)})
 
 
@@ -744,10 +898,14 @@ def _apply_add_hints(
         ]
     ] = []
     hint_results: list[dict[str, object]] = []
+    processing_mode = "standard"
     for group_index, hint_group in enumerate(grouped, start=1):
         _cancel_if_requested(cancel_event)
         bbox = tuple(int(value) for value in hint_group["bbox"])
-        _enforce_review_ram_policy(manifest, bbox)
+        if _use_low_memory_review(manifest, bbox):
+            # Add hints are intrinsically bounded by the local margin and Z radius;
+            # processing them independently is the low-memory path.
+            processing_mode = "low_memory"
         slices = _bbox_slices(bbox)
         before = np.asarray(target[slices])
         dendrite_patch = (
@@ -802,6 +960,7 @@ def _apply_add_hints(
             else int(group.attrs["spine_count"]),
             checkpoint_written=False,
             hint_results=tuple(hint_results),
+            processing_mode=processing_mode,
         )
 
     action_id = uuid.uuid4().hex
@@ -842,6 +1001,7 @@ def _apply_add_hints(
         "bboxes": [list(bbox) for bbox, _before, _output in updates],
         "count_delta": len(created_ids),
         "previous_status": {},
+        "processing_mode": processing_mode,
         "undone": False,
         "undo_available": True,
     }
@@ -887,6 +1047,7 @@ def _apply_add_hints(
         spine_count=int(group.attrs["spine_count"]),
         checkpoint_written=True,
         hint_results=tuple(hint_results),
+        processing_mode=processing_mode,
     )
 
 
@@ -949,6 +1110,7 @@ def apply_review_action(
     count_delta = 0
     previous_status: dict[str, str | None] = {}
     pending_status: str | None = None
+    processing_mode = "standard"
 
     if action.operation in {"accept", "needs_attention"}:
         if not selected_ids:
@@ -964,60 +1126,87 @@ def apply_review_action(
                 + ("at least two objects." if required == 2 else "an existing object.")
             )
         bbox = _expand_bbox(_bbox_for_ids(target, selected_ids), tuple(target.shape), 2)
-        _enforce_review_ram_policy(manifest, bbox)
-        slices = _bbox_slices(bbox)
-        before = np.asarray(target[slices])
-        patch = before.copy()
-        if action.operation in {"exclude", "filopodium"}:
-            patch[np.isin(patch, selected_ids)] = 0
-            count_delta = -len(selected_ids)
-            pending_status = (
-                "excluded_filopodium"
-                if action.operation == "filopodium"
-                else "excluded"
-            )
-        elif action.operation == "merge":
-            keep = min(selected_ids)
-            patch[np.isin(patch, selected_ids)] = keep
-            count_delta = -(len(selected_ids) - 1)
-            pending_status = "merged"
-            new_ids = (keep,)
-        else:
-            if len(selected_ids) != 1:
-                raise ValueError("Split one object at a time.")
-            object_id = selected_ids[0]
-            object_mask = patch == object_id
-            local_hint = _disk_mask(
-                tuple(patch.shape[1:]),
-                _local_points(action.points, bbox),
-                action.brush_radius_pixels,
-            )
-            object_mask &= ~local_hint[None, :, :]
-            components, component_count = ndimage.label(
-                object_mask, structure=np.ones((3, 3, 3), dtype=bool)
-            )
-            sizes = np.bincount(components.ravel())
-            component_ids = [
-                value for value in range(1, component_count + 1) if sizes[value] >= 5
-            ]
-            if len(component_ids) < 2:
-                raise ValueError(
-                    "The hint did not separate this object. Draw across the full neck/contact."
+        low_memory = _use_low_memory_review(manifest, bbox)
+        processing_mode = "low_memory" if low_memory else "standard"
+        with _editable_review_patch(
+            manifest,
+            target,
+            bbox,
+            low_memory=low_memory,
+            cancel_event=cancel_event,
+        ) as (before, patch, temporary):
+            if action.operation in {"exclude", "filopodium", "merge"}:
+                replacement = 0 if action.operation != "merge" else min(selected_ids)
+                for z_index in range(patch.shape[0]):
+                    plane = np.asarray(patch[z_index])
+                    plane[np.isin(plane, selected_ids)] = replacement
+                    patch[z_index] = plane
+                if action.operation in {"exclude", "filopodium"}:
+                    count_delta = -len(selected_ids)
+                    pending_status = (
+                        "excluded_filopodium"
+                        if action.operation == "filopodium"
+                        else "excluded"
+                    )
+                else:
+                    count_delta = -(len(selected_ids) - 1)
+                    pending_status = "merged"
+                    new_ids = (replacement,)
+            else:
+                if len(selected_ids) != 1:
+                    raise ValueError("Split one object at a time.")
+                object_id = selected_ids[0]
+                local_hint = _disk_mask(
+                    tuple(patch.shape[1:]),
+                    _local_points(action.points, bbox),
+                    action.brush_radius_pixels,
                 )
-            patch[patch == object_id] = 0
-            assigned = [object_id]
-            next_key = f"next_{action.object_type}_id"
-            next_id = int(group.attrs[next_key])
-            for component_id in component_ids[1:]:
-                assigned.append(next_id)
-                next_id += 1
-            for component_id, assigned_id in zip(component_ids, assigned):
-                patch[components == component_id] = assigned_id
-            group.attrs[next_key] = next_id
-            new_ids = tuple(assigned)
-            count_delta = len(assigned) - 1
-        _store_undo_patch(group, action_id, dataset_name, bbox, before)
-        target[slices] = patch
+                if low_memory:
+                    assert temporary is not None
+                    object_mask = _disk_backed_array(
+                        temporary, "object-mask.dat", tuple(patch.shape), np.bool_
+                    )
+                    for z_index in range(patch.shape[0]):
+                        object_mask[z_index] = (
+                            np.asarray(before[z_index]) == object_id
+                        ) & ~local_hint
+                    components, component_count, sizes = _label_disk_backed_mask(
+                        object_mask, temporary
+                    )
+                else:
+                    object_mask = (patch == object_id) & ~local_hint[None, :, :]
+                    components, component_count = ndimage.label(
+                        object_mask, structure=np.ones((3, 3, 3), dtype=bool)
+                    )
+                    sizes = np.bincount(components.ravel())
+                component_ids = [
+                    value
+                    for value in range(1, component_count + 1)
+                    if sizes[value] >= 5
+                ]
+                if len(component_ids) < 2:
+                    raise ValueError(
+                        "The hint did not separate this object. Draw across the full neck/contact."
+                    )
+                assigned = [object_id]
+                next_key = f"next_{action.object_type}_id"
+                next_id = int(group.attrs[next_key])
+                for component_id in component_ids[1:]:
+                    assigned.append(next_id)
+                    next_id += 1
+                for z_index in range(patch.shape[0]):
+                    plane = np.asarray(patch[z_index])
+                    plane[plane == object_id] = 0
+                    component_plane = np.asarray(components[z_index])
+                    for component_id, assigned_id in zip(component_ids, assigned):
+                        plane[component_plane == component_id] = assigned_id
+                    patch[z_index] = plane
+                group.attrs[next_key] = next_id
+                new_ids = tuple(assigned)
+                count_delta = len(assigned) - 1
+            _store_undo_patch(group, action_id, dataset_name, bbox, before)
+            _cancel_if_requested(cancel_event)
+            _write_review_patch(target, bbox, patch)
     else:
         xy = float(manifest["calibration"]["xy_um_per_pixel"])
         margin = max(
@@ -1035,57 +1224,141 @@ def apply_review_action(
             bbox = _local_bbox(
                 tuple(target.shape), effective_z, action.points, margin, z_radius
             )
-        _enforce_review_ram_policy(manifest, bbox)
         slices = _bbox_slices(bbox)
-        before = np.asarray(target[slices])
-        patch = before.copy()
-        local_points = _local_points(action.points, bbox)
-        hint_2d = _disk_mask(
-            tuple(patch.shape[1:]), local_points, action.brush_radius_pixels
-        )
-        hint_3d = np.zeros(patch.shape, dtype=bool)
-        local_z = effective_z - bbox[0]
-        hint_3d[local_z, hint_2d] = True
-        hint_3d = ndimage.binary_dilation(
-            hint_3d, structure=np.ones((3, 3, 3), dtype=bool), iterations=1
-        )
-        if action.operation == "trim":
+        low_memory = _use_low_memory_review(manifest, bbox)
+        processing_mode = "low_memory" if low_memory else "standard"
+        with _editable_review_patch(
+            manifest,
+            target,
+            bbox,
+            low_memory=low_memory,
+            cancel_event=cancel_event,
+        ) as (before, patch, temporary):
+            local_points = _local_points(action.points, bbox)
+            hint_2d = _disk_mask(
+                tuple(patch.shape[1:]), local_points, action.brush_radius_pixels
+            )
+            expanded_hint = ndimage.binary_dilation(
+                hint_2d, structure=np.ones((3, 3), dtype=bool), iterations=1
+            )
+            local_z = effective_z - bbox[0]
+
+            def hint_plane(z_index: int) -> np.ndarray:
+                return (
+                    expanded_hint
+                    if abs(z_index - local_z) <= 1
+                    else np.zeros_like(expanded_hint)
+                )
+
             object_id = selected_ids[0]
-            candidate = (patch == object_id) & ~hint_3d
-            components, count = ndimage.label(
-                candidate, structure=np.ones((3, 3, 3), dtype=bool)
-            )
-            if not count:
-                raise ValueError("This hint would remove the complete object.")
-            sizes = np.bincount(components.ravel())
-            keep = int(np.argmax(sizes[1:]) + 1)
-            patch[patch == object_id] = 0
-            patch[components == keep] = object_id
-        else:
-            processed = _processed_dendrite_data(manifest, specimen_index)
-            signal = np.asarray(processed[slices])
-            sensitivity = float(
-                manifest["detection"]["settings"]["dendrite_sensitivity"]
-            )
-            threshold = float(processed.attrs["statistics"]["applied_threshold"])
-            candidate = signal >= (threshold / sensitivity) * 0.8
-            candidate = ndimage.binary_closing(
-                candidate, structure=np.ones((1, 3, 3), dtype=bool)
-            )
-            if action.object_type == "spine":
-                dendrite_patch = np.asarray(group["dendrite_labels"][slices])
-                candidate &= dendrite_patch == 0
-            candidate |= hint_3d
-            object_id = selected_ids[0]
-            seed = (patch == object_id) | hint_3d
-            candidate |= patch == object_id
-            region = ndimage.binary_propagation(
-                seed, structure=np.ones((3, 3, 3), dtype=bool), mask=candidate
-            )
-            region &= (patch == 0) | (patch == object_id)
-            patch[region] = object_id
-        _store_undo_patch(group, action_id, dataset_name, bbox, before)
-        target[slices] = patch
+            if action.operation == "trim":
+                if low_memory:
+                    assert temporary is not None
+                    candidate = _disk_backed_array(
+                        temporary, "trim-candidate.dat", tuple(patch.shape), np.bool_
+                    )
+                    for z_index in range(patch.shape[0]):
+                        candidate[z_index] = (
+                            np.asarray(before[z_index]) == object_id
+                        ) & ~hint_plane(z_index)
+                    components, count, sizes = _label_disk_backed_mask(
+                        candidate, temporary
+                    )
+                else:
+                    hint_3d = np.zeros(patch.shape, dtype=bool)
+                    for z_index in range(patch.shape[0]):
+                        hint_3d[z_index] = hint_plane(z_index)
+                    candidate = (patch == object_id) & ~hint_3d
+                    components, count = ndimage.label(
+                        candidate, structure=np.ones((3, 3, 3), dtype=bool)
+                    )
+                    sizes = np.bincount(components.ravel())
+                if not count:
+                    raise ValueError("This hint would remove the complete object.")
+                keep = int(np.argmax(sizes[1:]) + 1)
+                for z_index in range(patch.shape[0]):
+                    plane = np.asarray(patch[z_index])
+                    plane[plane == object_id] = 0
+                    plane[np.asarray(components[z_index]) == keep] = object_id
+                    patch[z_index] = plane
+            else:
+                processed = _processed_dendrite_data(manifest, specimen_index)
+                sensitivity = float(
+                    manifest["detection"]["settings"]["dendrite_sensitivity"]
+                )
+                threshold = float(
+                    processed.attrs["statistics"]["applied_threshold"]
+                )
+                if low_memory:
+                    assert temporary is not None
+                    candidate = _disk_backed_array(
+                        temporary, "expand-candidate.dat", tuple(patch.shape), np.bool_
+                    )
+                    seed = _disk_backed_array(
+                        temporary, "expand-seed.dat", tuple(patch.shape), np.bool_
+                    )
+                    dendrites = group["dendrite_labels"]
+                    for z_index, source_z in enumerate(range(bbox[0], bbox[1])):
+                        signal = np.asarray(
+                            processed[source_z, slices[1], slices[2]]
+                        )
+                        plane_candidate = signal >= (threshold / sensitivity) * 0.8
+                        plane_candidate = ndimage.binary_closing(
+                            plane_candidate,
+                            structure=np.ones((3, 3), dtype=bool),
+                        )
+                        if action.object_type == "spine":
+                            plane_candidate &= (
+                                np.asarray(
+                                    dendrites[source_z, slices[1], slices[2]]
+                                )
+                                == 0
+                            )
+                        hint = hint_plane(z_index)
+                        before_plane = np.asarray(before[z_index])
+                        candidate[z_index] = (
+                            plane_candidate | hint | (before_plane == object_id)
+                        )
+                        seed[z_index] = (before_plane == object_id) | hint
+                    region = _disk_backed_array(
+                        temporary, "expand-region.dat", tuple(patch.shape), np.bool_
+                    )
+                    ndimage.binary_propagation(
+                        seed,
+                        structure=np.ones((3, 3, 3), dtype=bool),
+                        mask=candidate,
+                        output=region,
+                    )
+                    for z_index in range(patch.shape[0]):
+                        plane = np.asarray(patch[z_index])
+                        allowed = (plane == 0) | (plane == object_id)
+                        plane[np.asarray(region[z_index]) & allowed] = object_id
+                        patch[z_index] = plane
+                else:
+                    hint_3d = np.zeros(patch.shape, dtype=bool)
+                    for z_index in range(patch.shape[0]):
+                        hint_3d[z_index] = hint_plane(z_index)
+                    signal = np.asarray(processed[slices])
+                    candidate = signal >= (threshold / sensitivity) * 0.8
+                    candidate = ndimage.binary_closing(
+                        candidate, structure=np.ones((1, 3, 3), dtype=bool)
+                    )
+                    if action.object_type == "spine":
+                        dendrite_patch = np.asarray(group["dendrite_labels"][slices])
+                        candidate &= dendrite_patch == 0
+                    candidate |= hint_3d
+                    seed = (patch == object_id) | hint_3d
+                    candidate |= patch == object_id
+                    region = ndimage.binary_propagation(
+                        seed,
+                        structure=np.ones((3, 3, 3), dtype=bool),
+                        mask=candidate,
+                    )
+                    region &= (patch == 0) | (patch == object_id)
+                    patch[region] = object_id
+            _store_undo_patch(group, action_id, dataset_name, bbox, before)
+            _cancel_if_requested(cancel_event)
+            _write_review_patch(target, bbox, patch)
 
     count_key = f"{action.object_type}_count"
     group.attrs[count_key] = max(0, int(group.attrs[count_key]) + count_delta)
@@ -1107,6 +1380,7 @@ def apply_review_action(
         "bbox": list(bbox) if bbox else None,
         "count_delta": count_delta,
         "previous_status": previous_status,
+        "processing_mode": processing_mode,
         "undone": False,
         "undo_available": True,
     }
@@ -1150,6 +1424,7 @@ def apply_review_action(
         edit_count=int(checkpoint["edit_count"]),
         dendrite_count=int(group.attrs["dendrite_count"]),
         spine_count=int(group.attrs["spine_count"]),
+        processing_mode=processing_mode,
     )
 
 

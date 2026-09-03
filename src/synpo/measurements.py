@@ -1583,10 +1583,14 @@ def measure_project(
     eligible = [
         index
         for index, specimen in enumerate(manifest["specimens"])
-        if specimen["checkpoints"]["detection"].get("state") == "complete"
+        if specimen["checkpoints"]["preprocessing"].get("state") == "complete"
+        and specimen["checkpoints"]["detection"].get("state") == "complete"
+        and specimen["checkpoints"]["review"].get("state") == "complete"
     ]
     if not eligible:
-        raise ValueError("No detected specimens are ready for measurement.")
+        raise ValueError(
+            "No specimen has completed preprocessing, detection, and manual review."
+        )
     summaries: list[dict[str, object]] = []
     work_units: dict[int, int] = {}
     for specimen_index in eligible:

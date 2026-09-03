@@ -7,6 +7,7 @@ from threading import Event
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSettings, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
@@ -27,7 +28,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
-    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -58,6 +58,7 @@ from .preprocessing import (
     PreviewResult,
     ProcessingCancelled,
     StackStatistics,
+    effective_preprocessing_settings,
     make_preview,
     process_project_cache,
 )
@@ -70,6 +71,8 @@ from .detection import (
     load_detection_slice,
 )
 from .review import (
+    ALWAYS_LOW_MEMORY_REVIEW_MODE,
+    AUTOMATIC_REVIEW_MEMORY_MODE,
     ReviewAction,
     ReviewSlice,
     apply_review_action,
@@ -115,6 +118,17 @@ DISTRIBUTION_COLORS = (
     (35, 0, 75), (75, 3, 110), (112, 14, 117), (147, 37, 103), (177, 63, 82),
     (204, 93, 58), (224, 127, 36), (239, 167, 25), (246, 210, 42), (240, 249, 33),
 )
+REVIEW_BRUSH_COLORS = {
+    "exclude": QColor("#ff3030"),
+    "add": QColor("#2ecc71"),
+    "trim": QColor("#ff00ff"),
+    "expand": QColor("#2389ff"),
+    "split": QColor("#ffe119"),
+    "filopodium": QColor("#9b59b6"),
+    "merge": QColor("#ED6291"),
+    "accept": QColor("#22d3ee"),
+    "needs_attention": QColor("#ff8c1a"),
+}
 
 
 def _label_colors(labels: np.ndarray, kind: int) -> np.ndarray:
@@ -480,12 +494,20 @@ class SpineMapView(SliceView):
         filtered = np.where(np.isin(labels, list(visible_ids)), labels, 0).astype(
             np.uint32
         )
-        boundaries = self._boundaries(filtered)
-        other = boundaries & (filtered != int(current_id or 0))
-        rgb[other] = (105, 205, 225) if not focus_only else (120, 130, 135)
+        boundary_pixels = self._boundaries(filtered)
+        other = ndimage.binary_dilation(
+            boundary_pixels & (filtered != int(current_id or 0)),
+            structure=np.ones((3, 3), dtype=bool),
+            iterations=2,
+        )
+        rgb[other] = (0, 255, 255)
         if current_id is not None:
-            current = boundaries & (filtered == current_id)
-            rgb[current] = (255, 230, 20)
+            current = ndimage.binary_dilation(
+                boundary_pixels & (filtered == current_id),
+                structure=np.ones((3, 3), dtype=bool),
+                iterations=2,
+            )
+            rgb[current] = (0, 255, 0)
         image = QImage(
             np.ascontiguousarray(rgb).data,
             rgb.shape[1],
@@ -730,10 +752,15 @@ class ReviewCanvas(SliceView):
         self._strokes: list[list[tuple[int, int]]] = []
         self._drawing = False
         self._brush_radius = 4
+        self._hint_color = QColor(REVIEW_BRUSH_COLORS["add"])
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     def set_brush_radius(self, radius: int) -> None:
         self._brush_radius = max(1, int(radius))
+        self._draw_hints()
+
+    def set_hint_color(self, color: QColor) -> None:
+        self._hint_color = QColor(color)
         self._draw_hints()
 
     def clear_hint(self) -> None:
@@ -821,7 +848,7 @@ class ReviewCanvas(SliceView):
         image = self._base_image.copy()
         painter = QPainter(image)
         pen = QPen(
-            QColor(255, 220, 0, 230),
+            self._hint_color,
             self._brush_radius * 2 + 1,
             Qt.PenStyle.SolidLine,
             Qt.PenCapStyle.RoundCap,
@@ -2232,7 +2259,6 @@ class MainWindow(QMainWindow):
         self._review_refresh_pending = False
         self._context_thread: QThread | None = None
         self._context_worker: ContextWorker | None = None
-        self._context_progress: QProgressDialog | None = None
         self._context_request: tuple[object, ...] | None = None
         self._context_cache: dict[tuple[object, ...], ContextVolume] = {}
         self._context_dialogs: list[ContextViewerDialog] = []
@@ -2481,6 +2507,23 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(3, False)
         self.tabs.setTabEnabled(4, False)
         self.setCentralWidget(central)
+        self._build_context_status_line()
+
+    def _build_context_status_line(self) -> None:
+        self.context_status_widget = QWidget()
+        layout = QHBoxLayout(self.context_status_widget)
+        layout.setContentsMargins(4, 0, 4, 0)
+        self.context_status_label = QLabel("Preparing image context…")
+        layout.addWidget(self.context_status_label, 1)
+        self.context_status_progress = QProgressBar()
+        self.context_status_progress.setMinimumWidth(220)
+        self.context_status_progress.setRange(0, 1)
+        layout.addWidget(self.context_status_progress)
+        self.cancel_context_button = QPushButton("Cancel")
+        self.cancel_context_button.clicked.connect(self._cancel_context_generation)
+        layout.addWidget(self.cancel_context_button)
+        self.context_status_widget.setVisible(False)
+        self.statusBar().addPermanentWidget(self.context_status_widget, 1)
 
     def _build_preprocessing_tab(self) -> None:
         tab = QWidget()
@@ -2504,6 +2547,17 @@ class MainWindow(QMainWindow):
         selection_layout.addWidget(self.preprocess_channel)
         self.representative_check = QCheckBox("Use as representative specimen")
         selection_layout.addWidget(self.representative_check)
+        self.special_preprocessing_check = QCheckBox(
+            "Use special preprocessing settings for this pair"
+        )
+        self.special_preprocessing_check.setToolTip(
+            "When checked, ChanA and ChanB keep specimen-specific settings. "
+            "Clearing the checkmark returns to batch defaults without deleting the saved override."
+        )
+        self.special_preprocessing_check.toggled.connect(
+            self._special_preprocessing_toggled
+        )
+        selection_layout.addWidget(self.special_preprocessing_check)
         outer.addWidget(selection)
 
         controls = QGroupBox("Adaptive preprocessing settings for this channel")
@@ -2988,6 +3042,21 @@ class MainWindow(QMainWindow):
             self._review_brush_changed
         )
         correction_form.addRow("Hint brush radius:", self.review_brush_radius)
+        self.review_memory_mode = QComboBox()
+        self.review_memory_mode.addItem(
+            "Automatic (use slow mode when needed)",
+            AUTOMATIC_REVIEW_MEMORY_MODE,
+        )
+        self.review_memory_mode.addItem(
+            "Always use slow low-memory correction",
+            ALWAYS_LOW_MEMORY_REVIEW_MODE,
+        )
+        self.review_memory_mode.setToolTip(
+            "Automatic mode uses disk-backed correction when the selected object "
+            "would exceed the RAM safety limit. Forced mode is slower but useful "
+            "on computers with little available memory."
+        )
+        correction_form.addRow("Memory strategy:", self.review_memory_mode)
         self.review_instruction = QLabel()
         self.review_instruction.setWordWrap(True)
         correction_form.addRow(self.review_instruction)
@@ -3538,6 +3607,15 @@ class MainWindow(QMainWindow):
             )
         )
         self.representative_check.setChecked(index in representatives)
+        special = {
+            int(value)
+            for value in self.manifest["preprocessing"].get(
+                "special_specimens", []
+            )
+        }
+        self.special_preprocessing_check.blockSignals(True)
+        self.special_preprocessing_check.setChecked(index in special)
+        self.special_preprocessing_check.blockSignals(False)
         self.z_slider.blockSignals(True)
         self.z_slider.setRange(0, max(0, z_count - 1))
         self.z_slider.setValue(max(0, (z_count - 1) // 2))
@@ -3554,13 +3632,27 @@ class MainWindow(QMainWindow):
         self._load_channel_settings()
         self._preprocess_specimen_changed()
 
+    def _special_preprocessing_toggled(self, _checked: bool) -> None:
+        if self.manifest is None:
+            return
+        self._last_preview = None
+        self._load_channel_settings()
+        self._preview_timer.start()
+
     def _load_channel_settings(self) -> None:
         if self.manifest is None:
             return
         channel = self._selected_preprocess_channel()
-        settings = PreprocessingSettings.from_dict(
-            self.manifest["preprocessing"]["settings_by_channel"][channel]
+        specimen_index = self._selected_specimen_index()
+        preprocessing = self.manifest["preprocessing"]
+        saved = preprocessing.get("settings_by_specimen", {}).get(
+            str(specimen_index), {}
         )
+        if self.special_preprocessing_check.isChecked() and channel in saved:
+            value = saved[channel]
+        else:
+            value = preprocessing["settings_by_channel"][channel]
+        settings = PreprocessingSettings.from_dict(value)
         for widget, value in (
             (self.background_spin, settings.background_percentile),
             (self.sigma_xy_spin, settings.gaussian_sigma_xy_um),
@@ -3608,31 +3700,102 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No project", "Save or open a project first.")
             return
         try:
-            channel = self._selected_preprocess_channel()
-            index = self._selected_specimen_index()
-            settings = self._current_preprocessing_settings()
-            self.manifest["preprocessing"]["settings_by_channel"][channel] = settings.to_dict()
-            representatives = {
-                int(value)
-                for value in self.manifest["preprocessing"].get(
-                    "representative_specimens", []
-                )
-            }
-            if self.representative_check.isChecked():
-                representatives.add(index)
-            else:
-                representatives.discard(index)
-            self.manifest["preprocessing"]["representative_specimens"] = sorted(
-                representatives
-            )
+            channel, invalidated = self._store_preprocessing_selection()
             save_project(self.project_path, self.manifest)
             self._last_preview = None
             self.preprocessing_status.setText(
-                f"Saved {channel} settings. Previewing with the updated parameters."
+                f"Saved {channel} "
+                + (
+                    "special settings for this pair"
+                    if self.special_preprocessing_check.isChecked()
+                    else "batch-default settings"
+                )
+                + (
+                    f"; invalidated {invalidated} affected preprocessing checkpoint(s)."
+                    if invalidated
+                    else "."
+                )
+                + " Previewing with the updated parameters."
             )
             self._request_preview()
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot apply settings", str(exc))
+
+    def _store_preprocessing_selection(self) -> tuple[str, int]:
+        if self.manifest is None:
+            raise ValueError("Save or open a project first.")
+        before = {
+            (index, channel): effective_preprocessing_settings(
+                self.manifest, index, channel
+            ).to_dict()
+            for index, _specimen in enumerate(self.manifest["specimens"])
+            for channel in ("ChanA", "ChanB")
+        }
+        channel = self._selected_preprocess_channel()
+        specimen_index = self._selected_specimen_index()
+        settings = self._current_preprocessing_settings().to_dict()
+        preprocessing = self.manifest["preprocessing"]
+        representatives = {
+            int(value)
+            for value in preprocessing.get("representative_specimens", [])
+        }
+        if self.representative_check.isChecked():
+            representatives.add(specimen_index)
+        else:
+            representatives.discard(specimen_index)
+        preprocessing["representative_specimens"] = sorted(representatives)
+
+        special = {
+            int(value) for value in preprocessing.get("special_specimens", [])
+        }
+        if self.special_preprocessing_check.isChecked():
+            special.add(specimen_index)
+            by_specimen = preprocessing.setdefault("settings_by_specimen", {})
+            specimen_settings = by_specimen.setdefault(str(specimen_index), {})
+            for candidate_channel in ("ChanA", "ChanB"):
+                specimen_settings.setdefault(
+                    candidate_channel,
+                    dict(preprocessing["settings_by_channel"][candidate_channel]),
+                )
+            specimen_settings[channel] = settings
+        else:
+            special.discard(specimen_index)
+            preprocessing["settings_by_channel"][channel] = settings
+        preprocessing["special_specimens"] = sorted(special)
+
+        changed: dict[int, list[str]] = {}
+        for key, prior in before.items():
+            index, candidate_channel = key
+            current = effective_preprocessing_settings(
+                self.manifest, index, candidate_channel
+            ).to_dict()
+            if current != prior:
+                changed.setdefault(index, []).append(candidate_channel)
+        for index, channels in changed.items():
+            self._invalidate_preprocessing_channels(index, channels)
+        return channel, sum(len(channels) for channels in changed.values())
+
+    def _invalidate_preprocessing_channels(
+        self, specimen_index: int, channels: list[str]
+    ) -> None:
+        if self.manifest is None:
+            return
+        specimen = self.manifest["specimens"][specimen_index]
+        now = time.time()
+        preprocessing = specimen["checkpoints"]["preprocessing"]
+        completed_channels = preprocessing.setdefault("channels", {})
+        for channel in channels:
+            completed_channels.pop(channel, None)
+        preprocessing.update({"state": "not_started", "updated_at": now})
+        for stage in ("detection", "review", "measurements"):
+            checkpoint = specimen["checkpoints"].setdefault(stage, {})
+            checkpoint.update({"state": "not_started", "updated_at": now})
+        specimen["review"]["state"] = "needs_attention"
+        self._context_cache = {
+            key: value
+            for key, value in self._context_cache.items()
+            if int(key[0]) != specimen_index
+        }
 
     def _preview_cache_key(self) -> tuple[object, ...]:
         settings = self._current_preprocessing_settings()
@@ -3737,10 +3900,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._sync_manifest_edits()
-            channel = self._selected_preprocess_channel()
-            self.manifest["preprocessing"]["settings_by_channel"][channel] = (
-                self._current_preprocessing_settings().to_dict()
-            )
+            self._store_preprocessing_selection()
             save_project(self.project_path, self.manifest)
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot start preprocessing", str(exc))
@@ -4106,6 +4266,13 @@ class MainWindow(QMainWindow):
             f"{len(detected)} detected specimen(s) available; "
             f"{complete_count} marked review complete. New detections appear here immediately."
         )
+        memory_mode = str(
+            self.manifest["review_settings"].get(
+                "memory_mode", AUTOMATIC_REVIEW_MEMORY_MODE
+            )
+        )
+        memory_index = self.review_memory_mode.findData(memory_mode)
+        self.review_memory_mode.setCurrentIndex(max(0, memory_index))
         if detected:
             self._review_specimen_changed()
         else:
@@ -4131,12 +4298,14 @@ class MainWindow(QMainWindow):
         if self.manifest is None:
             self.tabs.setTabEnabled(4, False)
             return
-        detected = [
+        reviewed = [
             index
             for index, specimen in enumerate(self.manifest["specimens"])
-            if specimen["checkpoints"]["detection"].get("state") == "complete"
+            if specimen["checkpoints"]["preprocessing"].get("state") == "complete"
+            and specimen["checkpoints"]["detection"].get("state") == "complete"
+            and specimen["checkpoints"]["review"].get("state") == "complete"
         ]
-        self.tabs.setTabEnabled(4, bool(detected))
+        self.tabs.setTabEnabled(4, bool(reviewed))
         settings = MeasurementSettings.from_dict(
             self.manifest["measurements"]["settings"]
         )
@@ -4167,7 +4336,7 @@ class MainWindow(QMainWindow):
         self.measurement_specimen.blockSignals(True)
         self.measurement_specimen.clear()
         complete = 0
-        for index in detected:
+        for index in reviewed:
             specimen = self.manifest["specimens"][index]
             checkpoint = specimen["checkpoints"].get("measurements", {})
             state = str(checkpoint.get("state", "not_started"))
@@ -4181,10 +4350,12 @@ class MainWindow(QMainWindow):
             self.measurement_specimen.setCurrentIndex(max(0, found))
         self.measurement_specimen.blockSignals(False)
         self.measurement_status.setText(
-            f"{len(detected)} detected specimen(s); {complete} measurement checkpoint(s) complete."
+            f"{len(reviewed)} fully reviewed specimen(s) eligible; "
+            f"{complete} measurement checkpoint(s) complete. "
+            "Incomplete pairs are skipped and can be measured later with Resume."
         )
         self._refresh_distribution_groups()
-        if detected:
+        if reviewed:
             self._measurement_specimen_changed()
 
     def _save_measurement_settings(self) -> None:
@@ -4822,6 +4993,18 @@ class MainWindow(QMainWindow):
     def _export_measurements(self) -> None:
         if self.manifest is None:
             return
+        complete = sum(
+            specimen["checkpoints"].get("measurements", {}).get("state")
+            == "complete"
+            for specimen in self.manifest["specimens"]
+        )
+        omitted = len(self.manifest["specimens"]) - complete
+        self.measurement_status.setText(
+            f"Partial export: {complete} completed pair(s) included; "
+            f"{omitted} incomplete pair(s) omitted."
+            if omitted
+            else f"Export includes all {complete} completed pair(s)."
+        )
         output = Path(str(self.manifest["output_directory"]))
         selected, _ = QFileDialog.getSaveFileName(
             self,
@@ -5121,6 +5304,9 @@ class MainWindow(QMainWindow):
 
     def _review_tool_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
         operation = str(self.review_operation.currentData())
+        self.review_view.set_hint_color(
+            REVIEW_BRUSH_COLORS.get(operation, QColor("#ffe119"))
+        )
         if operation == "filopodium":
             self.review_object_type.setCurrentIndex(
                 self.review_object_type.findData("spine")
@@ -5180,6 +5366,11 @@ class MainWindow(QMainWindow):
             projection_hint=self.review_view_mode.currentData() == "xy_max",
             strokes=self.review_view.hint_strokes(),
         )
+        self.manifest["review_settings"]["memory_mode"] = str(
+            self.review_memory_mode.currentData()
+            or AUTOMATIC_REVIEW_MEMORY_MODE
+        )
+        save_project(self.project_path, self.manifest)
         self._start_review_worker(action)
 
     def _undo_review_action(self) -> None:
@@ -5250,13 +5441,23 @@ class MainWindow(QMainWindow):
             self.review_status.setText(
                 f"Add hints: {len(created)}/{len(result.hint_results)} object(s) created. "
                 + (f"{details}. " if details else "")
+                + (
+                    "Slow low-memory correction was used. "
+                    if result.processing_mode == "low_memory"
+                    else ""
+                )
                 + checkpoint
             )
             return
         self.review_status.setText(
             f"Saved {result.operation}: {result.dendrite_count} dendrites, "
             f"{result.spine_count} spines; {result.edit_count} active edit(s). "
-            "An automatic specimen checkpoint was written."
+            + (
+                "Slow low-memory correction was used. "
+                if result.processing_mode == "low_memory"
+                else ""
+            )
+            + "An automatic specimen checkpoint was written."
         )
 
     @Slot(str)
@@ -5290,6 +5491,7 @@ class MainWindow(QMainWindow):
             self.review_object_type,
             self.review_operation,
             self.review_brush_radius,
+            self.review_memory_mode,
             self.review_projections_button,
             self.review_3d_button,
             self.clear_review_hint_button,
@@ -5336,6 +5538,7 @@ class MainWindow(QMainWindow):
         self.review_status.setText(
             f"Specimen review marked {state}; comment and checkpoint saved."
         )
+        self._prepare_measurements_tab()
         if complete:
             self._move_review_specimen(1)
 
@@ -5518,10 +5721,8 @@ class MainWindow(QMainWindow):
                 self._show_context_dialog(request, self._context_cache[cache_key])
             return
         if self._context_thread is not None:
-            QMessageBox.information(
-                self,
-                "3D view in progress",
-                "Wait for the current projection/3D view to finish generating.",
+            self.context_status_label.setText(
+                "A projection or 3D view is already being generated."
             )
             return
         self._start_context_generation(request)
@@ -5560,30 +5761,32 @@ class MainWindow(QMainWindow):
         worker.cancelled.connect(thread.quit)
         thread.finished.connect(self._context_finished)
         thread.finished.connect(thread.deleteLater)
-        progress_dialog = QProgressDialog(
-            "Preparing projections and 3D objects…", "Cancel", 0, 1, self
-        )
-        progress_dialog.setWindowTitle("Generating 3D context")
-        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        progress_dialog.setAutoClose(False)
-        progress_dialog.setAutoReset(False)
-        progress_dialog.canceled.connect(worker.cancel)
-        progress_dialog.show()
         self._context_thread = thread
         self._context_worker = worker
-        self._context_progress = progress_dialog
         self._context_request = request
+        self.context_status_label.setText("Preparing projections and 3D objects…")
+        self.context_status_progress.setRange(0, 1)
+        self.context_status_progress.setValue(0)
+        self.cancel_context_button.setEnabled(True)
+        self.context_status_widget.setVisible(True)
         thread.start()
 
     @Slot(str, int, int, str)
     def _context_progress_updated(
         self, phase: str, current: int, total: int, detail: str
     ) -> None:
-        if self._context_progress is None:
+        self.context_status_progress.setRange(0, max(1, total))
+        self.context_status_progress.setValue(current)
+        self.context_status_label.setText(f"{phase}: {detail}")
+
+    def _cancel_context_generation(self) -> None:
+        if self._context_worker is None:
             return
-        self._context_progress.setRange(0, max(1, total))
-        self._context_progress.setValue(current)
-        self._context_progress.setLabelText(f"{phase}\n{detail}")
+        self._context_worker.cancel()
+        self.cancel_context_button.setEnabled(False)
+        self.context_status_label.setText(
+            "Cancellation requested; finishing the current safe step…"
+        )
 
     @Slot(object)
     def _context_completed(self, volume: ContextVolume) -> None:
@@ -5740,15 +5943,12 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _context_finished(self) -> None:
-        if self._context_progress is not None:
-            self._context_progress.close()
-            self._context_progress.deleteLater()
         if self._context_worker is not None:
             self._context_worker.deleteLater()
-        self._context_progress = None
         self._context_worker = None
         self._context_thread = None
         self._context_request = None
+        self.context_status_widget.setVisible(False)
 
     def _invalidate_context_views(
         self, specimen_index: int, *, corrected_only: bool
@@ -6347,7 +6547,19 @@ class MainWindow(QMainWindow):
             eligible = bool(
                 self.manifest
                 and any(
-                    specimen["checkpoints"]["detection"].get("state")
+                    specimen["checkpoints"]["preprocessing"].get("state")
+                    == "complete"
+                    and specimen["checkpoints"]["detection"].get("state")
+                    == "complete"
+                    and specimen["checkpoints"]["review"].get("state")
+                    == "complete"
+                    for specimen in self.manifest["specimens"]
+                )
+            )
+            measured = bool(
+                self.manifest
+                and any(
+                    specimen["checkpoints"].get("measurements", {}).get("state")
                     == "complete"
                     for specimen in self.manifest["specimens"]
                 )
@@ -6356,20 +6568,20 @@ class MainWindow(QMainWindow):
             self.save_measurement_settings_button.setEnabled(
                 not running and self.manifest is not None
             )
-            self.load_trim_preview_button.setEnabled(not running and eligible)
+            self.load_trim_preview_button.setEnabled(not running and measured)
             self.cancel_measurements_button.setEnabled(
                 running and self._job_kind == "measurements"
             )
             self.save_distribution_review_button.setEnabled(not running)
-            self.export_measurements_button.setEnabled(not running and eligible)
+            self.export_measurements_button.setEnabled(not running and measured)
             self.centerline_hint_button.setEnabled(
                 not running
-                and eligible
+                and measured
                 and self._current_spine_review_mode() == "cluster_positive"
             )
             self.clear_centerline_hint_button.setEnabled(
                 not running
-                and eligible
+                and measured
                 and self._last_distribution_preview is not None
                 and bool(
                     self._last_distribution_preview.row.get(
@@ -6377,7 +6589,7 @@ class MainWindow(QMainWindow):
                     )
                 )
             )
-            self.open_spine_map_button.setEnabled(not running and eligible)
+            self.open_spine_map_button.setEnabled(not running and measured)
         if not running and not self.progress_label.text():
             self.progress_label.setText("Ready")
 

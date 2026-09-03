@@ -30,6 +30,8 @@ def default_preprocessing_manifest() -> dict[str, object]:
             "ChanB": dict(settings),
         },
         "representative_specimens": [],
+        "special_specimens": [],
+        "settings_by_specimen": {},
     }
 
 
@@ -51,6 +53,7 @@ def default_detection_manifest() -> dict[str, object]:
 def default_review_manifest() -> dict[str, object]:
     return {
         "algorithm_version": 2,
+        "memory_mode": "automatic",
         "local_margin_um": 1.0,
         "z_radius_slices": 2,
         "add_z_radius_slices": 6,
@@ -80,11 +83,17 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     application["name"] = "Synpo"
     application["version"] = __version__
     manifest.setdefault("resource_policy", {"maximum_ram_fraction": 0.8})
-    manifest.setdefault("preprocessing", default_preprocessing_manifest())
+    preprocessing = manifest.setdefault(
+        "preprocessing", default_preprocessing_manifest()
+    )
+    preprocessing.setdefault("representative_specimens", [])
+    preprocessing.setdefault("special_specimens", [])
+    preprocessing.setdefault("settings_by_specimen", {})
     manifest.setdefault("detection", default_detection_manifest())
     manifest["detection"].setdefault("memory_mode", "automatic")
     review_settings = manifest.setdefault("review_settings", default_review_manifest())
     review_settings["algorithm_version"] = 2
+    review_settings.setdefault("memory_mode", "automatic")
     review_settings.setdefault("add_z_radius_slices", 6)
     manifest.setdefault("measurements", default_measurements_manifest())
     import_settings = manifest.setdefault(

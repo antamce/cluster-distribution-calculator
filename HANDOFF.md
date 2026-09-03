@@ -3,7 +3,7 @@
 This document is the context-free continuation record for Synpo. Read it before
 changing code, publishing a release, or proposing the next stage. It describes the
 current approved behavior, scientific invariants, architecture, repository state,
-validation procedure, and remaining work as of 2026-09-02.
+validation procedure, and remaining work as of 2026-09-03.
 
 ## One-minute orientation
 
@@ -17,9 +17,11 @@ validation procedure, and remaining work as of 2026-09-02.
 - Current development release commit: `bb2219a` (`Release Synpo 0.8.0 beta`).
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
 - Current public beta commit: `54b77fa` (`Release Synpo 0.8.0 beta`).
-- Full test result at release: 34 tests passed.
-- Current user status: the 0.8.0 beta adds approved low-memory detection for large
-  stacks. The synthetic regression suite passes; an actual approximately
+- Full test result for the current UX update: 41 tests passed.
+- Current user status: the 0.8.0 beta now includes pair-specific preprocessing
+  overrides, action-colored correction brushes, non-modal context-generation
+  progress, high-visibility spine-map outlines, low-memory corrections, and
+  reviewed-pair measurement gating with partial export. An actual approximately
   `80 x 2048 x 2048` stack on a 4 GB device remains the preferred field test.
 - Development method: build in stages and do not move to a new stage until the user
   explicitly approves the previous one. All behavior through the current beta is
@@ -93,7 +95,7 @@ $env:PYTHONPATH = (Resolve-Path "src").Path
 conda run -n synpo-microscopy python -m pytest -q
 ```
 
-Expected release baseline: `34 passed`. Also perform an offscreen application
+Expected release baseline: `41 passed`. Also perform an offscreen application
 construction smoke test after material UI changes. The application title should
 contain `Synpo Microscopy Processor - Beta 0.8.0` (typographic dash may differ).
 
@@ -113,7 +115,8 @@ The user-approved workflow is:
 1. Select a folder or manually select paired TIFFs.
 2. Confirm channel roles, voxel calibration, and output location.
 3. Review paired files and parsed experimental groups.
-4. Tune preprocessing on representative specimens.
+4. Tune preprocessing on representative specimens; save pair-specific ChanA/ChanB
+   overrides for unusual pairs when needed.
 5. Preprocess the batch unattended and run automatic detection.
 6. Review every specimen; corrections are optional and become available while
    later pairs are still being detected.
@@ -180,8 +183,9 @@ and optional registered flag follow them.
 - Preprocessing target: under one minute per channel.
 - Standard detection target: under three minutes per pair. Low-memory detection may
   be substantially slower in exchange for bounded RAM use.
-- Corrections and review are optional. A satisfactory automatic result can proceed
-  without drawing or confirming each object.
+- Corrections are optional and a satisfactory automatic result can be marked review
+  complete without drawing or confirming each object. That explicit specimen-level
+  completion is required before measurement.
 - Detection intentionally errs toward extra spine and cluster candidates; uncertain
   candidates are flagged and can be excluded later.
 - A specimen is a field containing one or more dendrites. Multiple/crossing
@@ -234,7 +238,7 @@ and optional registered flag follow them.
 - `src/synpo/exporting.py`: verified Excel/CSV exports and optional validation/audit
   PDF generation.
 - `src/synpo/cli.py`: non-GUI scan/inspection command.
-- `tests/`: 34-test release suite, including importer, project, preprocessing,
+- `tests/`: 41-test release suite, including importer, project, preprocessing,
   detection, review, measurement, 3D rendering, and beta UI regression coverage.
 
 Keep project manifests at schema version 1 unless a real schema break is needed.
@@ -282,6 +286,9 @@ Runtime data live below the chosen output directory:
 - Scrollable Z viewer, zoom, contrast adjustment and representative-specimen tuning.
 - Independent channel settings: adaptive background percentile, physical XY/Z
   Gaussian smoothing and sensitivity/threshold controls with expanded beta ranges.
+- Pair-level special-setting checkmarks activate separate ChanA/ChanB overrides;
+  clearing a checkmark leaves its saved values dormant. Effective setting changes
+  invalidate only affected preprocessing and downstream checkpoints.
 - Background and threshold are estimated per stack.
 - Compressed, slice-wise, RAM-guarded batch processing with resume and progress/ETA.
 - Preprocessed data are used for detection/boundary guidance only.
@@ -334,6 +341,9 @@ laptop. Treat these as historical guidance, not guaranteed performance.
 - Rotation uses bounded element-wise float32 arithmetic instead of NumPy matrix
   multiplication inside paint events. Do not reintroduce native BLAS calls there:
   they caused a fatal Windows MKL/DLL delay-load crash on the user's laptop.
+- Projection/3D generation progress is a cancellable bottom status line, not a
+  modal progress dialog. Full-field spine maps use thick green outlines for the
+  current spine and thick cyan outlines for all others.
 
 ### Stage 4 - optional hint-assisted review (approved)
 
@@ -341,6 +351,8 @@ laptop. Treat these as historical guidance, not guaranteed performance.
   later detection.
 - Actions: add, exclude, exclude as filopodium, split, merge, expand, trim, accept,
   and flag as needing attention.
+- Hint colors are add green, exclude red, trim magenta, expand blue, split yellow,
+  filopodium purple, merge `#ED6291`, accept cyan, and needs-attention orange.
 - Hints can be drawn on Z slices or XY maximum projections. Projection hints search
   touched labels through Z or infer a plane from strongest nearby processed signal.
 - Each hint-assisted added object is independent. Boundaries are derived from the
@@ -349,9 +361,15 @@ laptop. Treat these as historical guidance, not guaranteed performance.
   actions atomically checkpoint masks and object statuses.
 - Review can be completed without corrections. Any later correction returns it to
   in-progress. Comments are per specimen.
+- Correction memory mode automatically moves oversized edits to disk-backed
+  workspaces; a forced slow low-memory option is also saved per project. Undo is
+  retained for low-memory exclude, filopodium, merge, split, trim, and expand.
 
 ### Stage 5 - association and measurements (approved)
 
+- Only specimens with complete preprocessing, detection, and manual-review
+  checkpoints are eligible. Resuming skips unfinished pairs, so spine review can
+  begin once the first eligible measurement checkpoint exists.
 - Uses compatible corrected dendrite/spine masks when present, otherwise immutable
   automatic masks.
 - Assigns a cluster to the single spine with greatest voxel overlap, provided the
@@ -404,6 +422,8 @@ laptop. Treat these as historical guidance, not guaranteed performance.
   individual distributions, specimen/group distributions, exclusion/invalid audits,
   compact group counts/means/variability/inclusion percentages, and settings.
 - CSV versions of every sheet are written and verified.
+- Partial export is permitted and includes only completed measurement checkpoints;
+  the measurement panel reports omitted unfinished pairs.
 - Optional multi-page PDFs use two original-channel XY maximum panels plus the
   ten-color mask/centerline and individual line/bar distribution. Main,
   distribution-excluded, and invalid-spine audit PDFs are independent options.
@@ -491,7 +511,7 @@ For a material change:
 1. Inspect `git status` and preserve unrelated user changes.
 2. Identify which computation signature/checkpoint must be invalidated.
 3. Add or update a focused regression test.
-4. Run the full 34-test baseline plus any relevant GUI smoke test.
+4. Run the full 41-test baseline plus any relevant GUI smoke test.
 5. Update version/docs only when preparing a requested release.
 6. Summarize behavior and validation for user approval before advancing stages.
 

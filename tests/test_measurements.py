@@ -78,6 +78,8 @@ class MeasurementTests(unittest.TestCase):
             ],
         }
         migrate_manifest(manifest)
+        manifest["specimens"][0]["checkpoints"]["review"]["state"] = "complete"
+        manifest["specimens"][0]["review"]["state"] = "complete"
         manifest["measurements"]["settings"] = MeasurementSettings(
             cluster_end_method="untrimmed"
         ).to_dict()
@@ -133,6 +135,7 @@ class MeasurementTests(unittest.TestCase):
             result = load_measurement_result(manifest, 0)
             self.assertEqual(len(result["spine_rows"]), 1)
             self.assertEqual(len(result["distribution_rows"]), 1)
+
             self.assertEqual(result["distribution_rows"][0]["spine_id"], 1)
             self.assertEqual(result["spine_rows"][0]["included_cluster_count"], 1)
             self.assertAlmostEqual(result["spine_rows"][0]["volume_um3"], 0.72)
@@ -241,6 +244,16 @@ class MeasurementTests(unittest.TestCase):
             invalidated = load_measurement_result(manifest, 0)
             self.assertEqual(invalidated["specimen_rows"][0]["spine_count"], 0)
             self.assertFalse(invalidated["spine_rows"][0]["spine_valid"])
+
+    def test_measurement_requires_completed_manual_review(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_project(root)
+            manifest["specimens"][0]["checkpoints"]["review"][
+                "state"
+            ] = "in_progress"
+            manifest["specimens"][0]["review"]["state"] = "in_progress"
+            with self.assertRaisesRegex(ValueError, "manual review"):
+                measure_project(manifest, project_path)
 
     def test_fixed_and_adaptive_end_trimming(self) -> None:
         areas = np.zeros((8, 2), dtype=np.int64)

@@ -92,6 +92,23 @@ class CachedStackResult:
     statistics: StackStatistics
 
 
+def effective_preprocessing_settings(
+    manifest: dict[str, object], specimen_index: int, channel: str
+) -> PreprocessingSettings:
+    """Return the active channel settings, including a specimen-pair override."""
+    preprocessing = manifest["preprocessing"]
+    active = {
+        int(value) for value in preprocessing.get("special_specimens", [])
+    }
+    saved = preprocessing.get("settings_by_specimen", {})
+    specimen_settings = saved.get(str(specimen_index), {})
+    if specimen_index in active and channel in specimen_settings:
+        value = specimen_settings[channel]
+    else:
+        value = preprocessing["settings_by_channel"][channel]
+    return PreprocessingSettings.from_dict(value)
+
+
 def _cancel_if_requested(cancel_event: Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise ProcessingCancelled("Preprocessing was cancelled. The partial cache can be resumed.")
@@ -517,8 +534,8 @@ def process_project_cache(
             _cancel_if_requested(cancel_event)
             channel_data = specimen["channels"][channel]
             z_count, _, _ = _z_count_and_shape(channel_data)
-            settings = PreprocessingSettings.from_dict(
-                manifest["preprocessing"]["settings_by_channel"][channel]
+            settings = effective_preprocessing_settings(
+                manifest, specimen_index, channel
             )
             filename = str(channel_data["filename"])
             source = channel_source_path(manifest, channel_data)

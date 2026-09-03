@@ -98,6 +98,9 @@ class ProjectTests(unittest.TestCase):
             loaded = load_project(save_project(root / "old.synpo.json", manifest))
             self.assertIn("preprocessing", loaded)
             self.assertEqual(loaded["detection"]["memory_mode"], "automatic")
+            self.assertEqual(loaded["review_settings"]["memory_mode"], "automatic")
+            self.assertEqual(loaded["preprocessing"]["special_specimens"], [])
+            self.assertEqual(loaded["preprocessing"]["settings_by_specimen"], {})
             self.assertIsInstance(
                 loaded["specimens"][0]["checkpoints"]["preprocessing"], dict
             )

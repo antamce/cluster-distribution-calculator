@@ -70,12 +70,19 @@ After saving or opening a project, open **2. Preprocessing**:
 2. Scroll through Z and tune display contrast. Contrast never changes data.
 3. Tune adaptive background percentile, physical-unit XY/Z Gaussian smoothing,
    and threshold sensitivity independently for both channels.
-4. Save channel settings, then select **Preprocess entire batch / resume**.
+4. For an unusual specimen pair, check **Use special preprocessing settings for
+   this pair** and save separate ChanA and ChanB values. Unchecked pairs continue
+   to use the channel-wide batch defaults. Clearing the checkmark makes a saved
+   override dormant rather than deleting it.
+5. Save channel settings, then select **Preprocess entire batch / resume**.
 
 Background and threshold values are estimated independently for every stack.
 Processed voxels are used only for detection; intensity measurements remain tied
 to original 16-bit TIFF voxels. Processing is slice-at-a-time and guarded by the
-project's 80% RAM ceiling.
+project's 80% RAM ceiling. Changing a batch default invalidates only ordinary
+specimens whose effective setting changed; changing or enabling a special override
+invalidates only that pair. Downstream detection, review, and measurement
+checkpoints for affected pairs are also made retryable.
 
 The compressed cache is stored at
 `.synpo-cache/<project-id>/preprocessed.zarr` below the output directory. Each
@@ -136,7 +143,7 @@ automatic result can be marked complete without drawing anything.
 
 The viewer shows a scrollable original 16-bit Z slice with contrast controls and
 colored overlays. Choose dendrite or spine, choose an action, then click or draw a
-yellow hint. The drawing guides the operation and is not treated as a final mask.
+colored hint. The drawing guides the operation and is not treated as a final mask.
 The same orthogonal-maximum and rotatable-3D buttons are available here, using the
 current corrected masks when corrections exist and automatic masks otherwise.
 
@@ -147,13 +154,26 @@ objects and infers the relevant Z plane; a missed-object hint uses the strongest
 nearby processed signal. Switch back to an individual slice whenever projected
 objects overlap ambiguously.
 
-Available actions are:
+Brush colors and actions are:
 
-- add a missed object using nearby image signal;
-- exclude an object or record a spine as an excluded filopodium;
-- split touching objects or merge objects;
-- expand or trim a boundary by re-evaluating a bounded 3D neighborhood;
-- accept an object or flag it as needing attention without changing its mask.
+- **Add missed object — green:** draw a separate stroke inside each missing
+  object. Each stroke seeds one independent 3D object whose final boundary follows
+  the preprocessed image signal.
+- **Exclude object — red:** touch an unwanted object to remove that complete 3D
+  object from the corrected mask.
+- **Trim boundary — magenta:** draw across excess segmentation. Synpo removes the
+  hinted region and retains the largest connected remainder of that object.
+- **Expand boundary — blue:** draw from an existing object toward omitted signal.
+  Synpo regrows that object through locally supported preprocessed signal.
+- **Split touching objects — yellow:** draw through the neck or contact that should
+  divide one object; connected pieces receive separate stable object IDs.
+- **Exclude as filopodium — purple:** touch a spine to exclude it while recording
+  the specific filopodium decision in the audit trail.
+- **Merge objects — `#ED6291` pink:** draw through at least two objects that should
+  be one; they are combined under one stable ID.
+- **Accept object — cyan:** retain the mask unchanged and record it as accepted.
+- **Flag object for attention — orange:** retain the mask unchanged while keeping
+  an explicit needs-attention status.
 
 **Undo drawn stroke** changes only the current hint. **Undo last applied
 correction** restores saved 3D labels and prior object status. Every applied action
@@ -165,6 +185,13 @@ Review groups are tied to their detection signature. If detection is rerun with
 different settings, stale corrections are ignored and the specimen returns to the
 review queue.
 
+Correction memory strategy defaults to **Automatic**, which uses the ordinary
+in-memory operation when safe and switches oversized object edits to a slower,
+disk-backed path. **Always use slow low-memory correction** is available for
+low-RAM computers. Exclude, filopodium, merge, split, trim, and expand preserve
+undo checkpoints in both modes; bounded add operations remain local and report the
+chosen mode.
+
 Projection/3D generation streams one Z slice at a time, enforces the 80% RAM
 ceiling, and adaptively limits the interactive rendering to 60,000 surface faces
 inside the selected rectangle. The projection window can independently hide
@@ -175,15 +202,22 @@ the displayed separation from `0.20×` to `5.00×`; `1.00×` is the confirmed
 physical calibration. This is display-only and never changes masks or measurements.
 Independent dendrite and spine opacity controls range from 5% to 100%; dendrites
 default to 75%, spines to 60%, and protein clusters remain fixed at 100% opacity.
+Generation progress and cancellation are shown in the status line at the bottom of
+the main window; generation does not open a modal progress popup. Numbered
+full-field spine maps draw the current spine with a five-pixel-or-wider bright
+green outline and every other visible spine with a similarly thick cyan outline.
 The Qt renderer performs its rotations with bounded element-wise array operations;
 it does not call a native BLAS matrix routine from the paint event. This avoids a
 Windows DLL delay-load failure observed on the development laptop.
 
 ## Stage 5: association and measurements
 
-Open **5. Measurements** after automatic detection. Corrected dendrite/spine masks
-are used when a compatible review checkpoint exists; otherwise the immutable
-automatic masks are measured. The configurable minimum cluster/spine overlap is
+Open **5. Measurements** after at least one specimen has completed preprocessing,
+automatic detection, and manual review. Clicking **Mark review complete** qualifies
+a specimen even when no corrections were needed. The resumable measurement batch
+processes only fully reviewed specimens and skips unfinished pairs until a later
+resume. Corrected dendrite/spine masks are used when present; otherwise the
+immutable automatic masks are measured. The configurable minimum cluster/spine overlap is
 80% by default. Each cluster is assigned to the spine with its greatest overlap,
 and only the overlapping portion contributes to cluster volume.
 
@@ -233,8 +267,10 @@ history. A hint invalidated by later mask correction falls back to the automatic
 endpoint and returns the spine to the unreviewed queue. Excel/CSV rows save both
 endpoint coordinates, source and validity; validation PDFs show both endpoint dots.
 
-The export button creates one verified Excel workbook plus CSV copies of every
-sheet. Sheets include master specimen/dendrite/spine/cluster rows,
+The export button permits a partial export as soon as one measurement checkpoint is
+complete. Its status states how many completed pairs are included and how many
+unfinished pairs are omitted. It creates one verified Excel workbook plus CSV
+copies of every sheet. Sheets include master specimen/dendrite/spine/cluster rows,
 `Distribution_Individual`, `Distribution_Specimen`, `Distribution_Group`,
 `Distribution_Excluded`, `Invalid_Spines`, compact group summaries, and settings.
 Optional PDFs contain one two-panel XY maximum-projection page per spine using the

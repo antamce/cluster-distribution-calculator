@@ -10,9 +10,10 @@ import numpy as np
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import QApplication
 
-from synpo.app import MainWindow, SliceView, SpineMapView
+from synpo.app import MainWindow, REVIEW_BRUSH_COLORS, ReviewCanvas, SliceView, SpineMapView
 from synpo.detection import ALWAYS_LOW_MEMORY_MODE, DetectionSettings
 from synpo.preprocessing import PreprocessingSettings
+from synpo.project import default_preprocessing_manifest, migrate_manifest
 
 
 class Stage7AUiTests(unittest.TestCase):
@@ -99,7 +100,74 @@ class Stage7AUiTests(unittest.TestCase):
         view.set_scene(raw, spines, clusters, {3, 9}, 9, focus_only=False)
         self.assertIsNotNone(view._image)
         self.assertEqual(view._visible_ids, {3, 9})
+        self.assertEqual(view._image.pixelColor(6, 10).name(), "#00ffff")
+        self.assertEqual(view._image.pixelColor(33, 25).name(), "#00ff00")
+        self.assertEqual(window.review_memory_mode.count(), 2)
+        self.assertFalse(window.context_status_widget.isVisible())
         view.close()
+        window.deleteLater()
+        self.app.processEvents()
+
+    def test_review_brush_palette_changes_with_action(self) -> None:
+        window = MainWindow()
+        canvas = window.review_view
+        self.assertIsInstance(canvas, ReviewCanvas)
+        for operation, expected in REVIEW_BRUSH_COLORS.items():
+            index = window.review_operation.findData(operation)
+            window.review_operation.setCurrentIndex(index)
+            self.assertEqual(canvas._hint_color.name(), expected.name())
+        window.deleteLater()
+        self.app.processEvents()
+
+    def test_special_preprocessing_invalidates_only_effectively_changed_pairs(self) -> None:
+        window = MainWindow()
+        manifest = {
+            "application": {},
+            "preprocessing": default_preprocessing_manifest(),
+            "specimens": [
+                {
+                    "channels": {},
+                    "checkpoints": {
+                        "preprocessing": {
+                            "state": "complete",
+                            "channels": {"ChanA": {}, "ChanB": {}},
+                        },
+                        "detection": {"state": "complete"},
+                        "review": {"state": "complete"},
+                        "measurements": {"state": "complete"},
+                    },
+                    "review": {"state": "complete"},
+                }
+                for _ in range(2)
+            ],
+        }
+        migrate_manifest(manifest)
+        window.manifest = manifest
+        window.preprocess_specimen.blockSignals(True)
+        window.preprocess_specimen.addItem("first", 0)
+        window.preprocess_specimen.addItem("second", 1)
+        window.preprocess_specimen.setCurrentIndex(0)
+        window.preprocess_specimen.blockSignals(False)
+        window.special_preprocessing_check.blockSignals(True)
+        window.special_preprocessing_check.setChecked(True)
+        window.special_preprocessing_check.blockSignals(False)
+        window.sensitivity_spin.setValue(2.0)
+        window._store_preprocessing_selection()
+        self.assertEqual(manifest["preprocessing"]["special_specimens"], [0])
+        self.assertEqual(
+            manifest["specimens"][0]["checkpoints"]["preprocessing"]["state"],
+            "not_started",
+        )
+        self.assertEqual(
+            manifest["specimens"][1]["checkpoints"]["preprocessing"]["state"],
+            "complete",
+        )
+        self.assertEqual(
+            manifest["preprocessing"]["settings_by_specimen"]["0"]["ChanA"][
+                "threshold_sensitivity"
+            ],
+            2.0,
+        )
         window.deleteLater()
         self.app.processEvents()
 

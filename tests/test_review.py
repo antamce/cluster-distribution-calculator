@@ -16,6 +16,7 @@ from synpo.models import Calibration
 from synpo.preprocessing import process_project_cache, project_cache_path
 from synpo.project import create_project_manifest, load_project, save_project
 from synpo.review import (
+    ALWAYS_LOW_MEMORY_REVIEW_MODE,
     ReviewAction,
     apply_review_action,
     load_review_slice,
@@ -344,6 +345,89 @@ class ReviewTests(unittest.TestCase):
             self.assertNotEqual(
                 int(corrected.spines[8, 36]), int(corrected.spines[8, 44])
             )
+
+    def test_forced_low_memory_correction_keeps_undo_available(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            manifest["review_settings"][
+                "memory_mode"
+            ] = ALWAYS_LOW_MEMORY_REVIEW_MODE
+            initial = load_review_slice(manifest, 0, 3, "ChanB")
+            y, x = (int(value) for value in np.argwhere(initial.dendrites > 0)[0])
+            object_id = int(initial.dendrites[y, x])
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="dendrite",
+                    operation="exclude",
+                    z_index=3,
+                    points=((x, y),),
+                    brush_radius_pixels=1,
+                ),
+            )
+            self.assertEqual(result.processing_mode, "low_memory")
+            self.assertFalse(
+                np.any(load_review_slice(manifest, 0, 3, "ChanB").dendrites == object_id)
+            )
+            undo_last_review_action(manifest, project_path, 0)
+            self.assertEqual(
+                int(load_review_slice(manifest, 0, 3, "ChanB").dendrites[y, x]),
+                object_id,
+            )
+
+    def test_forced_low_memory_split_labels_both_connected_sides(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            manifest["review_settings"][
+                "memory_mode"
+            ] = ALWAYS_LOW_MEMORY_REVIEW_MODE
+            before = load_review_slice(manifest, 0, 3, "ChanB")
+            object_id = int(before.dendrites[32, 40])
+            self.assertGreater(object_id, 0)
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="dendrite",
+                    operation="split",
+                    z_index=3,
+                    points=((40, 32),),
+                    brush_radius_pixels=4,
+                ),
+            )
+            self.assertEqual(result.processing_mode, "low_memory")
+            self.assertEqual(len(result.new_ids), 2)
+            corrected = load_review_slice(manifest, 0, 3, "ChanB")
+            self.assertNotEqual(
+                int(corrected.dendrites[32, 30]),
+                int(corrected.dendrites[32, 50]),
+            )
+
+    def test_forced_low_memory_expand_runs_disk_backed_propagation(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            manifest["review_settings"][
+                "memory_mode"
+            ] = ALWAYS_LOW_MEMORY_REVIEW_MODE
+            before = load_review_slice(manifest, 0, 3, "ChanB")
+            self.assertGreater(int(before.dendrites[32, 40]), 0)
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="dendrite",
+                    operation="expand",
+                    z_index=3,
+                    points=((40, 32),),
+                    brush_radius_pixels=1,
+                ),
+            )
+            self.assertEqual(result.processing_mode, "low_memory")
+            self.assertTrue(result.checkpoint_written)
 
 
 if __name__ == "__main__":
