@@ -14,9 +14,9 @@ validation procedure, and remaining work as of 2026-09-03.
 - Dedicated Conda environment: `synpo-microscopy`. Never modify the user's separate
   environment named `synpo`.
 - Current development branch: `lsh`.
-- Current development release commit: `bb2219a` (`Release Synpo 0.8.0 beta`).
+- Current development feature commit: `a2ad4dd` (`Improve batch preprocessing and review workflow`).
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
-- Current public beta commit: `54b77fa` (`Release Synpo 0.8.0 beta`).
+- Current public beta commit: `5523392` (`Improve preprocessing and review workflow`).
 - Full test result for the current UX update: 41 tests passed.
 - Current user status: the 0.8.0 beta now includes pair-specific preprocessing
   overrides, action-colored correction brushes, non-modal context-generation
@@ -534,7 +534,8 @@ For a material change:
 
 ## State immediately after this handoff update
 
-The 0.8.0 source release is `bb2219a` on local/development branch `lsh` and
-`origin/lsh`. The curated public beta is verified at `54b77fa` on
-`antamce/cluster-distribution` `main`. `HANDOFF.md` remains development-only and is
-never copied into the public repository.
+The current 0.8.0 UX feature implementation is `a2ad4dd` on the local `lsh`
+branch; the development remote was intentionally not changed by this public-only
+publishing request. The curated public beta is verified at `5523392` on
+`antamce/cluster-distribution` `main`. `HANDOFF.md` remains development-only and
+is never copied into the public repository.
