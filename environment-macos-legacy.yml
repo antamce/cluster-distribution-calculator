@@ -1,0 +1,22 @@
+name: synpo-microscopy
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  # Catalina is Intel-only. Qt's official 6.2.4 wheel targets macOS 10.14+
+  # and requires Python below 3.11, so this legacy environment is deliberately
+  # separate from the current macOS/Windows environment. It also covers macOS 11.
+  - python=3.10
+  - pip>=22
+  - libexpat
+  - tifffile>=2024.5,<2025
+  - scipy>=1.13,<1.14
+  - scikit-image>=0.24,<0.25
+  - zarr>=2.18,<3
+  - numcodecs>=0.12,<0.16
+  - psutil>=6,<7
+  - openpyxl>=3.1,<4
+  - matplotlib>=3.9,<3.10
+  - pytest>=8,<9
+  - pip:
+      - PySide6==6.2.4

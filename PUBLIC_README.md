@@ -4,7 +4,7 @@
   <img src="src/synpo/assets/synpo-icon.png" alt="Synpo icon" width="180">
 </p>
 
-Synpo is a Windows desktop application for processing paired-channel, 3D microscopy recordings of dendrites, dendritic spines, and protein clusters. It supports large batches from TIFF import through preprocessing, automatic 3D segmentation, optional guided correction, measurement, spine-distribution review, and Excel/CSV export.
+Synpo is a Windows and macOS desktop application for processing paired-channel, 3D microscopy recordings of dendrites, dendritic spines, and protein clusters. It supports large batches from TIFF import through preprocessing, automatic 3D segmentation, optional guided correction, measurement, spine-distribution review, and Excel/CSV export.
 
 This is the **0.8.0 beta release**. It is intended for supervised scientific use: review segmentation and centerline results before relying on exported measurements.
 
@@ -31,35 +31,48 @@ Synpo calculates measurements only. Perform statistical hypothesis testing in se
 
 ## Requirements
 
-- Windows 10 or Windows 11
-- Anaconda or Miniconda
+- Windows 10/11; macOS 12+ on Intel or Apple Silicon; or the separate legacy environment for Intel macOS 10.15 Catalina and macOS 11
+- Anaconda, Miniconda, or Miniforge
 - Sufficient free disk space for the compressed project cache, exports, and temporary low-memory detection data
 
-Synpo is designed for ordinary laptop hardware and limits itself to at most 80% of available RAM. Large stacks are processed with a disk-backed Z-slab method that merges objects crossing slab boundaries. Synpo checks the required temporary space before starting each such specimen. If space is insufficient, that specimen remains retryable and the rest of the batch continues. A macOS build is not included in this beta release.
+Synpo is designed for ordinary laptop hardware and limits itself to at most 80% of available RAM. Large stacks are processed with a disk-backed Z-slab method that merges objects crossing slab boundaries. Synpo checks the required temporary space before starting each such specimen. If space is insufficient, that specimen remains retryable and the rest of the batch continues.
 
 ## Installation
 
-Download or clone this repository. Open an **Anaconda Prompt** in the downloaded folder and run:
+The environment is named `synpo-microscopy`. Synpo never modifies a separate environment named `synpo`.
+
+### Windows
+
+Download or clone this repository and double-click `launch_synpo.bat`. It searches the active Conda installation, its saved choice, `PATH`, Conda's environment registry, the Windows registry, and common Anaconda, Miniconda, Miniforge, and Mambaforge locations. Custom installation directories and custom Conda `envs_dirs` are supported. If automatic discovery fails, select the Conda installation folder once; if the environment is missing, approve its creation when prompted.
+
+The choice is saved in `%APPDATA%\Synpo\launcher-conda.txt`. Delete that file to select another installation. Manual setup is also available from an **Anaconda Prompt**:
 
 ```powershell
 conda env create -f environment.yml
-launch_synpo.bat
-```
-
-The environment is named `synpo-microscopy`. If it already exists, update it before launching:
-
-```powershell
 conda env update -n synpo-microscopy -f environment.yml --prune
 launch_synpo.bat
 ```
-
-The launcher also works when `conda` is not recognized in an ordinary Command Prompt, provided Miniconda or Anaconda is installed in its usual location.
 
 To create a Synpo desktop shortcut with the supplied icon, run once:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\create_desktop_shortcut.ps1
 ```
+
+### macOS
+
+The standard environment supports Intel and Apple Silicon Macs on macOS 12 or newer. A separate legacy environment supports Intel macOS 10.15 Catalina and macOS 11 on Intel or Apple Silicon. The legacy file pins Python 3.10 and the official PySide6 6.2.4 wheel, keeping it isolated from current systems.
+
+In Terminal, make the launcher executable once and open it:
+
+```bash
+chmod +x launch_synpo.command
+./launch_synpo.command
+```
+
+It can subsequently be opened from Finder. Like the Windows launcher, it discovers Conda and custom environment locations automatically, presents a native folder picker only when necessary, remembers the successful choice in `~/Library/Application Support/Synpo/launcher-conda.txt`, and offers to create the OS-appropriate environment. If macOS blocks this unsigned beta script, right-click it, choose **Open**, and confirm once; do not disable Gatekeeper globally.
+
+Catalina users need the archived [Miniforge release that supports macOS 10.13-10.15](https://github.com/conda-forge/miniforge/releases/tag/26.1.1-3). Catalina dependency resolution has been verified; final application and representative-dataset testing must be performed on a Catalina Mac before treating that path as field-validated.
 
 ## Importing TIFF files
 

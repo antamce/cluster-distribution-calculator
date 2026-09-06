@@ -18,24 +18,59 @@ generated Zarr caches. They are user data or runtime artifacts, not source files
 ## Setup and launch
 
 The dedicated environment is `synpo-microscopy`; the separate environment named
-`synpo` is not used or modified. From an Anaconda Prompt in this directory:
+`synpo` is not used or modified. Both launchers discover environments in custom
+Conda `envs_dirs`, so neither assumes that the environment is inside the Anaconda
+or Miniconda installation folder.
+
+### Windows
+
+Double-click `launch_synpo.bat`. The launcher checks the active Conda installation,
+its saved choice, `PATH`, Conda's environment registry, the Windows registry, and
+common Anaconda, Miniconda, Miniforge, and Mambaforge locations. If discovery still
+fails, select the installation folder in the graphical picker. If
+`synpo-microscopy` is missing, the launcher offers to create it from
+`environment.yml`; it never changes an environment merely because Synpo starts.
+
+The successful choice is stored for this computer in
+`%APPDATA%\Synpo\launcher-conda.txt`. Delete that file to choose a different Conda
+installation. `conda` does not need to be on the ordinary Command Prompt's `PATH`.
+Run `scripts/create_desktop_shortcut.ps1` once to create a desktop shortcut.
+
+Manual setup and update commands remain available from an Anaconda Prompt:
 
 ```powershell
 conda env create -f environment.yml
-launch_synpo.bat
-```
-
-For an existing dedicated environment:
-
-```powershell
 conda env update -n synpo-microscopy -f environment.yml --prune
 launch_synpo.bat
 ```
 
-The launcher finds Miniconda or Anaconda directly and starts the dedicated
-environment through Conda's runner, so `conda` does not need to be on the ordinary
-Windows command prompt's `PATH`. Run
-`scripts/create_desktop_shortcut.ps1` once to create a desktop shortcut.
+### macOS
+
+The current environment supports Intel and Apple Silicon Macs on macOS 12 or
+newer. A separate legacy environment supports macOS 10.15 Catalina on Intel Macs
+and macOS 11 on Intel or Apple Silicon. It pins Python 3.10 and PySide6 6.2.4 so
+legacy support cannot downgrade packages for modern macOS or Windows users.
+
+In Terminal, make the launcher executable once and start it:
+
+```bash
+chmod +x launch_synpo.command
+./launch_synpo.command
+```
+
+After that, it can be opened from Finder. The launcher searches the active Conda,
+its saved choice, `PATH`, initialized zsh/bash shells, and common installation
+locations. It uses a macOS folder picker only if needed and offers to create the
+correct modern or legacy environment for the detected OS. The choice is stored in
+`~/Library/Application Support/Synpo/launcher-conda.txt`; delete that file to
+choose again.
+
+For Catalina, use the archived
+[Miniforge installer supporting macOS 10.13-10.15](https://github.com/conda-forge/miniforge/releases/tag/26.1.1-3).
+If Gatekeeper blocks the unsigned beta script, right-click
+`launch_synpo.command`, choose **Open**, and confirm once. Do not disable
+Gatekeeper globally. Catalina compatibility is dependency-solved but must still be
+confirmed by running the test suite and a real dataset on the Catalina device.
 
 ## Filename pairing
 

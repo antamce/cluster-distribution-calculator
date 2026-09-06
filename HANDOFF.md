@@ -3,26 +3,36 @@
 This document is the context-free continuation record for Synpo. Read it before
 changing code, publishing a release, or proposing the next stage. It describes the
 current approved behavior, scientific invariants, architecture, repository state,
-validation procedure, and remaining work as of 2026-09-03.
+validation procedure, and remaining work as of 2026-09-06.
 
 ## One-minute orientation
 
-- Product: Windows desktop application for paired-channel, registered 3D microscopy
-  TIFF stacks, written in Python 3.11/PySide6 and installed with Anaconda/Miniconda.
+- Product: Windows and macOS desktop application for paired-channel, registered 3D
+  microscopy TIFF stacks, written in Python/PySide6 and installed with Conda.
+  Current systems use Python 3.12/PySide6 6.7+; the isolated macOS 10.15/11 legacy
+  environment uses Python 3.10/PySide6 6.2.4.
 - Current version: `0.8.0 Beta`.
 - Development checkout: `C:\Users\user\Documents\code2\Synpo`.
 - Dedicated Conda environment: `synpo-microscopy`. Never modify the user's separate
   environment named `synpo`.
 - Current development branch: `lsh`.
-- Current development feature commit: `a2ad4dd` (`Improve batch preprocessing and review workflow`).
+- Current development tip before the uncommitted macOS launcher work: `069794d`
+  (`Record public publication state`).
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
 - Current public beta commit: `5523392` (`Improve preprocessing and review workflow`).
-- Full test result for the current UX update: 41 tests passed.
+- Current full Windows result: 46 passed and 1 platform-specific test skipped.
+  PowerShell and Bash syntax checks, Windows runtime resolution, Python 3.10 syntax
+  parsing, and the offscreen application construction smoke test also passed.
+  Conda dry-run resolution passed for Catalina `osx-64`, macOS 11 `osx-arm64`,
+  and macOS 12 on both `osx-64` and `osx-arm64`.
 - Current user status: the 0.8.0 beta now includes pair-specific preprocessing
   overrides, action-colored correction brushes, non-modal context-generation
   progress, high-visibility spine-map outlines, low-memory corrections, and
-  reviewed-pair measurement gating with partial export. An actual approximately
-  `80 x 2048 x 2048` stack on a 4 GB device remains the preferred field test.
+  reviewed-pair measurement gating with partial export. The current worktree adds
+  robust Conda discovery on Windows and macOS, a Finder launcher, and a separately
+  pinned Catalina/macOS 11 environment. These changes have not been published to
+  the public repository yet. An actual approximately `80 x 2048 x 2048` stack on a
+  4 GB device and a Catalina launch remain preferred field tests.
 - Development method: build in stages and do not move to a new stage until the user
   explicitly approves the previous one. All behavior through the current beta is
   approved.
@@ -82,11 +92,21 @@ Launch with:
 launch_synpo.bat
 ```
 
-The launcher locates common Miniconda/Anaconda installations directly and invokes
-`conda run`, so it works even when `conda` is not on `PATH`. The user considers a
-reproducible environment and desktop shortcut sufficient packaging for now.
-`scripts/create_desktop_shortcut.ps1` creates the Windows shortcut using the
-supplied Synpo `.ico` asset.
+`launch_synpo.bat` delegates to `scripts/launch_synpo.ps1`. The resolver checks the
+active and saved Conda, `PATH`, registered environments, registry/common locations,
+and finally a native folder picker. It discovers `synpo-microscopy` with `conda
+run`, so custom installation directories and custom `envs_dirs` work. Its per-user
+choice lives at `%APPDATA%\Synpo\launcher-conda.txt`.
+
+On macOS, run `chmod +x launch_synpo.command` once. It performs equivalent discovery
+through the active/saved Conda, `PATH`, initialized zsh/bash, common locations, and
+an AppleScript folder picker. It uses `environment.yml` on macOS 12+ and
+`environment-macos-legacy.yml` on macOS 10.15/11. Catalina is Intel-only; macOS 11
+and current macOS cover Intel and Apple Silicon. Its choice lives at
+`~/Library/Application Support/Synpo/launcher-conda.txt`. This is a source/Conda
+launcher, not a signed or notarized `.app` bundle. The current macOS work must be
+field-tested before it is described as verified. `scripts/create_desktop_shortcut.ps1`
+continues to create the Windows shortcut using the `.ico` asset.
 
 Run the complete suite from the repository root:
 
@@ -95,7 +115,8 @@ $env:PYTHONPATH = (Resolve-Path "src").Path
 conda run -n synpo-microscopy python -m pytest -q
 ```
 
-Expected release baseline: `41 passed`. Also perform an offscreen application
+Current Windows baseline: `46 passed, 1 skipped` (the macOS Bash execution test is
+the expected skip). Also perform an offscreen application
 construction smoke test after material UI changes. The application title should
 contain `Synpo Microscopy Processor - Beta 0.8.0` (typographic dash may differ).
 
@@ -205,10 +226,18 @@ and optional registered flag follow them.
   is measured for the current method.
 - Statistical hypothesis testing is out of scope. Synpo exports clearly labeled raw
   and summary metrics; the user performs statistics elsewhere.
-- Keep future design portable to macOS, although the current target is Windows.
+- Preserve both Windows and macOS behavior. macOS 10.15/11 depends on the isolated
+  legacy environment; do not loosen its pins without testing the Catalina device.
 
 ## Architecture map
 
+- `launch_synpo.bat` and `scripts/launch_synpo.ps1`: Windows entry point and robust
+  Conda/environment locator with a remembered per-user selection.
+- `launch_synpo.command`: Finder/Terminal entry point, macOS version-aware
+  environment creation, Conda discovery, native folder selection, and launch.
+- `environment.yml`: current Windows and macOS 12+ environment.
+- `environment-macos-legacy.yml`: macOS 10.15/11 compatibility environment using
+  Python 3.10 and the official PySide6 6.2.4 wheel.
 - `src/synpo/app.py`: PySide6 application, workflow tabs, background workers,
   progress/ETA plumbing, project state, viewers, review queues, dialogs and export
   orchestration. This is large; search for the relevant widget/class before editing.
@@ -484,7 +513,12 @@ There is no known active regression at this handoff. Remaining planned work is:
 4. Optionally add an in-app annotation/training utility after the core application.
    It must be optional, part of Synpo rather than Fiji-dependent, and may use up to
    two annotated pairs the user can provide.
-5. macOS packaging/compatibility is a future target, not current release scope.
+5. Run the full suite, application smoke test, and a representative small dataset
+   on the user's Intel Catalina device. Then repeat at least the launcher/smoke test
+   on an Apple Silicon macOS 12+ device. Catalina dependencies were cross-platform
+   solved with `CONDA_OVERRIDE_OSX=10.15`; that is not a substitute for execution.
+6. A signed/notarized `.app` or DMG remains future packaging work. The approved
+   first macOS delivery is the Conda-backed `launch_synpo.command` workflow.
 
 Do not infer that the next task is necessarily item 1 or 2. Ask or follow the user's
 next explicit stage request.

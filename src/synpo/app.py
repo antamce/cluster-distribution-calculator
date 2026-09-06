@@ -6615,7 +6615,9 @@ def main() -> int:
     application = QApplication(sys.argv)
     application.setApplicationName("Synpo Microscopy Processor")
     application.setOrganizationName("Synpo")
-    icon_path = Path(__file__).resolve().parent / "assets" / "synpo.ico"
+    assets_path = Path(__file__).resolve().parent / "assets"
+    icon_name = "synpo.ico" if sys.platform == "win32" else "synpo-icon.png"
+    icon_path = assets_path / icon_name
     if icon_path.is_file():
         application.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()

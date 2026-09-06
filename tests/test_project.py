@@ -5,11 +5,12 @@ import shutil
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import tifffile
 
-from synpo.calibration import CalibrationStore
+from synpo.calibration import CalibrationStore, default_preset_path
 from synpo.importer import inspect_manual_pair, scan_batch
 from synpo.models import Calibration
 from synpo.project import (
@@ -33,6 +34,17 @@ def workspace_directory():
 
 
 class ProjectTests(unittest.TestCase):
+    def test_macos_calibration_path_uses_application_support(self) -> None:
+        with patch("synpo.calibration.sys.platform", "darwin"), patch(
+            "synpo.calibration.Path.home", return_value=Path("/Users/scientist")
+        ):
+            path = default_preset_path()
+
+        self.assertEqual(
+            path,
+            Path("/Users/scientist/Library/Application Support/Synpo/calibrations.json"),
+        )
+
     def make_pair(self, root: Path) -> None:
         data = np.arange(3 * 8 * 9, dtype=np.uint16).reshape(3, 8, 9)
         for channel in ("ChanA", "ChanB"):

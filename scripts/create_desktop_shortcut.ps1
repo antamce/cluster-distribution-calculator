@@ -15,7 +15,7 @@ $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $launcher
 $shortcut.WorkingDirectory = $projectRoot
-$shortcut.Description = "Launch Synpo through its Anaconda environment"
+$shortcut.Description = "Launch Synpo through its dedicated Conda environment"
 if (Test-Path -LiteralPath $icon) {
     $shortcut.IconLocation = "$icon,0"
 }
