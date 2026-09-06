@@ -16,8 +16,8 @@ validation procedure, and remaining work as of 2026-09-06.
 - Dedicated Conda environment: `synpo-microscopy`. Never modify the user's separate
   environment named `synpo`.
 - Current development branch: `lsh`.
-- Current development tip before the uncommitted macOS launcher work: `069794d`
-  (`Record public publication state`).
+- Current development feature commit: `8ba4ebc` (`Add macOS launch and portable
+  Conda discovery`).
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
 - Current public beta commit: `5523392` (`Improve preprocessing and review workflow`).
 - Current full Windows result: 46 passed and 1 platform-specific test skipped.
@@ -28,11 +28,12 @@ validation procedure, and remaining work as of 2026-09-06.
 - Current user status: the 0.8.0 beta now includes pair-specific preprocessing
   overrides, action-colored correction brushes, non-modal context-generation
   progress, high-visibility spine-map outlines, low-memory corrections, and
-  reviewed-pair measurement gating with partial export. The current worktree adds
-  robust Conda discovery on Windows and macOS, a Finder launcher, and a separately
-  pinned Catalina/macOS 11 environment. These changes have not been published to
-  the public repository yet. An actual approximately `80 x 2048 x 2048` stack on a
-  4 GB device and a Catalina launch remain preferred field tests.
+  reviewed-pair measurement gating with partial export. Development commit
+  `8ba4ebc` adds robust Conda discovery on Windows and macOS, a Finder launcher,
+  and a separately pinned Catalina/macOS 11 environment. These changes have not
+  been published to the public user repository. An actual approximately
+  `80 x 2048 x 2048` stack on a 4 GB device and a Catalina launch remain preferred
+  field tests.
 - Development method: build in stages and do not move to a new stage until the user
   explicitly approves the previous one. All behavior through the current beta is
   approved.
