@@ -107,6 +107,12 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
         for row in spine
         if (str(row.get("experimental_group", "")), str(row.get("specimen_id", "")), int(row["spine_id"])) in invalid_ids
     ]
+    reviewed_spines = [
+        row
+        for row in spine
+        if bool(row.get("validity_reviewed", False))
+        or bool(row.get("distribution_reviewed", False))
+    ]
     settings = [
         {"section": "calibration", **dict(manifest["calibration"])},
         {"section": "measurements", **dict(manifest["measurements"]["settings"])},
@@ -130,6 +136,7 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
         "Distribution_Group": distribution_group,
         "Distribution_Excluded": excluded,
         "Invalid_Spines": invalid,
+        "Spine_Review_Audit": reviewed_spines,
         "Group_Summary": _group_summary(specimen),
         "Settings": settings,
     }
@@ -186,10 +193,23 @@ def _pdf_pages(
 
     colors = np.asarray(BIN_COLORS, dtype=np.float64) / 255.0
     with PdfPages(path) as pdf:
+        wrote_page = False
         if include_group_summary:
             for group in group_rows:
-                means = [group.get(f"bin_{index:02d}_mean") for index in range(1, 11)]
-                sem = [group.get(f"bin_{index:02d}_sem") for index in range(1, 11)]
+                means = np.asarray(
+                    [
+                        np.nan if group.get(f"bin_{index:02d}_mean") is None else float(group[f"bin_{index:02d}_mean"])
+                        for index in range(1, 11)
+                    ],
+                    dtype=np.float64,
+                )
+                sem = np.asarray(
+                    [
+                        np.nan if group.get(f"bin_{index:02d}_sem") is None else float(group[f"bin_{index:02d}_sem"])
+                        for index in range(1, 11)
+                    ],
+                    dtype=np.float64,
+                )
                 figure, axis = plt.subplots(figsize=(9, 6))
                 axis.errorbar(range(1, 11), means, yerr=sem, marker="o", capsize=3)
                 axis.set(xlabel="Spine part (shaft → tip)", ylabel="Cluster volume / spine-part volume", title=f"{group['experimental_group']} — specimen-weighted mean ± SEM")
@@ -198,6 +218,7 @@ def _pdf_pages(
                 axis.grid(alpha=0.25)
                 pdf.savefig(figure, bbox_inches="tight")
                 plt.close(figure)
+                wrote_page = True
         for position, (specimen_index, row) in enumerate(selected):
             preview = load_distribution_preview(
                 manifest, specimen_index, int(row["spine_id"]), margin_um=margin_um
@@ -227,6 +248,30 @@ def _pdf_pages(
                     color="white",
                     linewidth=1.2,
                 )
+            if preview.base_point_local_zyx is not None:
+                dendrite_axis.scatter(
+                    [preview.base_point_local_zyx[2]],
+                    [preview.base_point_local_zyx[1]],
+                    s=42,
+                    c="#20d060",
+                    edgecolors="black",
+                    linewidths=0.6,
+                    label="automatic base",
+                    zorder=5,
+                )
+            if preview.endpoint_local_zyx is not None:
+                dendrite_axis.scatter(
+                    [preview.endpoint_local_zyx[2]],
+                    [preview.endpoint_local_zyx[1]],
+                    s=42,
+                    c="#ed32c8",
+                    edgecolors="black",
+                    linewidths=0.6,
+                    label=f"{row.get('centerline_endpoint_source', 'automatic')} endpoint",
+                    zorder=5,
+                )
+            if preview.base_point_local_zyx is not None or preview.endpoint_local_zyx is not None:
+                dendrite_axis.legend(loc="lower right", fontsize=7)
             ratios = [row.get(f"bin_{index:02d}_ratio") for index in range(1, 11)]
             profile_axis.plot(range(1, 11), ratios, marker="o")
             profile_axis.set(xlabel="Spine part (shaft → tip)", ylabel="Cluster volume / spine-part volume")
@@ -235,12 +280,27 @@ def _pdf_pages(
             figure.suptitle(
                 f"{row['experimental_group']} | {row['specimen_id']} | spine {row['spine_id']}\n"
                 f"Axis: {row['distribution_axis_status']} | included: {row.get('distribution_included')} | "
-                f"valid: {row.get('spine_valid')} | {row.get('review_note', '')}"
+                f"valid: {row.get('spine_valid')} | endpoint: "
+                f"{row.get('centerline_endpoint_source', 'automatic')} | {row.get('review_note', '')}"
             )
             pdf.savefig(figure, bbox_inches="tight")
             plt.close(figure)
+            wrote_page = True
             if progress:
                 progress("Exporting validation PDF", position + 1, len(selected), f"Spine {row['spine_id']}")
+        if not wrote_page:
+            figure, axis = plt.subplots(figsize=(9, 6))
+            axis.axis("off")
+            axis.text(
+                0.5,
+                0.5,
+                "No spines matched this optional PDF category.",
+                ha="center",
+                va="center",
+                fontsize=14,
+            )
+            pdf.savefig(figure, bbox_inches="tight")
+            plt.close(figure)
 
 
 def export_measurements(

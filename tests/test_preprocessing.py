@@ -12,6 +12,7 @@ import zarr
 
 from synpo.preprocessing import (
     PreprocessingSettings,
+    effective_preprocessing_settings,
     estimate_stack_statistics,
     make_preview,
     process_stack_to_cache,
@@ -128,6 +129,45 @@ class PreprocessingTests(unittest.TestCase):
             self.assertEqual(checkpoint["state"], "complete")
             self.assertEqual(set(checkpoint["channels"]), {"ChanA", "ChanB"})
             self.assertEqual(result["total_slices"], 10)
+
+    def test_special_pair_settings_override_defaults_and_remain_dormant(self) -> None:
+        manifest = {
+            "preprocessing": {
+                "settings_by_channel": {
+                    "ChanA": PreprocessingSettings(
+                        threshold_sensitivity=1.0
+                    ).to_dict(),
+                    "ChanB": PreprocessingSettings().to_dict(),
+                },
+                "special_specimens": [0],
+                "settings_by_specimen": {
+                    "0": {
+                        "ChanA": PreprocessingSettings(
+                            threshold_sensitivity=2.5
+                        ).to_dict()
+                    }
+                },
+            }
+        }
+        self.assertEqual(
+            effective_preprocessing_settings(
+                manifest, 0, "ChanA"
+            ).threshold_sensitivity,
+            2.5,
+        )
+        manifest["preprocessing"]["special_specimens"] = []
+        self.assertEqual(
+            effective_preprocessing_settings(
+                manifest, 0, "ChanA"
+            ).threshold_sensitivity,
+            1.0,
+        )
+        self.assertEqual(
+            manifest["preprocessing"]["settings_by_specimen"]["0"]["ChanA"][
+                "threshold_sensitivity"
+            ],
+            2.5,
+        )
 
 
 if __name__ == "__main__":

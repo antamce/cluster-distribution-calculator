@@ -7,10 +7,10 @@ review. Raw TIFFs are never modified or copied.
 
 ## Current project status
 
-The current version is `0.6.0`. Stages 1–5 are user-approved. Stage 6 curved-axis
-protein-distribution analysis, review, and tabular export are ready for testing. See
-[HANDOFF.md](HANDOFF.md) for architecture, scientific constraints, benchmarks, and
-the remaining roadmap.
+The current version is `0.8.0 Beta`. The end-to-end workflow through flexible
+import, preprocessing, detection, correction, measurement, spine review, and
+tabular/PDF export is user-approved. See [HANDOFF.md](HANDOFF.md) for architecture,
+scientific constraints, and development history.
 
 This repository intentionally excludes microscopy TIFFs, project manifests, and
 generated Zarr caches. They are user data or runtime artifacts, not source files.
@@ -18,36 +18,74 @@ generated Zarr caches. They are user data or runtime artifacts, not source files
 ## Setup and launch
 
 The dedicated environment is `synpo-microscopy`; the separate environment named
-`synpo` is not used or modified. From an Anaconda Prompt in this directory:
+`synpo` is not used or modified. Both launchers discover environments in custom
+Conda `envs_dirs`, so neither assumes that the environment is inside the Anaconda
+or Miniconda installation folder.
+
+### Windows
+
+Double-click `launch_synpo.bat`. The launcher checks the active Conda installation,
+its saved choice, `PATH`, Conda's environment registry, the Windows registry, and
+common Anaconda, Miniconda, Miniforge, and Mambaforge locations. If discovery still
+fails, select the installation folder in the graphical picker. If
+`synpo-microscopy` is missing, the launcher offers to create it from
+`environment.yml`; it never changes an environment merely because Synpo starts.
+
+The successful choice is stored for this computer in
+`%APPDATA%\Synpo\launcher-conda.txt`. Delete that file to choose a different Conda
+installation. `conda` does not need to be on the ordinary Command Prompt's `PATH`.
+Run `scripts/create_desktop_shortcut.ps1` once to create a desktop shortcut.
+
+Manual setup and update commands remain available from an Anaconda Prompt:
 
 ```powershell
 conda env create -f environment.yml
-launch_synpo.bat
-```
-
-For an existing dedicated environment:
-
-```powershell
 conda env update -n synpo-microscopy -f environment.yml --prune
 launch_synpo.bat
 ```
 
-The launcher finds Miniconda or Anaconda directly and starts the dedicated
-environment through Conda's runner, so `conda` does not need to be on the ordinary
-Windows command prompt's `PATH`. Run
-`scripts/create_desktop_shortcut.ps1` once to create a desktop shortcut.
+### macOS
 
-## Expected filenames
+The current environment supports Intel and Apple Silicon Macs on macOS 12 or
+newer. A separate legacy environment supports macOS 10.15 Catalina on Intel Macs
+and macOS 11 on Intel or Apple Silicon. It pins Python 3.10 and PySide6 6.2.4 so
+legacy support cannot downgrade packages for modern macOS or Windows users.
 
-Files must be directly inside the selected folder and follow:
+In Terminal, make the launcher executable once and start it:
+
+```bash
+chmod +x launch_synpo.command
+./launch_synpo.command
+```
+
+After that, it can be opened from Finder. The launcher searches the active Conda,
+its saved choice, `PATH`, initialized zsh/bash shells, and common installation
+locations. It uses a macOS folder picker only if needed and offers to create the
+correct modern or legacy environment for the detected OS. The choice is stored in
+`~/Library/Application Support/Synpo/launcher-conda.txt`; delete that file to
+choose again.
+
+For Catalina, use the archived
+[Miniforge installer supporting macOS 10.13-10.15](https://github.com/conda-forge/miniforge/releases/tag/26.1.1-3).
+If Gatekeeper blocks the unsigned beta script, right-click
+`launch_synpo.command`, choose **Open**, and confirm once. Do not disable
+Gatekeeper globally. Catalina compatibility is dependency-solved but must still be
+confirmed by running the test suite and a real dataset on the Catalina device.
+
+## Filename pairing
+
+The original metadata schema remains supported:
 
 ```text
 <batch_prefix>_<experimental_group>_<specimen_id>_<ChanA|ChanB>_registered.tif
 ```
 
+Channel markers are configurable, so metadata-free pairs such as
+`Untitled001cy.tif` / `Untitled001cl.tif` can be placed in one editable fallback
+group. A manual mode pairs individual A/B TIFFs from the same or different folders.
 The importer checks pairing, duplicates, TIFF dimensions, data type, axis metadata,
 and channel-shape agreement without loading whole stacks into RAM. SHA-256 source
-fingerprints are computed in a background worker.
+fingerprints and per-file source paths support verification and recursive relinking.
 
 ## Stage 1: project setup
 
@@ -67,12 +105,19 @@ After saving or opening a project, open **2. Preprocessing**:
 2. Scroll through Z and tune display contrast. Contrast never changes data.
 3. Tune adaptive background percentile, physical-unit XY/Z Gaussian smoothing,
    and threshold sensitivity independently for both channels.
-4. Save channel settings, then select **Preprocess entire batch / resume**.
+4. For an unusual specimen pair, check **Use special preprocessing settings for
+   this pair** and save separate ChanA and ChanB values. Unchecked pairs continue
+   to use the channel-wide batch defaults. Clearing the checkmark makes a saved
+   override dormant rather than deleting it.
+5. Save channel settings, then select **Preprocess entire batch / resume**.
 
 Background and threshold values are estimated independently for every stack.
 Processed voxels are used only for detection; intensity measurements remain tied
 to original 16-bit TIFF voxels. Processing is slice-at-a-time and guarded by the
-project's 80% RAM ceiling.
+project's 80% RAM ceiling. Changing a batch default invalidates only ordinary
+specimens whose effective setting changed; changing or enabling a special override
+invalidates only that pair. Downstream detection, review, and measurement
+checkpoints for affected pairs are also made retryable.
 
 The compressed cache is stored at
 `.synpo-cache/<project-id>/preprocessed.zarr` below the output directory. Each
@@ -112,6 +157,16 @@ review. Compressed 3D label masks are stored in `detection.zarr`. A changed
 detection setting produces a new reproducibility signature and replaces only stale
 automatic masks.
 
+Detection uses the fast in-memory algorithm when it fits below the project's 80%
+RAM ceiling. Larger specimens automatically use a slower disk-backed mode that
+streams the percentile projection, labels protein clusters in Z slabs, and merges
+objects across slab boundaries. **Always use low-memory detection** can be saved as
+a per-project execution setting without invalidating completed masks. Synpo checks
+temporary disk requirements before each low-memory specimen; a specimen with
+insufficient space is left retryable and skipped while the rest of the batch
+continues. Other specimen-local failures are likewise recorded without stopping
+unrelated specimens.
+
 On the supplied registered pair, defaults completed in 22.88 seconds, below the
 three-minute target. Reopening an unchanged checkpoint took 0.019 seconds.
 
@@ -123,7 +178,7 @@ automatic result can be marked complete without drawing anything.
 
 The viewer shows a scrollable original 16-bit Z slice with contrast controls and
 colored overlays. Choose dendrite or spine, choose an action, then click or draw a
-yellow hint. The drawing guides the operation and is not treated as a final mask.
+colored hint. The drawing guides the operation and is not treated as a final mask.
 The same orthogonal-maximum and rotatable-3D buttons are available here, using the
 current corrected masks when corrections exist and automatic masks otherwise.
 
@@ -134,13 +189,26 @@ objects and infers the relevant Z plane; a missed-object hint uses the strongest
 nearby processed signal. Switch back to an individual slice whenever projected
 objects overlap ambiguously.
 
-Available actions are:
+Brush colors and actions are:
 
-- add a missed object using nearby image signal;
-- exclude an object or record a spine as an excluded filopodium;
-- split touching objects or merge objects;
-- expand or trim a boundary by re-evaluating a bounded 3D neighborhood;
-- accept an object or flag it as needing attention without changing its mask.
+- **Add missed object — green:** draw a separate stroke inside each missing
+  object. Each stroke seeds one independent 3D object whose final boundary follows
+  the preprocessed image signal.
+- **Exclude object — red:** touch an unwanted object to remove that complete 3D
+  object from the corrected mask.
+- **Trim boundary — magenta:** draw across excess segmentation. Synpo removes the
+  hinted region and retains the largest connected remainder of that object.
+- **Expand boundary — blue:** draw from an existing object toward omitted signal.
+  Synpo regrows that object through locally supported preprocessed signal.
+- **Split touching objects — yellow:** draw through the neck or contact that should
+  divide one object; connected pieces receive separate stable object IDs.
+- **Exclude as filopodium — purple:** touch a spine to exclude it while recording
+  the specific filopodium decision in the audit trail.
+- **Merge objects — `#ED6291` pink:** draw through at least two objects that should
+  be one; they are combined under one stable ID.
+- **Accept object — cyan:** retain the mask unchanged and record it as accepted.
+- **Flag object for attention — orange:** retain the mask unchanged while keeping
+  an explicit needs-attention status.
 
 **Undo drawn stroke** changes only the current hint. **Undo last applied
 correction** restores saved 3D labels and prior object status. Every applied action
@@ -152,6 +220,13 @@ Review groups are tied to their detection signature. If detection is rerun with
 different settings, stale corrections are ignored and the specimen returns to the
 review queue.
 
+Correction memory strategy defaults to **Automatic**, which uses the ordinary
+in-memory operation when safe and switches oversized object edits to a slower,
+disk-backed path. **Always use slow low-memory correction** is available for
+low-RAM computers. Exclude, filopodium, merge, split, trim, and expand preserve
+undo checkpoints in both modes; bounded add operations remain local and report the
+chosen mode.
+
 Projection/3D generation streams one Z slice at a time, enforces the 80% RAM
 ceiling, and adaptively limits the interactive rendering to 60,000 surface faces
 inside the selected rectangle. The projection window can independently hide
@@ -162,15 +237,22 @@ the displayed separation from `0.20×` to `5.00×`; `1.00×` is the confirmed
 physical calibration. This is display-only and never changes masks or measurements.
 Independent dendrite and spine opacity controls range from 5% to 100%; dendrites
 default to 75%, spines to 60%, and protein clusters remain fixed at 100% opacity.
+Generation progress and cancellation are shown in the status line at the bottom of
+the main window; generation does not open a modal progress popup. Numbered
+full-field spine maps draw the current spine with a five-pixel-or-wider bright
+green outline and every other visible spine with a similarly thick cyan outline.
 The Qt renderer performs its rotations with bounded element-wise array operations;
 it does not call a native BLAS matrix routine from the paint event. This avoids a
 Windows DLL delay-load failure observed on the development laptop.
 
 ## Stage 5: association and measurements
 
-Open **5. Measurements** after automatic detection. Corrected dendrite/spine masks
-are used when a compatible review checkpoint exists; otherwise the immutable
-automatic masks are measured. The configurable minimum cluster/spine overlap is
+Open **5. Measurements** after at least one specimen has completed preprocessing,
+automatic detection, and manual review. Clicking **Mark review complete** qualifies
+a specimen even when no corrections were needed. The resumable measurement batch
+processes only fully reviewed specimens and skips unfinished pairs until a later
+resume. Corrected dendrite/spine masks are used when present; otherwise the
+immutable automatic masks are measured. The configurable minimum cluster/spine overlap is
 80% by default. Each cluster is assigned to the spine with its greatest overlap,
 and only the overlapping portion contributes to cluster volume.
 
@@ -205,8 +287,25 @@ spines within each specimen, then average specimen means by experimental group;
 the screen shows SEM across specimen means. Line profiles are the default, with a
 bar-chart switch and automatic or fixed 0–1 scaling.
 
-The export button creates one verified Excel workbook plus CSV copies of every
-sheet. Sheets include master specimen/dendrite/spine/cluster rows,
+The cropped spine viewer normally remains an XY maximum projection and requires no
+manual correction. If the automatic distal endpoint is wrong, press **Centerline
+end hint**. The same panel switches to an exact Z-slice viewer with a slider limited
+to the first and last slices occupied by that spine; the XY crop includes the full
+spine and a 1 µm margin. Click near the spine to place the endpoint. Synpo snaps the
+dot to the nearest selected-spine voxel on that slice, rebuilds the path from the
+read-only automatic base, checkpoints it, and returns to the maximum projection.
+The base is green, the endpoint is magenta, and invalid clicks appear only in the
+status line. **Clear end hint** restores automatic endpoint detection.
+
+Placed, replaced, cleared, and resegmentation-invalidated hints remain in audit
+history. A hint invalidated by later mask correction falls back to the automatic
+endpoint and returns the spine to the unreviewed queue. Excel/CSV rows save both
+endpoint coordinates, source and validity; validation PDFs show both endpoint dots.
+
+The export button permits a partial export as soon as one measurement checkpoint is
+complete. Its status states how many completed pairs are included and how many
+unfinished pairs are omitted. It creates one verified Excel workbook plus CSV
+copies of every sheet. Sheets include master specimen/dendrite/spine/cluster rows,
 `Distribution_Individual`, `Distribution_Specimen`, `Distribution_Group`,
 `Distribution_Excluded`, `Invalid_Spines`, compact group summaries, and settings.
 Optional PDFs contain one two-panel XY maximum-projection page per spine using the
@@ -215,13 +314,36 @@ margin is adjustable; excluded-distribution and invalid-spine audit PDFs are
 separate options. Segmentation-mask/ImageJ ROI export remains part of the later
 final-export stage.
 
+## Beta workflow additions
+
+Version 0.8.0 adds automatic low-memory detection for stacks that exceed the RAM
+safety ceiling, a per-project option to use that strategy for every specimen,
+cross-slab object reconciliation, disk-space preflight, retryable skipped/failed
+states, and specimen-level batch failure isolation.
+
+Version 0.7.0 added zoomable preprocessing, detection, correction, projection, and
+spine-context views; larger sensitivity ranges; independent X/Y/Z 3D rotation
+controls; and screen-aware persistent window sizing. Missed-object correction
+strokes now produce separate objects and use preprocessed signal for image-guided
+boundaries.
+
+The measurement screen has separate protein-cluster-positive and optional
+cluster-less spine queues. Both use stable spine IDs. Clicking a crop opens the
+full specimen with the selected spine highlighted, while the numbered spine map
+provides maximum-projection or single-Z viewing and category/validity filters.
+Invalid cluster-less spines are excluded from every downstream metric and retained
+in audit exports.
+
+Preprocessing, automatic detection, and measurement each show a responsive batch
+progress bar with work counts, elapsed time, and a smoothed approximate ETA.
+
 ## Tests and command-line validation
 
 Run the test suite from the repository root:
 
 ```powershell
 $env:PYTHONPATH = (Resolve-Path "src").Path
-conda run -n synpo-microscopy python -m unittest discover -s tests -v
+conda run -n synpo-microscopy python -m pytest -q
 ```
 
 The non-GUI importer can be exercised with:

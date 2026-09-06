@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 from .models import Calibration
 
 
 def default_preset_path() -> Path:
-    root = Path(os.environ.get("APPDATA", Path.home() / ".config"))
+    if sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
+    else:
+        root = Path(os.environ.get("APPDATA", Path.home() / ".config"))
     return root / "Synpo" / "calibrations.json"
 
 

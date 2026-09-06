@@ -30,12 +30,15 @@ def default_preprocessing_manifest() -> dict[str, object]:
             "ChanB": dict(settings),
         },
         "representative_specimens": [],
+        "special_specimens": [],
+        "settings_by_specimen": {},
     }
 
 
 def default_detection_manifest() -> dict[str, object]:
     return {
         "algorithm_version": 2,
+        "memory_mode": "automatic",
         "settings": {
             "dendrite_sensitivity": 1.25,
             "cluster_sensitivity": 0.65,
@@ -49,9 +52,11 @@ def default_detection_manifest() -> dict[str, object]:
 
 def default_review_manifest() -> dict[str, object]:
     return {
-        "algorithm_version": 1,
+        "algorithm_version": 2,
+        "memory_mode": "automatic",
         "local_margin_um": 1.0,
         "z_radius_slices": 2,
+        "add_z_radius_slices": 6,
         "maximum_undo_actions": 100,
     }
 
@@ -78,10 +83,32 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     application["name"] = "Synpo"
     application["version"] = __version__
     manifest.setdefault("resource_policy", {"maximum_ram_fraction": 0.8})
-    manifest.setdefault("preprocessing", default_preprocessing_manifest())
+    preprocessing = manifest.setdefault(
+        "preprocessing", default_preprocessing_manifest()
+    )
+    preprocessing.setdefault("representative_specimens", [])
+    preprocessing.setdefault("special_specimens", [])
+    preprocessing.setdefault("settings_by_specimen", {})
     manifest.setdefault("detection", default_detection_manifest())
-    manifest.setdefault("review_settings", default_review_manifest())
+    manifest["detection"].setdefault("memory_mode", "automatic")
+    review_settings = manifest.setdefault("review_settings", default_review_manifest())
+    review_settings["algorithm_version"] = 2
+    review_settings.setdefault("memory_mode", "automatic")
+    review_settings.setdefault("add_z_radius_slices", 6)
     manifest.setdefault("measurements", default_measurements_manifest())
+    import_settings = manifest.setdefault(
+        "import_settings",
+        {
+            "mode": "strict",
+            "channel_markers": {"ChanA": "ChanA", "ChanB": "ChanB"},
+            "default_experimental_group": "Experiment",
+        },
+    )
+    import_settings.setdefault("mode", "strict")
+    import_settings.setdefault(
+        "channel_markers", {"ChanA": "ChanA", "ChanB": "ChanB"}
+    )
+    import_settings.setdefault("default_experimental_group", "Experiment")
     cache = manifest.setdefault("cache", {})
     if cache.get("format") == "pending_stage_2":
         cache["format"] = "zarr-v2-blosc-zstd"
@@ -89,6 +116,14 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     cache.setdefault("path", None)
     cache.setdefault("deletion_eligible", False)
     for specimen in manifest.get("specimens", []):
+        for channel_data in specimen.get("channels", {}).values():
+            channel_data.setdefault(
+                "source_path",
+                str(
+                    Path(str(manifest.get("source_directory", "")))
+                    / str(channel_data.get("filename", ""))
+                ),
+            )
         checkpoints = specimen.setdefault("checkpoints", {})
         value = checkpoints.get("preprocessing", "not_started")
         if isinstance(value, str):
@@ -178,6 +213,7 @@ def create_project_manifest(
                 raise ValueError(f"Missing metadata or fingerprint for {channel_file.filename}")
             channels[channel] = {
                 "filename": channel_file.filename,
+                "source_path": str(channel_file.path.resolve()),
                 "metadata": channel_file.metadata.to_dict(),
                 "fingerprint": channel_file.fingerprint.to_dict(),
             }
@@ -207,6 +243,11 @@ def create_project_manifest(
         "output_directory": str(output),
         "batch_prefix": report.pairs[0].batch_prefix,
         "channel_roles": dict(channel_roles),
+        "import_settings": {
+            "mode": report.import_mode,
+            "channel_markers": dict(report.channel_markers),
+            "default_experimental_group": report.default_experimental_group,
+        },
         "calibration": calibration.to_dict(),
         "resource_policy": {"maximum_ram_fraction": 0.8},
         "preprocessing": default_preprocessing_manifest(),
@@ -252,6 +293,21 @@ def load_project(path: str | Path) -> dict[str, object]:
     return migrate_manifest(manifest)
 
 
+def channel_source_path(
+    manifest: dict[str, object], channel_data: dict[str, object]
+) -> Path:
+    """Resolve a channel source while remaining compatible with older projects."""
+    saved = str(channel_data.get("source_path", "")).strip()
+    if saved:
+        path = Path(saved).expanduser()
+        if not path.is_absolute():
+            path = Path(str(manifest["source_directory"])) / path
+        return path.resolve()
+    return (
+        Path(str(manifest["source_directory"])) / str(channel_data["filename"])
+    ).expanduser().resolve()
+
+
 def verify_project_sources(
     manifest: dict[str, object],
     *,
@@ -259,7 +315,11 @@ def verify_project_sources(
     full_checksums: bool = True,
     progress: ProgressCallback | None = None,
 ) -> list[dict[str, str]]:
-    directory = Path(source_directory or str(manifest["source_directory"])).expanduser().resolve()
+    directory = (
+        Path(source_directory).expanduser().resolve()
+        if source_directory is not None
+        else None
+    )
     expected: list[tuple[str, dict[str, object]]] = []
     for specimen in manifest["specimens"]:
         for channel, channel_data in specimen["channels"].items():
@@ -269,29 +329,50 @@ def verify_project_sources(
     total = len(expected)
     for index, (channel, channel_data) in enumerate(expected, start=1):
         filename = str(channel_data["filename"])
-        path = directory / filename
+        if directory is None:
+            saved_path = channel_source_path(manifest, channel_data)
+            candidates = [saved_path] if saved_path.is_file() else []
+        else:
+            direct = directory / filename
+            candidates = [direct] if direct.is_file() else []
+            if not candidates and directory.is_dir():
+                candidates = sorted(
+                    (path for path in directory.rglob(filename) if path.is_file()),
+                    key=lambda path: str(path).casefold(),
+                )
         if progress:
             progress("Verifying source files", index - 1, total, filename)
-        if not path.is_file():
-            status, detail = "missing", "File not found"
-        else:
-            saved = channel_data["fingerprint"]
+        status, detail = "missing", "File not found"
+        matched_path: Path | None = None
+        saved = channel_data["fingerprint"]
+        for path in candidates:
             stat = path.stat()
             if stat.st_size != int(saved["size_bytes"]):
                 status, detail = "modified", "File size differs"
-            elif full_checksums:
-                current = fingerprint_file(path, include_checksum=True)
-                saved_hash = saved.get("sha256")
-                if not saved_hash:
-                    status, detail = "unverified", "Project has no saved checksum"
-                elif current.sha256 != saved_hash:
-                    status, detail = "modified", "SHA-256 checksum differs"
-                else:
-                    status, detail = "ok", "Checksum matches"
-            else:
+                continue
+            if not full_checksums:
                 status, detail = "ok", "File size matches; checksum not recalculated"
+                matched_path = path
+                break
+            current = fingerprint_file(path, include_checksum=True)
+            saved_hash = saved.get("sha256")
+            if not saved_hash:
+                status, detail = "unverified", "Project has no saved checksum"
+                matched_path = path
+                break
+            if current.sha256 == saved_hash:
+                status, detail = "ok", "Checksum matches"
+                matched_path = path
+                break
+            status, detail = "modified", "SHA-256 checksum differs"
         results.append(
-            {"filename": filename, "channel": channel, "status": status, "detail": detail}
+            {
+                "filename": filename,
+                "channel": channel,
+                "status": status,
+                "detail": detail,
+                "path": str(matched_path or (candidates[0] if candidates else "")),
+            }
         )
         if progress:
             progress("Verifying source files", index, total, filename)
@@ -312,6 +393,11 @@ def relink_project_sources(
         progress=progress,
     )
     if all(item["status"] == "ok" for item in results):
+        result_index = 0
+        for specimen in manifest["specimens"]:
+            for channel_data in specimen["channels"].values():
+                channel_data["source_path"] = results[result_index]["path"]
+                result_index += 1
         manifest["source_directory"] = str(directory)
         manifest["updated_at"] = _utc_now()
     return results
