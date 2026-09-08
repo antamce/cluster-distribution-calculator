@@ -3,7 +3,7 @@
 This document is the context-free continuation record for Synpo. Read it before
 changing code, publishing a release, or proposing the next stage. It describes the
 current approved behavior, scientific invariants, architecture, repository state,
-validation procedure, and remaining work as of 2026-09-06.
+validation procedure, and remaining work as of 2026-09-08.
 
 ## One-minute orientation
 
@@ -16,8 +16,8 @@ validation procedure, and remaining work as of 2026-09-06.
 - Dedicated Conda environment: `synpo-microscopy`. Never modify the user's separate
   environment named `synpo`.
 - Current development branch: `lsh`.
-- Current development feature commit: `8ba4ebc` (`Add macOS launch and portable
-  Conda discovery`).
+- Current development macOS feature commit: `8ba4ebc` (`Add macOS launch and
+  portable Conda discovery`); its first handoff record is `874772b`.
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
 - Current public beta commit: `5523392` (`Improve preprocessing and review workflow`).
 - Current full Windows result: 46 passed and 1 platform-specific test skipped.
@@ -30,10 +30,10 @@ validation procedure, and remaining work as of 2026-09-06.
   progress, high-visibility spine-map outlines, low-memory corrections, and
   reviewed-pair measurement gating with partial export. Development commit
   `8ba4ebc` adds robust Conda discovery on Windows and macOS, a Finder launcher,
-  and a separately pinned Catalina/macOS 11 environment. These changes have not
-  been published to the public user repository. An actual approximately
-  `80 x 2048 x 2048` stack on a 4 GB device and a Catalina launch remain preferred
-  field tests.
+  and a separately pinned Catalina/macOS 11 environment. The user requested a
+  curated public release of this state on 2026-09-08 so it can be tested. An actual
+  approximately `80 x 2048 x 2048` stack on a 4 GB device and a Catalina launch
+  remain preferred field tests.
 - Development method: build in stages and do not move to a new stage until the user
   explicitly approves the previous one. All behavior through the current beta is
   approved.
@@ -47,15 +47,17 @@ the same publishing target.
 - Local `origin`: `https://github.com/antamce/cluster-distribution-calculator.git`,
   the earlier raw/development sharing repository. It is no longer the desired public
   user destination.
-- The low-memory work and 0.8.0 metadata are pushed to the development remote as
-  `origin/lsh`. Do not merge or push development history to the public repository.
+- The low-memory, workflow, and macOS launcher work are pushed to the development
+  remote as `origin/lsh`. Do not merge or push development history to the public
+  repository.
 - The presentable public repository is
   `https://github.com/antamce/cluster-distribution.git` on branch `main`.
 - Beta 0.8.0 was published there from a clean temporary checkout as one curated
   public commit, not by changing the development checkout's `origin`.
-- The public tree contains user-facing source, environment/launcher files, icon and
-  README. It intentionally excludes `HANDOFF.md`, `tests/`, development history,
-  microscopy data, manifests, and Zarr caches.
+- The public tree contains user-facing source, both environment files, Windows and
+  macOS launcher files, launcher helpers, icons, package metadata, and README. It
+  intentionally excludes `HANDOFF.md`, `tests/`, `PUBLIC_README.md`, development
+  history, microscopy data, manifests, and Zarr caches.
 - `PUBLIC_README.md` is the source for the public repository's `README.md`.
 - The temporary public-release checkout used for 0.8.0 was deleted after the remote
   commit was verified. Do not assume a second local checkout still exists.
@@ -268,7 +270,7 @@ and optional registered flag follow them.
 - `src/synpo/exporting.py`: verified Excel/CSV exports and optional validation/audit
   PDF generation.
 - `src/synpo/cli.py`: non-GUI scan/inspection command.
-- `tests/`: 41-test release suite, including importer, project, preprocessing,
+- `tests/`: 47-test release suite, including importer, project, preprocessing,
   detection, review, measurement, 3D rendering, and beta UI regression coverage.
 
 Keep project manifests at schema version 1 unless a real schema break is needed.
@@ -546,7 +548,8 @@ For a material change:
 1. Inspect `git status` and preserve unrelated user changes.
 2. Identify which computation signature/checkpoint must be invalidated.
 3. Add or update a focused regression test.
-4. Run the full 41-test baseline plus any relevant GUI smoke test.
+4. Run the full 47-test collection plus any relevant GUI smoke test. Exactly one
+   platform-specific launcher test is expected to skip on Windows or macOS.
 5. Update version/docs only when preparing a requested release.
 6. Summarize behavior and validation for user approval before advancing stages.
 
@@ -567,10 +570,13 @@ For a material change:
   bar-chart alternative.
 - Statistics remain external to Synpo.
 
-## State immediately after this handoff update
+## State at the start of the 2026-09-08 public release
 
-The current 0.8.0 UX feature implementation is `a2ad4dd` on the local `lsh`
-branch; the development remote was intentionally not changed by this public-only
-publishing request. The curated public beta is verified at `5523392` on
-`antamce/cluster-distribution` `main`. `HANDOFF.md` remains development-only and
-is never copied into the public repository.
+The macOS/portable-launcher implementation is `8ba4ebc` and its initial handoff
+update is `874772b`; both are on local and development `origin/lsh`. Before this
+release, curated public `main` is verified at `5523392`. The requested release must
+be made from a temporary public checkout and must not copy `HANDOFF.md` or tests.
+After publishing, replace this paragraph with the exact documentation commit,
+public commit, verified remote refs, validation results, and temporary-checkout
+cleanup result so a cleared-context continuation cannot confuse pre-release and
+post-release state.

@@ -176,6 +176,8 @@ Source TIFFs are never modified. The compressed project cache can be removed aft
 
 ## Beta-release notes
 
+- Windows and macOS launchers discover Conda installations and environments in nonstandard folders; successful choices are remembered per user.
+- The macOS launcher is Conda-backed rather than a signed/notarized `.app`. Catalina dependency resolution is verified, but Catalina and Apple Silicon field testing remain in progress.
 - Closely touching structures and unusual morphology may require review or correction.
 - Filopodia are retained as candidates and can be excluded during review.
 - Automatically retained somata and axons should be removed with the correction tools.

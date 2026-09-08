@@ -319,7 +319,10 @@ final-export stage.
 Version 0.8.0 adds automatic low-memory detection for stacks that exceed the RAM
 safety ceiling, a per-project option to use that strategy for every specimen,
 cross-slab object reconciliation, disk-space preflight, retryable skipped/failed
-states, and specimen-level batch failure isolation.
+states, and specimen-level batch failure isolation. The current 0.8.0 source also
+adds Windows and macOS Conda launchers that discover nonstandard installation and
+environment directories, plus an isolated Python 3.10/PySide6 6.2.4 environment
+for macOS 10.15 Catalina and macOS 11.
 
 Version 0.7.0 added zoomable preprocessing, detection, correction, projection, and
 spine-context views; larger sensitivity ranges; independent X/Y/Z 3D rotation
@@ -345,6 +348,13 @@ Run the test suite from the repository root:
 $env:PYTHONPATH = (Resolve-Path "src").Path
 conda run -n synpo-microscopy python -m pytest -q
 ```
+
+Current Windows baseline: `46 passed, 1 skipped`; the skipped test executes the
+macOS launcher with `/bin/bash`. PowerShell and Bash syntax checks, Windows Conda
+runtime resolution, Python 3.10 syntax parsing, and offscreen application startup
+also pass. Conda dry-run resolution succeeds for Catalina Intel, macOS 11 Apple
+Silicon, and macOS 12 on Intel and Apple Silicon. These solves do not replace
+running Synpo and representative microscopy data on real Macs.
 
 The non-GUI importer can be exercised with:
 
