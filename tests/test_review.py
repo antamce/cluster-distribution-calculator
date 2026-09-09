@@ -10,7 +10,7 @@ import numpy as np
 import tifffile
 import zarr
 
-from synpo.detection import DetectionSettings, detect_project
+from synpo.detection import DetectionSettings, detect_project, detection_cache_path
 from synpo.importer import scan_batch
 from synpo.models import Calibration
 from synpo.preprocessing import process_project_cache, project_cache_path
@@ -18,8 +18,10 @@ from synpo.project import create_project_manifest, load_project, save_project
 from synpo.review import (
     ALWAYS_LOW_MEMORY_REVIEW_MODE,
     ReviewAction,
+    _segment_add_hint_group,
     apply_review_action,
     load_review_slice,
+    review_cache_path,
     set_specimen_review_state,
     undo_last_review_action,
 )
@@ -305,7 +307,7 @@ class ReviewTests(unittest.TestCase):
             view = load_review_slice(manifest, 0, 0, "ChanB")
             self.assertEqual(int(view.spines[6, 40]), 0)
 
-    def test_two_hints_split_one_connected_preprocessed_region(self) -> None:
+    def test_two_touching_add_hints_become_one_new_object(self) -> None:
         with workspace_directory() as root:
             manifest, project_path = self.make_detected_project(root)
             source = root / "source" / "batch_group_specimen_ChanB_registered.tif"
@@ -338,13 +340,360 @@ class ReviewTests(unittest.TestCase):
                     brush_radius_pixels=1,
                 ),
             )
-            self.assertEqual(len(result.new_ids), 2)
+            self.assertEqual(len(result.new_ids), 1)
             corrected = load_review_slice(manifest, 0, 4, "ChanB")
             self.assertEqual(int(corrected.spines[8, 36]), result.new_ids[0])
-            self.assertEqual(int(corrected.spines[8, 44]), result.new_ids[1])
-            self.assertNotEqual(
+            self.assertEqual(int(corrected.spines[8, 44]), result.new_ids[0])
+            self.assertEqual(
                 int(corrected.spines[8, 36]), int(corrected.spines[8, 44])
             )
+            self.assertEqual(
+                [item["status"] for item in result.hint_results],
+                ["created", "joined"],
+            )
+
+    def test_add_region_joins_one_existing_object_and_rejects_ambiguous_contact(self) -> None:
+        shape = (3, 15, 15)
+        processed = np.zeros(shape, dtype=np.float32)
+        processed[1, 5:10, 6:10] = 1000.0
+        target = np.zeros(shape, dtype=np.uint32)
+        target[1, 7, 10] = 7
+        hints = [
+            {
+                "index": 1,
+                "points": ((7, 7),),
+                "z_index": 1,
+                "bbox": (0, 3, 0, 15, 0, 15),
+            }
+        ]
+        output, next_id, results = _segment_add_hint_group(
+            processed,
+            target,
+            None,
+            (0, 3, 0, 15, 0, 15),
+            hints,
+            object_type="dendrite",
+            brush_radius=1,
+            sensitivity=1.0,
+            preprocessing_threshold=10.0,
+            next_id=20,
+        )
+        self.assertEqual(next_id, 20)
+        self.assertEqual(results[0]["status"], "joined")
+        self.assertEqual(results[0]["object_id"], 7)
+        self.assertGreater(np.count_nonzero(output == 7), 1)
+
+        ambiguous_target = target.copy()
+        ambiguous_target[1, 7, 5] = 8
+        rejected, next_id, results = _segment_add_hint_group(
+            processed,
+            ambiguous_target,
+            None,
+            (0, 3, 0, 15, 0, 15),
+            hints,
+            object_type="dendrite",
+            brush_radius=1,
+            sensitivity=1.0,
+            preprocessing_threshold=10.0,
+            next_id=20,
+        )
+        self.assertEqual(next_id, 20)
+        self.assertEqual(results[0]["status"], "skipped")
+        self.assertIn("multiple existing objects", results[0]["message"])
+        np.testing.assert_array_equal(rejected, ambiguous_target)
+
+    def test_add_action_joining_existing_object_writes_one_undoable_checkpoint(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            detection = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )["specimens/0000"]
+            dendrites = np.zeros(detection["dendrite_labels"].shape, dtype=np.uint32)
+            spines = np.zeros_like(dendrites)
+            spines[2:6, 8:12, 20:24] = 1
+            detection["dendrite_labels"][:] = dendrites
+            detection["spine_labels"][:] = spines
+            summary = dict(detection.attrs["summary"])
+            summary.update({"dendrite_count": 0, "spine_count": 1})
+            detection.attrs["summary"] = summary
+
+            key = manifest["specimens"][0]["checkpoints"]["preprocessing"][
+                "channels"
+            ]["ChanB"]["dataset_key"]
+            processed = zarr.open_group(
+                str(project_cache_path(manifest)), mode="a"
+            )[key]
+            signal = np.zeros(processed.shape, dtype=np.uint16)
+            signal[2:6, 8:12, 20:28] = 5000
+            processed[:] = signal
+
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="spine",
+                    operation="add",
+                    z_index=4,
+                    points=((26, 10),),
+                    strokes=(((26, 10),),),
+                    brush_radius_pixels=1,
+                    sensitivity=1.0,
+                ),
+            )
+            self.assertTrue(result.checkpoint_written)
+            self.assertEqual(result.new_ids, ())
+            self.assertEqual(result.affected_ids, (1,))
+            self.assertEqual(result.hint_results[0]["status"], "joined")
+            corrected = load_review_slice(manifest, 0, 4, "ChanB")
+            self.assertEqual(int(corrected.spines[10, 26]), 1)
+
+            undo_last_review_action(manifest, project_path, 0)
+            restored = load_review_slice(manifest, 0, 4, "ChanB")
+            self.assertEqual(int(restored.spines[10, 22]), 1)
+            self.assertEqual(int(restored.spines[10, 26]), 0)
+
+    def test_projection_brush_transfers_only_dendrite_voxels_to_one_spine_and_undoes(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            detection = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )["specimens/0000"]
+            dendrites = np.zeros(detection["dendrite_labels"].shape, dtype=np.uint32)
+            spines = np.zeros_like(dendrites)
+            dendrites[:, 30:36, 10:50] = 1
+            spines[:, 25:30, 20:30] = 1
+            detection["dendrite_labels"][:] = dendrites
+            detection["spine_labels"][:] = spines
+            summary = dict(detection.attrs["summary"])
+            summary.update({"dendrite_count": 1, "spine_count": 1})
+            detection.attrs["summary"] = summary
+
+            points = tuple((25, y) for y in range(27, 35)) + ((5, 45),)
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="spine",
+                    operation="dendrite_to_spine",
+                    z_index=3,
+                    points=points,
+                    brush_radius_pixels=1,
+                    projection_hint=True,
+                ),
+            )
+            self.assertGreater(result.transferred_voxel_count, 0)
+            for z_index in range(dendrites.shape[0]):
+                corrected = load_review_slice(
+                    manifest, 0, z_index, "ChanB"
+                )
+                self.assertEqual(int(corrected.dendrites[32, 25]), 0)
+                self.assertEqual(int(corrected.spines[32, 25]), 1)
+                self.assertEqual(int(corrected.spines[45, 5]), 0)
+                self.assertEqual(int(corrected.dendrites[32, 15]), 1)
+                self.assertEqual(int(corrected.dendrites[32, 45]), 1)
+            history = manifest["specimens"][0]["review"]["history"][-1]
+            self.assertEqual(history["transferred_voxel_count"], result.transferred_voxel_count)
+            self.assertEqual(history["source_dendrite_ids"], [1])
+
+            undo_last_review_action(manifest, project_path, 0)
+            restored = load_review_slice(manifest, 0, 3, "ChanB")
+            self.assertEqual(int(restored.dendrites[32, 25]), 1)
+            self.assertEqual(int(restored.spines[32, 25]), 0)
+
+    def test_projection_transfer_rejects_multiple_spines_without_writing(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            detection = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )["specimens/0000"]
+            dendrites = np.zeros(detection["dendrite_labels"].shape, dtype=np.uint32)
+            spines = np.zeros_like(dendrites)
+            dendrites[:, 30:36, 10:50] = 1
+            spines[:, 25:30, 20:30] = 1
+            spines[:, 36:41, 20:30] = 2
+            detection["dendrite_labels"][:] = dendrites
+            detection["spine_labels"][:] = spines
+            summary = dict(detection.attrs["summary"])
+            summary.update({"dendrite_count": 1, "spine_count": 2})
+            detection.attrs["summary"] = summary
+            points = tuple((25, y) for y in range(27, 40))
+            with self.assertRaisesRegex(ValueError, "touched multiple spines"):
+                apply_review_action(
+                    manifest,
+                    project_path,
+                    0,
+                    ReviewAction(
+                        object_type="spine",
+                        operation="dendrite_to_spine",
+                        z_index=3,
+                        points=points,
+                        brush_radius_pixels=1,
+                        projection_hint=True,
+                    ),
+                )
+            corrected = load_review_slice(manifest, 0, 3, "ChanB")
+            np.testing.assert_array_equal(corrected.dendrites, dendrites[3])
+            np.testing.assert_array_equal(corrected.spines, spines[3])
+            self.assertEqual(
+                manifest["specimens"][0]["checkpoints"]["review"].get(
+                    "edit_count", 0
+                ),
+                0,
+            )
+
+    def test_projection_brush_transfers_all_covered_spines_to_one_dendrite_and_undoes(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            detection = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )["specimens/0000"]
+            dendrites = np.zeros(detection["dendrite_labels"].shape, dtype=np.uint32)
+            spines = np.zeros_like(dendrites)
+            dendrites[:, 30:36, 10:50] = 1
+            spines[:, 25:30, 20:30] = 1
+            spines[:, 10, 40] = 2
+            detection["dendrite_labels"][:] = dendrites
+            detection["spine_labels"][:] = spines
+            summary = dict(detection.attrs["summary"])
+            summary.update({"dendrite_count": 1, "spine_count": 2})
+            detection.attrs["summary"] = summary
+
+            points = tuple((25, y) for y in range(27, 35)) + ((40, 10),)
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="dendrite",
+                    operation="spine_to_dendrite",
+                    z_index=3,
+                    points=points,
+                    brush_radius_pixels=1,
+                    projection_hint=True,
+                ),
+            )
+            self.assertGreater(result.transferred_voxel_count, 0)
+            self.assertEqual(result.dendrite_count, 1)
+            self.assertEqual(result.spine_count, 1)
+            for z_index in range(dendrites.shape[0]):
+                corrected = load_review_slice(manifest, 0, z_index, "ChanB")
+                self.assertEqual(int(corrected.spines[28, 25]), 0)
+                self.assertEqual(int(corrected.dendrites[28, 25]), 1)
+                self.assertEqual(int(corrected.spines[10, 40]), 0)
+                self.assertEqual(int(corrected.dendrites[10, 40]), 1)
+                self.assertEqual(int(corrected.spines[26, 21]), 1)
+            history = manifest["specimens"][0]["review"]["history"][-1]
+            self.assertEqual(history["source_spine_ids"], [1, 2])
+            self.assertEqual(history["removed_spine_ids"], [2])
+
+            undo = undo_last_review_action(manifest, project_path, 0)
+            self.assertEqual(undo.spine_count, 2)
+            restored = load_review_slice(manifest, 0, 3, "ChanB")
+            np.testing.assert_array_equal(restored.dendrites, dendrites[3])
+            np.testing.assert_array_equal(restored.spines, spines[3])
+
+    def test_spine_transfer_rejects_multiple_dendrites_without_writing(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            detection = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )["specimens/0000"]
+            dendrites = np.zeros(detection["dendrite_labels"].shape, dtype=np.uint32)
+            spines = np.zeros_like(dendrites)
+            dendrites[:, 30:35, 20:30] = 1
+            dendrites[:, 40:45, 20:30] = 2
+            spines[:, 35:40, 20:30] = 1
+            detection["dendrite_labels"][:] = dendrites
+            detection["spine_labels"][:] = spines
+            summary = dict(detection.attrs["summary"])
+            summary.update({"dendrite_count": 2, "spine_count": 1})
+            detection.attrs["summary"] = summary
+
+            with self.assertRaisesRegex(ValueError, "touched multiple dendrites"):
+                apply_review_action(
+                    manifest,
+                    project_path,
+                    0,
+                    ReviewAction(
+                        object_type="dendrite",
+                        operation="spine_to_dendrite",
+                        z_index=3,
+                        points=tuple((25, y) for y in range(32, 43)),
+                        brush_radius_pixels=1,
+                        projection_hint=True,
+                    ),
+                )
+            corrected = load_review_slice(manifest, 0, 3, "ChanB")
+            np.testing.assert_array_equal(corrected.dendrites, dendrites[3])
+            np.testing.assert_array_equal(corrected.spines, spines[3])
+            self.assertEqual(
+                manifest["specimens"][0]["checkpoints"]["review"].get(
+                    "edit_count", 0
+                ),
+                0,
+            )
+
+    def test_trim_sensitivity_is_captured_per_action_and_higher_removes_more(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            detection = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )["specimens/0000"]
+            dendrites = np.zeros(detection["dendrite_labels"].shape, dtype=np.uint32)
+            dendrites[:, 20:45, 20:60] = 1
+            detection["dendrite_labels"][:] = dendrites
+            detection["spine_labels"][:] = 0
+            summary = dict(detection.attrs["summary"])
+            summary.update({"dendrite_count": 1, "spine_count": 0})
+            detection.attrs["summary"] = summary
+
+            key = manifest["specimens"][0]["checkpoints"]["preprocessing"][
+                "channels"
+            ]["ChanB"]["dataset_key"]
+            processed = zarr.open_group(
+                str(project_cache_path(manifest)), mode="a"
+            )[key]
+            signal = np.zeros(processed.shape, dtype=np.uint16)
+            signal[:, 20:45, 20:40] = 3000
+            signal[:, 20:45, 40:60] = 800
+            processed[:] = signal
+            statistics = dict(processed.attrs["statistics"])
+            statistics["applied_threshold"] = 1000.0
+            processed.attrs["statistics"] = statistics
+
+            def trim(sensitivity: float) -> int:
+                apply_review_action(
+                    manifest,
+                    project_path,
+                    0,
+                    ReviewAction(
+                        object_type="dendrite",
+                        operation="trim",
+                        z_index=3,
+                        points=((42, 32),),
+                        brush_radius_pixels=1,
+                        sensitivity=sensitivity,
+                    ),
+                )
+                group = zarr.open_group(
+                    str(review_cache_path(manifest)), mode="r"
+                )["specimens/0000"]
+                return int(np.count_nonzero(np.asarray(group["dendrite_labels"])))
+
+            low_count = trim(0.5)
+            self.assertEqual(
+                manifest["specimens"][0]["review"]["history"][-1]["sensitivity"],
+                0.5,
+            )
+            undo_last_review_action(manifest, project_path, 0)
+            high_count = trim(2.0)
+            self.assertEqual(
+                manifest["specimens"][0]["review"]["history"][-1]["sensitivity"],
+                2.0,
+            )
+            self.assertLess(high_count, low_count)
 
     def test_forced_low_memory_correction_keeps_undo_available(self) -> None:
         with workspace_directory() as root:

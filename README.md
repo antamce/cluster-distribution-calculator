@@ -179,6 +179,8 @@ automatic result can be marked complete without drawing anything.
 The viewer shows a scrollable original 16-bit Z slice with contrast controls and
 colored overlays. Choose dendrite or spine, choose an action, then click or draw a
 colored hint. The drawing guides the operation and is not treated as a final mask.
+Enable **Distinct colors for individual dendrites and spines** to expose touching
+object borders while keeping protein clusters magenta.
 The same orthogonal-maximum and rotatable-3D buttons are available here, using the
 current corrected masks when corrections exist and automatic masks otherwise.
 
@@ -192,12 +194,23 @@ objects overlap ambiguously.
 Brush colors and actions are:
 
 - **Add missed object — green:** draw a separate stroke inside each missing
-  object. Each stroke seeds one independent 3D object whose final boundary follows
-  the preprocessed image signal.
+  object. Image-supported new regions that touch become one object. A region that
+  touches exactly one existing object of the same category joins that stable ID;
+  contact with multiple existing objects is rejected as ambiguous.
+- **Assign painted dendrite area to spine — lime:** available only on the drawable
+  XY maximum projection. The painted area must touch exactly one spine. Every
+  dendrite-mask voxel beneath the painted XY footprint across all Z slices is moved
+  literally to that spine; background and other masks are unchanged.
+- **Assign painted spine area to dendrite — coral:** the projection-only reverse
+  transfer. The painted area must touch exactly one dendrite; touching none or
+  multiple dendrites changes nothing. Covered voxels from every touched spine ID
+  are moved to that dendrite through all Z slices. Surviving parts retain their
+  spine IDs, while fully consumed spines are removed from the object count.
 - **Exclude object — red:** touch an unwanted object to remove that complete 3D
   object from the corrected mask.
 - **Trim boundary — magenta:** draw across excess segmentation. Synpo removes the
-  hinted region and retains the largest connected remainder of that object.
+  hinted region and locally retains the largest connected, image-supported
+  remainder of that object.
 - **Expand boundary — blue:** draw from an existing object toward omitted signal.
   Synpo regrows that object through locally supported preprocessed signal.
 - **Split touching objects — yellow:** draw through the neck or contact that should
@@ -210,10 +223,20 @@ Brush colors and actions are:
 - **Flag object for attention — orange:** retain the mask unchanged while keeping
   an explicit needs-attention status.
 
+The correction sensitivity slider is enabled for Add, Expand, and Trim and disabled
+for other actions. Each Apply captures the currently displayed value, so consecutive
+corrections may use different sensitivities. Higher sensitivity grows more signal
+for Add/Expand and removes more weak signal for Trim. Brush size is specified as a
+diameter from 1 to 1000 pixels.
+
 **Undo drawn stroke** changes only the current hint. **Undo last applied
 correction** restores saved 3D labels and prior object status. Every applied action
 immediately writes a specimen checkpoint. Comments and review-complete state are
 also saved; a later correction reopens the specimen as in progress.
+
+A persistent **Save project** button remains visible below every workflow tab. It
+saves committed project state without applying uncommitted processing or correction
+controls.
 
 Corrections are stored separately in `review.zarr`, leaving automatic masks intact.
 Review groups are tied to their detection signature. If detection is rerun with

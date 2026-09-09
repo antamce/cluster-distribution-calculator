@@ -111,6 +111,9 @@ class ProjectTests(unittest.TestCase):
             self.assertIn("preprocessing", loaded)
             self.assertEqual(loaded["detection"]["memory_mode"], "automatic")
             self.assertEqual(loaded["review_settings"]["memory_mode"], "automatic")
+            self.assertEqual(
+                loaded["review_settings"]["correction_sensitivity"], 1.0
+            )
             self.assertEqual(loaded["preprocessing"]["special_specimens"], [])
             self.assertEqual(loaded["preprocessing"]["settings_by_specimen"], {})
             self.assertIsInstance(

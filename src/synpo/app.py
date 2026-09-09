@@ -121,6 +121,8 @@ DISTRIBUTION_COLORS = (
 REVIEW_BRUSH_COLORS = {
     "exclude": QColor("#ff3030"),
     "add": QColor("#2ecc71"),
+    "dendrite_to_spine": QColor("#b8ff3d"),
+    "spine_to_dendrite": QColor("#ff6f61"),
     "trim": QColor("#ff00ff"),
     "expand": QColor("#2389ff"),
     "split": QColor("#ffe119"),
@@ -129,6 +131,32 @@ REVIEW_BRUSH_COLORS = {
     "accept": QColor("#22d3ee"),
     "needs_attention": QColor("#ff8c1a"),
 }
+
+DISTINCT_OBJECT_PALETTE = np.asarray(
+    [
+        (230, 25, 75),
+        (60, 180, 75),
+        (255, 225, 25),
+        (0, 130, 200),
+        (245, 130, 48),
+        (145, 30, 180),
+        (70, 240, 240),
+        (240, 50, 230),
+        (210, 245, 60),
+        (250, 190, 212),
+        (0, 128, 128),
+        (220, 190, 255),
+        (170, 110, 40),
+        (255, 250, 200),
+        (128, 0, 0),
+        (170, 255, 195),
+        (128, 128, 0),
+        (255, 215, 180),
+        (0, 0, 128),
+        (128, 128, 128),
+    ],
+    dtype=np.uint8,
+)
 
 
 def _label_colors(labels: np.ndarray, kind: int) -> np.ndarray:
@@ -149,6 +177,14 @@ def _label_colors(labels: np.ndarray, kind: int) -> np.ndarray:
         colors[..., 1] = 30 + variation
         colors[..., 2] = 165 + variation
     return colors
+
+
+def _distinct_object_colors(labels: np.ndarray, kind: int) -> np.ndarray:
+    values = np.asarray(labels, dtype=np.uint64)
+    indices = (
+        values * np.uint64(2654435761) + np.uint64(kind * 7)
+    ) % np.uint64(len(DISTINCT_OBJECT_PALETTE))
+    return DISTINCT_OBJECT_PALETTE[indices.astype(np.intp)]
 
 
 def _screen_limited_size(widget: QWidget, width: int, height: int) -> tuple[int, int]:
@@ -289,22 +325,33 @@ class SliceView(QLabel):
         dendrites: np.ndarray | None = None,
         spines: np.ndarray | None = None,
         clusters: np.ndarray | None = None,
+        distinct_dendrites_spines: bool = False,
     ) -> None:
         scale = max(1.0, float(high) - float(low))
         gray = np.clip(
             (np.asarray(array, dtype=np.float32) - low) * 255.0 / scale, 0, 255
         ).astype(np.uint8)
         rgb = np.repeat(gray[:, :, None], 3, axis=2)
-        for labels, color in (
-            (dendrites, np.array([35, 220, 70], dtype=np.float32)),
-            (spines, np.array([0, 205, 255], dtype=np.float32)),
-            (clusters, np.array([255, 40, 205], dtype=np.float32)),
+        for kind, (labels, color) in enumerate(
+            (
+                (dendrites, np.array([35, 220, 70], dtype=np.float32)),
+                (spines, np.array([0, 205, 255], dtype=np.float32)),
+                (clusters, np.array([255, 40, 205], dtype=np.float32)),
+            )
         ):
             if labels is None:
                 continue
             mask = np.asarray(labels) > 0
+            overlay_colors = (
+                _distinct_object_colors(np.asarray(labels), kind).astype(np.float32)
+                if distinct_dendrites_spines and kind < 2
+                else np.broadcast_to(color, rgb.shape)
+            )
             rgb[mask] = np.clip(
-                rgb[mask].astype(np.float32) * 0.3 + color * 0.7, 0, 255
+                rgb[mask].astype(np.float32) * 0.3
+                + overlay_colors[mask] * 0.7,
+                0,
+                255,
             ).astype(np.uint8)
         height, width = gray.shape
         self._image = QImage(
@@ -752,11 +799,18 @@ class ReviewCanvas(SliceView):
         self._strokes: list[list[tuple[int, int]]] = []
         self._drawing = False
         self._brush_radius = 4
+        self._brush_diameter = 9
         self._hint_color = QColor(REVIEW_BRUSH_COLORS["add"])
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     def set_brush_radius(self, radius: int) -> None:
         self._brush_radius = max(1, int(radius))
+        self._brush_diameter = self._brush_radius * 2 + 1
+        self._draw_hints()
+
+    def set_brush_diameter(self, diameter: int) -> None:
+        self._brush_diameter = max(1, int(diameter))
+        self._brush_radius = self._brush_diameter // 2
         self._draw_hints()
 
     def set_hint_color(self, color: QColor) -> None:
@@ -849,7 +903,7 @@ class ReviewCanvas(SliceView):
         painter = QPainter(image)
         pen = QPen(
             self._hint_color,
-            self._brush_radius * 2 + 1,
+            self._brush_diameter,
             Qt.PenStyle.SolidLine,
             Qt.PenCapStyle.RoundCap,
             Qt.PenJoinStyle.RoundJoin,
@@ -2246,6 +2300,7 @@ class MainWindow(QMainWindow):
         self._last_detection: DetectionSlice | None = None
         self._last_review: ReviewSlice | None = None
         self._last_review_context: ContextVolume | None = None
+        self._review_projection_loading = False
         self._last_trim_preview: ClusterTrimPreview | None = None
         self._last_distribution_preview: DistributionPreview | SpineReviewPreview | None = None
         self._preferred_distribution_spine_id: int | None = None
@@ -2492,9 +2547,6 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMinimumWidth(320)
         self.progress_bar.setVisible(False)
         progress_row.addWidget(self.progress_bar)
-        self.save_button = QPushButton("Save project…")
-        self.save_button.clicked.connect(self._save_project)
-        progress_row.addWidget(self.save_button)
         outer.addLayout(progress_row)
 
         self.tabs.addTab(setup_tab, "1. Batch setup")
@@ -2506,6 +2558,15 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
         self.tabs.setTabEnabled(4, False)
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        self.save_button = QPushButton("Save project…")
+        self.save_button.setToolTip(
+            "Save the project from any workflow step. Unapplied processing and correction controls are not committed."
+        )
+        self.save_button.clicked.connect(self._save_project)
+        save_row.addWidget(self.save_button)
+        central_layout.addLayout(save_row)
         self.setCentralWidget(central)
         self._build_context_status_line()
 
@@ -2993,6 +3054,14 @@ class MainWindow(QMainWindow):
         self.review_show_clusters.setChecked(True)
         self.review_show_clusters.toggled.connect(self._render_review_view)
         display_form.addRow(self.review_show_clusters)
+        self.review_distinct_object_colors = QCheckBox(
+            "Distinct colors for individual dendrites and spines"
+        )
+        self.review_distinct_object_colors.setToolTip(
+            "Assign stable contrasting colors to object IDs so touching borders are visible."
+        )
+        self.review_distinct_object_colors.toggled.connect(self._render_review_view)
+        display_form.addRow(self.review_distinct_object_colors)
         self.review_projections_button = QPushButton(
             "Generate XY/XZ/YZ maximum projections"
         )
@@ -3020,6 +3089,8 @@ class MainWindow(QMainWindow):
         self.review_operation = QComboBox()
         for label, value in (
             ("Add missed object", "add"),
+            ("Assign painted dendrite area to spine", "dendrite_to_spine"),
+            ("Assign painted spine area to dendrite", "spine_to_dendrite"),
             ("Exclude object", "exclude"),
             ("Exclude as filopodium", "filopodium"),
             ("Split touching objects", "split"),
@@ -3034,14 +3105,36 @@ class MainWindow(QMainWindow):
             self._review_tool_changed
         )
         correction_form.addRow("Action:", self.review_operation)
-        self.review_brush_radius = QSpinBox()
-        self.review_brush_radius.setRange(1, 100)
-        self.review_brush_radius.setValue(4)
-        self.review_brush_radius.setSuffix(" px")
-        self.review_brush_radius.valueChanged.connect(
+        self.review_brush_diameter = QSpinBox()
+        self.review_brush_diameter.setRange(1, 1000)
+        self.review_brush_diameter.setValue(9)
+        self.review_brush_diameter.setSuffix(" px")
+        self.review_brush_diameter.setToolTip(
+            "Displayed brush width. A 1000 px maximum is available for clearing large debris fields."
+        )
+        self.review_brush_diameter.valueChanged.connect(
             self._review_brush_changed
         )
-        correction_form.addRow("Hint brush radius:", self.review_brush_radius)
+        correction_form.addRow("Hint brush diameter:", self.review_brush_diameter)
+        self.review_sensitivity_label = QLabel("Resegmentation sensitivity:")
+        self.review_sensitivity_widget = QWidget()
+        sensitivity_layout = QHBoxLayout(self.review_sensitivity_widget)
+        sensitivity_layout.setContentsMargins(0, 0, 0, 0)
+        self.review_sensitivity = QSlider(Qt.Orientation.Horizontal)
+        self.review_sensitivity.setRange(25, 1000)
+        self.review_sensitivity.setValue(100)
+        self.review_sensitivity.setSingleStep(5)
+        self.review_sensitivity.setPageStep(25)
+        self.review_sensitivity.valueChanged.connect(
+            self._review_sensitivity_changed
+        )
+        sensitivity_layout.addWidget(self.review_sensitivity, 1)
+        self.review_sensitivity_value = QLabel("1.00")
+        self.review_sensitivity_value.setMinimumWidth(38)
+        sensitivity_layout.addWidget(self.review_sensitivity_value)
+        correction_form.addRow(
+            self.review_sensitivity_label, self.review_sensitivity_widget
+        )
         self.review_memory_mode = QComboBox()
         self.review_memory_mode.addItem(
             "Automatic (use slow mode when needed)",
@@ -3072,7 +3165,7 @@ class MainWindow(QMainWindow):
         )
         hint_buttons.addWidget(self.undo_review_stroke_button)
         correction_form.addRow(hint_buttons)
-        self.apply_review_button = QPushButton("Apply hint and resegment locally")
+        self.apply_review_button = QPushButton("Apply correction")
         self.apply_review_button.setMinimumHeight(38)
         self.apply_review_button.clicked.connect(self._apply_review_action)
         correction_form.addRow(self.apply_review_button)
@@ -4273,6 +4366,12 @@ class MainWindow(QMainWindow):
         )
         memory_index = self.review_memory_mode.findData(memory_mode)
         self.review_memory_mode.setCurrentIndex(max(0, memory_index))
+        correction_sensitivity = float(
+            self.manifest["review_settings"].get("correction_sensitivity", 1.0)
+        )
+        self.review_sensitivity.setValue(
+            max(25, min(1000, round(correction_sensitivity * 100)))
+        )
         if detected:
             self._review_specimen_changed()
         else:
@@ -5180,6 +5279,7 @@ class MainWindow(QMainWindow):
     def _review_view_mode_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
         self.review_view.clear_hint()
         self._update_review_z_label()
+        self._update_review_tool_controls()
         self._load_review_view(auto_contrast=True)
 
     def _load_review_view(
@@ -5225,6 +5325,7 @@ class MainWindow(QMainWindow):
                 self._context_cache[cache_key], auto_contrast=auto_contrast
             )
             return
+        self._last_review_context = None
         request = (
             cache_key,
             specimen_index,
@@ -5240,12 +5341,17 @@ class MainWindow(QMainWindow):
             self.review_status.setText(
                 "Waiting for the current projection/3D generation to finish."
             )
+            self._update_review_tool_controls()
             return
+        self._review_projection_loading = True
+        self.review_view.setEnabled(False)
+        self._update_review_tool_controls()
         self._start_context_generation(request)
 
     def _display_review_projection(
         self, volume: ContextVolume, *, auto_contrast: bool
     ) -> None:
+        self._review_projection_loading = False
         self._last_review_context = volume
         projection = volume.xy
         self._last_review = ReviewSlice(
@@ -5265,6 +5371,8 @@ class MainWindow(QMainWindow):
             self._auto_review_contrast()
         else:
             self._render_review_view()
+        self.review_view.clear_hint()
+        self._update_review_tool_controls()
 
     def _auto_review_contrast(self) -> None:
         if self._last_review is None:
@@ -5300,6 +5408,7 @@ class MainWindow(QMainWindow):
                 if self.review_show_clusters.isChecked()
                 else None
             ),
+            distinct_dendrites_spines=self.review_distinct_object_colors.isChecked(),
         )
 
     def _review_tool_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
@@ -5307,29 +5416,80 @@ class MainWindow(QMainWindow):
         self.review_view.set_hint_color(
             REVIEW_BRUSH_COLORS.get(operation, QColor("#ffe119"))
         )
-        if operation == "filopodium":
+        if operation in {"filopodium", "dendrite_to_spine"}:
             self.review_object_type.setCurrentIndex(
                 self.review_object_type.findData("spine")
+            )
+        elif operation == "spine_to_dendrite":
+            self.review_object_type.setCurrentIndex(
+                self.review_object_type.findData("dendrite")
+            )
+        if (
+            operation in {"dendrite_to_spine", "spine_to_dendrite"}
+            and self.review_view_mode.currentData() != "xy_max"
+        ):
+            self.review_view_mode.setCurrentIndex(
+                self.review_view_mode.findData("xy_max")
             )
         instructions = {
             "add": (
                 "Draw one separate stroke inside each missed object. Every stroke seeds one "
-                "independent 3D object; the saved preprocessed image determines its boundary. "
-                "Measurements still use the original 16-bit voxels."
+                "3D region. Touching new regions become one object; a region touching exactly "
+                "one existing object joins its stable ID. Ambiguous contact is skipped."
+            ),
+            "dendrite_to_spine": (
+                "On the XY maximum projection, paint across exactly one spine and any dendrite "
+                "area that belongs to it. Covered dendrite voxels in every Z slice are transferred "
+                "literally to that spine; image intensity is ignored."
+            ),
+            "spine_to_dendrite": (
+                "On the XY maximum projection, paint across exactly one dendrite and any spine "
+                "area that belongs to it. Covered spine voxels from every touched spine ID in "
+                "every Z slice are transferred literally to that dendrite; image intensity is ignored."
             ),
             "exclude": "Touch an unwanted object to exclude the complete 3D object.",
             "filopodium": "Touch a spine candidate to exclude and record it as a filopodium.",
             "split": "Draw across the contact or neck that should separate one object into two.",
             "merge": "Draw through at least two objects that should be one object.",
             "expand": "Draw toward missing signal from an existing object; the boundary is regrown locally.",
-            "trim": "Draw across the excess part; the connected object is retained locally.",
+            "trim": (
+                "Draw across the excess part. The connected image-supported remainder is retained "
+                "locally; higher sensitivity removes more weak signal."
+            ),
             "accept": "Touch an object to mark it accepted without changing its mask.",
             "needs_attention": "Touch an object to retain it but flag it for later attention.",
         }
         self.review_instruction.setText(instructions.get(operation, "Draw a hint."))
+        self._update_review_tool_controls()
+
+    def _update_review_tool_controls(self) -> None:
+        operation = str(self.review_operation.currentData())
+        available = self.review_specimen.count() > 0 and self._review_thread is None
+        has_fixed_type = operation in {
+            "filopodium",
+            "dendrite_to_spine",
+            "spine_to_dendrite",
+        }
+        self.review_object_type.setEnabled(available and not has_fixed_type)
+        sensitivity_enabled = available and operation in {"add", "expand", "trim"}
+        self.review_sensitivity_label.setEnabled(sensitivity_enabled)
+        self.review_sensitivity_widget.setEnabled(sensitivity_enabled)
+        projection_valid = (
+            operation not in {"dendrite_to_spine", "spine_to_dendrite"}
+            or (
+                self.review_view_mode.currentData() == "xy_max"
+                and self._last_review_context is not None
+            )
+        )
+        drawing_available = available and not self._review_projection_loading
+        self.review_view.setEnabled(drawing_available)
+        self.apply_review_button.setEnabled(drawing_available and projection_valid)
 
     def _review_brush_changed(self, value: int) -> None:
-        self.review_view.set_brush_radius(value)
+        self.review_view.set_brush_diameter(value)
+
+    def _review_sensitivity_changed(self, value: int) -> None:
+        self.review_sensitivity_value.setText(f"{value / 100.0:.2f}")
 
     def _review_hint_changed(self, count: int) -> None:
         stroke_count = len(self.review_view.hint_strokes())
@@ -5357,12 +5517,15 @@ class MainWindow(QMainWindow):
                 "Draw or click on the current Z slice or XY maximum projection first.",
             )
             return
+        operation = str(self.review_operation.currentData())
+        sensitivity = self.review_sensitivity.value() / 100.0
         action = ReviewAction(
             object_type=str(self.review_object_type.currentData()),
-            operation=str(self.review_operation.currentData()),
+            operation=operation,
             z_index=self.review_z_slider.value(),
             points=points,
-            brush_radius_pixels=self.review_brush_radius.value(),
+            brush_radius_pixels=max(0, self.review_brush_diameter.value() // 2),
+            sensitivity=sensitivity,
             projection_hint=self.review_view_mode.currentData() == "xy_max",
             strokes=self.review_view.hint_strokes(),
         )
@@ -5370,6 +5533,8 @@ class MainWindow(QMainWindow):
             self.review_memory_mode.currentData()
             or AUTOMATIC_REVIEW_MEMORY_MODE
         )
+        if operation in {"add", "expand", "trim"}:
+            self.manifest["review_settings"]["correction_sensitivity"] = sensitivity
         save_project(self.project_path, self.manifest)
         self._start_review_worker(action)
 
@@ -5427,11 +5592,15 @@ class MainWindow(QMainWindow):
             created = [
                 item for item in result.hint_results if item.get("status") == "created"
             ]
+            joined = [
+                item for item in result.hint_results if item.get("status") == "joined"
+            ]
             skipped = [
-                item for item in result.hint_results if item.get("status") != "created"
+                item for item in result.hint_results if item.get("status") == "skipped"
             ]
             details = "; ".join(
-                f"hint {item['hint_index']}: {item['message']}" for item in skipped
+                f"hint {item['hint_index']}: {item['message']}"
+                for item in (*joined, *skipped)
             )
             checkpoint = (
                 "One atomic checkpoint was written."
@@ -5439,7 +5608,8 @@ class MainWindow(QMainWindow):
                 else "No mask change or checkpoint was written; adjust the hint(s) and retry."
             )
             self.review_status.setText(
-                f"Add hints: {len(created)}/{len(result.hint_results)} object(s) created. "
+                f"Add hints: {len(created)} new, {len(joined)} joined, "
+                f"{len(skipped)} skipped. "
                 + (f"{details}. " if details else "")
                 + (
                     "Slow low-memory correction was used. "
@@ -5447,6 +5617,29 @@ class MainWindow(QMainWindow):
                     else ""
                 )
                 + checkpoint
+            )
+            return
+        if result.operation in {"dendrite_to_spine", "spine_to_dendrite"}:
+            source_type = (
+                "dendrite"
+                if result.operation == "dendrite_to_spine"
+                else "spine"
+            )
+            destination_type = (
+                "spine"
+                if result.operation == "dendrite_to_spine"
+                else "dendrite"
+            )
+            self.review_status.setText(
+                f"Transferred {result.transferred_voxel_count} {source_type} voxel(s) to "
+                f"{destination_type} "
+                f"{result.affected_ids[0]}; {result.edit_count} active edit(s). "
+                + (
+                    "Slow low-memory correction was used. "
+                    if result.processing_mode == "low_memory"
+                    else ""
+                )
+                + "An automatic specimen checkpoint was written."
             )
             return
         self.review_status.setText(
@@ -5462,8 +5655,14 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _review_action_failed(self, message: str) -> None:
-        self.review_status.setText("Correction was not applied; the previous mask is intact.")
-        QMessageBox.warning(self, "Cannot apply correction", message)
+        self.review_status.setText(
+            f"Correction was not applied; the previous mask is intact. {message}"
+        )
+        if self.review_operation.currentData() not in {
+            "dendrite_to_spine",
+            "spine_to_dendrite",
+        }:
+            QMessageBox.warning(self, "Cannot apply correction", message)
 
     @Slot()
     def _review_worker_finished(self) -> None:
@@ -5490,7 +5689,7 @@ class MainWindow(QMainWindow):
             self.review_z_slider,
             self.review_object_type,
             self.review_operation,
-            self.review_brush_radius,
+            self.review_brush_diameter,
             self.review_memory_mode,
             self.review_projections_button,
             self.review_3d_button,
@@ -5503,6 +5702,7 @@ class MainWindow(QMainWindow):
         ):
             widget.setEnabled(has_specimen and not busy)
         self.review_view.setEnabled(has_specimen and not busy)
+        self._update_review_tool_controls()
 
     def _refresh_review_specimen_label(self) -> None:
         if self.manifest is None or self.review_specimen.currentData() is None:
@@ -5943,12 +6143,26 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _context_finished(self) -> None:
+        review_projection_finished = bool(
+            self._context_request is not None
+            and self._context_request[4] == "review_main"
+        )
         if self._context_worker is not None:
             self._context_worker.deleteLater()
         self._context_worker = None
         self._context_thread = None
         self._context_request = None
         self.context_status_widget.setVisible(False)
+        if review_projection_finished:
+            self._review_projection_loading = False
+            self._update_review_tool_controls()
+        elif (
+            self.review_view_mode.currentData() == "xy_max"
+            and self._last_review_context is None
+            and self.manifest is not None
+            and self.review_specimen.currentData() is not None
+        ):
+            QTimer.singleShot(0, lambda: self._load_review_view(auto_contrast=False))
 
     def _invalidate_context_views(
         self, specimen_index: int, *, corrected_only: bool

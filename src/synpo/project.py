@@ -54,6 +54,7 @@ def default_review_manifest() -> dict[str, object]:
     return {
         "algorithm_version": 2,
         "memory_mode": "automatic",
+        "correction_sensitivity": 1.0,
         "local_margin_um": 1.0,
         "z_radius_slices": 2,
         "add_z_radius_slices": 6,
@@ -94,6 +95,7 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     review_settings = manifest.setdefault("review_settings", default_review_manifest())
     review_settings["algorithm_version"] = 2
     review_settings.setdefault("memory_mode", "automatic")
+    review_settings.setdefault("correction_sensitivity", 1.0)
     review_settings.setdefault("add_z_radius_slices", 6)
     manifest.setdefault("measurements", default_measurements_manifest())
     import_settings = manifest.setdefault(

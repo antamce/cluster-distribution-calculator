@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -118,6 +119,81 @@ class Stage7AUiTests(unittest.TestCase):
             self.assertEqual(canvas._hint_color.name(), expected.name())
         window.deleteLater()
         self.app.processEvents()
+
+    def test_review_correction_controls_cover_transfer_sensitivity_and_large_diameter(self) -> None:
+        window = MainWindow()
+        self.assertEqual(window.review_brush_diameter.maximum(), 1000)
+        self.assertEqual(window.review_brush_diameter.value(), 9)
+        self.assertTrue(window.centralWidget().isAncestorOf(window.save_button))
+        window.tabs.setTabEnabled(3, True)
+        window.review_specimen.addItem("test specimen", 0)
+        window._set_review_busy(False)
+
+        add_index = window.review_operation.findData("add")
+        window.review_operation.setCurrentIndex(add_index)
+        self.assertTrue(window.review_sensitivity_widget.isEnabled())
+        window.review_sensitivity.setValue(235)
+        self.assertEqual(window.review_sensitivity_value.text(), "2.35")
+
+        exclude_index = window.review_operation.findData("exclude")
+        window.review_operation.setCurrentIndex(exclude_index)
+        self.assertFalse(window.review_sensitivity_widget.isEnabled())
+
+        transfer_index = window.review_operation.findData("dendrite_to_spine")
+        window.review_operation.setCurrentIndex(transfer_index)
+        self.assertEqual(window.review_view_mode.currentData(), "xy_max")
+        self.assertEqual(window.review_object_type.currentData(), "spine")
+        self.assertFalse(window.review_object_type.isEnabled())
+        with patch("synpo.app.QMessageBox.warning") as warning:
+            window._review_action_failed("Dendrite transfer touched multiple spines 1, 2.")
+            warning.assert_not_called()
+        self.assertIn("multiple spines", window.review_status.text())
+
+        reverse_index = window.review_operation.findData("spine_to_dendrite")
+        window.review_operation.setCurrentIndex(reverse_index)
+        self.assertEqual(window.review_view_mode.currentData(), "xy_max")
+        self.assertEqual(window.review_object_type.currentData(), "dendrite")
+        self.assertFalse(window.review_object_type.isEnabled())
+        self.assertFalse(window.review_sensitivity_widget.isEnabled())
+        with patch("synpo.app.QMessageBox.warning") as warning:
+            window._review_action_failed(
+                "Spine transfer touched multiple dendrites 1, 2."
+            )
+            warning.assert_not_called()
+        self.assertIn("multiple dendrites", window.review_status.text())
+        window.deleteLater()
+        self.app.processEvents()
+
+    def test_distinct_review_colors_separate_dendrite_and_spine_ids_only(self) -> None:
+        view = SliceView("distinct labels")
+        raw = np.zeros((8, 8), dtype=np.uint16)
+        dendrites = np.zeros((8, 8), dtype=np.uint32)
+        spines = np.zeros((8, 8), dtype=np.uint32)
+        clusters = np.zeros((8, 8), dtype=np.uint32)
+        dendrites[1, 1] = 1
+        dendrites[1, 2] = 2
+        spines[3, 1] = 1
+        spines[3, 2] = 2
+        clusters[5, 1] = 1
+        clusters[5, 2] = 2
+        view.show_detection(
+            raw,
+            0,
+            1,
+            dendrites=dendrites,
+            spines=spines,
+            clusters=clusters,
+            distinct_dendrites_spines=True,
+        )
+        self.assertNotEqual(
+            view._image.pixelColor(1, 1), view._image.pixelColor(2, 1)
+        )
+        self.assertNotEqual(
+            view._image.pixelColor(1, 3), view._image.pixelColor(2, 3)
+        )
+        self.assertEqual(
+            view._image.pixelColor(1, 5), view._image.pixelColor(2, 5)
+        )
 
     def test_special_preprocessing_invalidates_only_effectively_changed_pairs(self) -> None:
         window = MainWindow()

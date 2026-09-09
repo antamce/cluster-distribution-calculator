@@ -27,6 +27,8 @@ from .project import channel_source_path, save_project
 ObjectType = Literal["dendrite", "spine"]
 Operation = Literal[
     "add",
+    "dendrite_to_spine",
+    "spine_to_dendrite",
     "exclude",
     "filopodium",
     "split",
@@ -52,6 +54,7 @@ class ReviewAction:
     z_index: int
     points: tuple[tuple[int, int], ...]
     brush_radius_pixels: int = 4
+    sensitivity: float = 1.0
     projection_hint: bool = False
     strokes: tuple[tuple[tuple[int, int], ...], ...] = ()
 
@@ -63,6 +66,8 @@ class ReviewAction:
             raise ValueError("Review object type must be dendrite or spine.")
         if self.operation not in {
             "add",
+            "dendrite_to_spine",
+            "spine_to_dendrite",
             "exclude",
             "filopodium",
             "split",
@@ -76,10 +81,26 @@ class ReviewAction:
         strokes = self.hint_strokes()
         if not strokes or any(not stroke for stroke in strokes):
             raise ValueError("Draw or click a hint before applying this action.")
-        if self.brush_radius_pixels < 1:
-            raise ValueError("Hint brush radius must be positive.")
+        if self.brush_radius_pixels < 0:
+            raise ValueError("Hint brush radius cannot be negative.")
+        if not 0.25 <= self.sensitivity <= 10.0:
+            raise ValueError("Correction sensitivity must be between 0.25 and 10.0.")
         if self.operation == "filopodium" and self.object_type != "spine":
             raise ValueError("Filopodium exclusion is available only for spines.")
+        if self.operation == "dendrite_to_spine":
+            if self.object_type != "spine":
+                raise ValueError("Dendrite transfer is available only for spines.")
+            if not self.projection_hint:
+                raise ValueError(
+                    "Dendrite transfer is available only on the drawable XY maximum projection."
+                )
+        if self.operation == "spine_to_dendrite":
+            if self.object_type != "dendrite":
+                raise ValueError("Spine transfer is available only for dendrites.")
+            if not self.projection_hint:
+                raise ValueError(
+                    "Spine transfer is available only on the drawable XY maximum projection."
+                )
 
 
 @dataclass(frozen=True)
@@ -96,6 +117,7 @@ class ReviewResult:
     checkpoint_written: bool = True
     hint_results: tuple[dict[str, object], ...] = ()
     processing_mode: str = "standard"
+    transferred_voxel_count: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -676,6 +698,8 @@ def _segment_add_hint_group(
     sensitivity: float,
     preprocessing_threshold: float,
     next_id: int,
+    target_border_patch: np.ndarray | None = None,
+    target_border_offset: tuple[int, int, int] = (0, 0, 0),
 ) -> tuple[np.ndarray, int, list[dict[str, object]]]:
     candidate_union = np.zeros(target_patch.shape, dtype=bool)
     combined_signal = np.zeros(target_patch.shape, dtype=np.float32)
@@ -795,6 +819,7 @@ def _segment_add_hint_group(
         connectivity=np.ones((3, 3, 3), dtype=bool),
     )
     output = target_patch.copy()
+    valid_markers: list[int] = []
     for marker_number, hint in enumerate(marker_hints, start=1):
         hint_index = int(hint["index"])
         region = separated == marker_number
@@ -808,17 +833,85 @@ def _segment_add_hint_group(
                 }
             )
             continue
-        object_id = next_id
-        next_id += 1
-        output[region] = object_id
-        results.append(
-            {
-                "hint_index": hint_index,
-                "status": "created",
-                "object_id": object_id,
-                "message": f"created object {object_id}",
-            }
+        valid_markers.append(marker_number)
+
+    if not valid_markers:
+        return output, next_id, results
+
+    valid_union = np.isin(separated, np.asarray(valid_markers, dtype=np.int32))
+    components, component_count = ndimage.label(
+        valid_union, structure=np.ones((3, 3, 3), dtype=bool)
+    )
+    neighbor_structure = np.ones((3, 3, 3), dtype=bool)
+    for component_number in range(1, component_count + 1):
+        component = components == component_number
+        component_markers = sorted(
+            int(value)
+            for value in np.unique(separated[component])
+            if int(value) in valid_markers
         )
+        if target_border_patch is None:
+            neighbor_labels = target_patch
+            neighbor_component = component
+        else:
+            neighbor_labels = target_border_patch
+            neighbor_component = np.zeros(neighbor_labels.shape, dtype=bool)
+            z0, y0, x0 = target_border_offset
+            neighbor_component[
+                z0 : z0 + component.shape[0],
+                y0 : y0 + component.shape[1],
+                x0 : x0 + component.shape[2],
+            ] = component
+        neighboring = ndimage.binary_dilation(
+            neighbor_component, structure=neighbor_structure
+        ) & ~neighbor_component
+        neighboring_ids = tuple(
+            int(value)
+            for value in np.unique(neighbor_labels[neighboring])
+            if int(value) > 0
+        )
+        if len(neighboring_ids) > 1:
+            message = (
+                "the new region touched multiple existing objects "
+                + ", ".join(str(value) for value in neighboring_ids)
+            )
+            for marker_number in component_markers:
+                results.append(
+                    {
+                        "hint_index": int(marker_hints[marker_number - 1]["index"]),
+                        "status": "skipped",
+                        "object_id": None,
+                        "message": message,
+                    }
+                )
+            continue
+
+        joined_existing = bool(neighboring_ids)
+        if joined_existing:
+            object_id = neighboring_ids[0]
+        else:
+            object_id = next_id
+            next_id += 1
+        output[component] = object_id
+        for position, marker_number in enumerate(component_markers):
+            hint_index = int(marker_hints[marker_number - 1]["index"])
+            created = not joined_existing and position == 0
+            results.append(
+                {
+                    "hint_index": hint_index,
+                    "status": "created" if created else "joined",
+                    "object_id": object_id,
+                    "message": (
+                        f"created object {object_id}"
+                        if created
+                        else (
+                            f"joined existing object {object_id}"
+                            if joined_existing
+                            else f"joined the same new object {object_id}"
+                        )
+                    ),
+                }
+            )
     return output, next_id, results
 
 
@@ -886,9 +979,7 @@ def _apply_add_hints(
     original_next_id = int(group.attrs[next_key])
     original_count = int(group.attrs[count_key])
     next_id = original_next_id
-    sensitivity = float(
-        manifest["detection"]["settings"]["dendrite_sensitivity"]
-    )
+    sensitivity = float(action.sensitivity)
     preprocessing_threshold = float(
         processed.attrs["statistics"]["applied_threshold"]
     )
@@ -908,6 +999,14 @@ def _apply_add_hints(
             processing_mode = "low_memory"
         slices = _bbox_slices(bbox)
         before = np.asarray(target[slices])
+        border_bbox = _expand_bbox(bbox, tuple(target.shape), 1, z=1)
+        border_slices = _bbox_slices(border_bbox)
+        target_border = np.asarray(target[border_slices])
+        border_offset = (
+            bbox[0] - border_bbox[0],
+            bbox[2] - border_bbox[2],
+            bbox[4] - border_bbox[4],
+        )
         dendrite_patch = (
             np.asarray(group["dendrite_labels"][slices])
             if action.object_type == "spine"
@@ -924,6 +1023,8 @@ def _apply_add_hints(
             sensitivity=sensitivity,
             preprocessing_threshold=preprocessing_threshold,
             next_id=next_id,
+            target_border_patch=target_border,
+            target_border_offset=border_offset,
         )
         hint_results.extend(results)
         if np.any(output != before):
@@ -937,11 +1038,21 @@ def _apply_add_hints(
             )
     hint_results.sort(key=lambda item: int(item["hint_index"]))
     created_ids = tuple(
-        int(item["object_id"])
-        for item in hint_results
-        if item["status"] == "created"
+        dict.fromkeys(
+            int(item["object_id"])
+            for item in hint_results
+            if item["status"] == "created" and item["object_id"] is not None
+        )
     )
-    if not created_ids:
+    affected_ids = tuple(
+        dict.fromkeys(
+            int(item["object_id"])
+            for item in hint_results
+            if item["status"] in {"created", "joined"}
+            and item["object_id"] is not None
+        )
+    )
+    if not affected_ids:
         return ReviewResult(
             specimen_index=specimen_index,
             action_id="",
@@ -995,7 +1106,8 @@ def _apply_add_hints(
         "hint_count": len(strokes),
         "hint_results": hint_results,
         "brush_radius_pixels": action.brush_radius_pixels,
-        "affected_ids": list(created_ids),
+        "sensitivity": sensitivity,
+        "affected_ids": list(affected_ids),
         "new_ids": list(created_ids),
         "bbox": None,
         "bboxes": [list(bbox) for bbox, _before, _output in updates],
@@ -1040,7 +1152,7 @@ def _apply_add_hints(
         action_id=action_id,
         operation="add",
         object_type=action.object_type,
-        affected_ids=created_ids,
+        affected_ids=affected_ids,
         new_ids=created_ids,
         edit_count=int(checkpoint["edit_count"]),
         dendrite_count=int(group.attrs["dendrite_count"]),
@@ -1048,6 +1160,235 @@ def _apply_add_hints(
         checkpoint_written=True,
         hint_results=tuple(hint_results),
         processing_mode=processing_mode,
+    )
+
+
+def _apply_projection_mask_transfer(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    action: ReviewAction,
+    group: zarr.Group,
+    *,
+    source_type: ObjectType,
+    destination_type: ObjectType,
+    operation: str,
+    progress: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
+) -> ReviewResult:
+    """Transfer painted full-Z columns between label volumes."""
+    specimen = manifest["specimens"][specimen_index]
+    source_name = f"{source_type}_labels"
+    destination_name = f"{destination_type}_labels"
+    source = group[source_name]
+    destination = group[destination_name]
+    if not 0 <= action.z_index < destination.shape[0]:
+        raise ValueError("The selected reference Z slice is outside the stack.")
+    selected_destinations = _sample_ids_projection(
+        destination, action.points, action.brush_radius_pixels
+    )
+    if not selected_destinations:
+        raise ValueError(
+            f"{source_type.capitalize()} transfer needs the painted area to touch "
+            f"one existing {destination_type}; none was touched."
+        )
+    if len(selected_destinations) > 1:
+        raise ValueError(
+            f"{source_type.capitalize()} transfer touched multiple "
+            f"{destination_type}s "
+            + ", ".join(str(value) for value in selected_destinations)
+            + "; no mask was changed."
+        )
+    destination_id = selected_destinations[0]
+    y_slice, x_slice, hint = _hint_crop(
+        tuple(destination.shape[1:]), action.points, action.brush_radius_pixels
+    )
+    bbox = (
+        0,
+        int(destination.shape[0]),
+        int(y_slice.start),
+        int(y_slice.stop),
+        int(x_slice.start),
+        int(x_slice.stop),
+    )
+    processing_mode = (
+        "low_memory" if _use_low_memory_review(manifest, bbox) else "standard"
+    )
+    action_id = uuid.uuid4().hex
+    undo = group.require_group("undo").require_group(action_id)
+    datasets = undo.require_group("datasets")
+    shape = (
+        int(destination.shape[0]),
+        int(y_slice.stop - y_slice.start),
+        int(x_slice.stop - x_slice.start),
+    )
+    chunks = (1, min(256, shape[1]), min(256, shape[2]))
+    before_source = datasets.create_dataset(
+        source_name,
+        shape=shape,
+        dtype="uint32",
+        chunks=chunks,
+        compressor=_compressor(),
+        overwrite=True,
+    )
+    before_destination = datasets.create_dataset(
+        destination_name,
+        shape=shape,
+        dtype="uint32",
+        chunks=chunks,
+        compressor=_compressor(),
+        overwrite=True,
+    )
+    undo.attrs.update({"multi_dataset": True, "bbox": list(bbox)})
+
+    transferred_voxels = 0
+    transferred_counts: dict[int, int] = {}
+    total_counts: dict[int, int] = {}
+    for z_index in range(destination.shape[0]):
+        if cancel_event is not None and cancel_event.is_set():
+            del group[f"undo/{action_id}"]
+        _cancel_if_requested(cancel_event)
+        full_source_plane = np.asarray(source[z_index])
+        source_patch = full_source_plane[y_slice, x_slice]
+        destination_patch = np.asarray(destination[z_index, y_slice, x_slice])
+        before_source[z_index] = source_patch
+        before_destination[z_index] = destination_patch
+        values, counts = np.unique(full_source_plane, return_counts=True)
+        for value, count in zip(values, counts):
+            object_id = int(value)
+            if object_id <= 0:
+                continue
+            total_counts[object_id] = total_counts.get(object_id, 0) + int(count)
+        transfer_values, transfer_counts = np.unique(
+            source_patch[hint], return_counts=True
+        )
+        for value, count in zip(transfer_values, transfer_counts):
+            object_id = int(value)
+            if object_id <= 0:
+                continue
+            transferred_counts[object_id] = (
+                transferred_counts.get(object_id, 0) + int(count)
+            )
+            transferred_voxels += int(count)
+        if progress:
+            progress(
+                f"Preparing {source_type}-to-{destination_type} transfer",
+                z_index + 1,
+                int(destination.shape[0]) * 2,
+                f"Reading Z {z_index + 1}/{destination.shape[0]}",
+            )
+    if not transferred_voxels:
+        del group[f"undo/{action_id}"]
+        raise ValueError(
+            f"The painted area touched one {destination_type} but did not cover "
+            f"any {source_type}-mask voxels."
+        )
+
+    try:
+        for z_index in range(destination.shape[0]):
+            _cancel_if_requested(cancel_event)
+            source_patch = np.asarray(before_source[z_index])
+            destination_patch = np.asarray(before_destination[z_index])
+            transfer = hint & (source_patch > 0)
+            source_patch[transfer] = 0
+            destination_patch[transfer] = destination_id
+            source[z_index, y_slice, x_slice] = source_patch
+            destination[z_index, y_slice, x_slice] = destination_patch
+            if progress:
+                progress(
+                    f"Applying {source_type}-to-{destination_type} transfer",
+                    int(destination.shape[0]) + z_index + 1,
+                    int(destination.shape[0]) * 2,
+                    f"Writing Z {z_index + 1}/{destination.shape[0]}",
+                )
+    except Exception:
+        for z_index in range(destination.shape[0]):
+            source[z_index, y_slice, x_slice] = np.asarray(before_source[z_index])
+            destination[z_index, y_slice, x_slice] = np.asarray(
+                before_destination[z_index]
+            )
+        del group[f"undo/{action_id}"]
+        raise
+
+    removed_source_ids = tuple(
+        object_id
+        for object_id, count in transferred_counts.items()
+        if count == total_counts.get(object_id, 0)
+    )
+    source_count_key = f"{source_type}_count"
+    group.attrs[source_count_key] = max(
+        0, int(group.attrs[source_count_key]) - len(removed_source_ids)
+    )
+    history_entry = {
+        "action_id": action_id,
+        "timestamp": time.time(),
+        "operation": operation,
+        "object_type": destination_type,
+        "z_index": action.z_index,
+        "projection_hint": True,
+        "hint_point_count": len(action.points),
+        "brush_radius_pixels": action.brush_radius_pixels,
+        "sensitivity": None,
+        "affected_ids": [destination_id],
+        f"source_{source_type}_ids": sorted(transferred_counts),
+        f"removed_{source_type}_ids": list(removed_source_ids),
+        "source_object_type": source_type,
+        "source_object_ids": sorted(transferred_counts),
+        "removed_source_ids": list(removed_source_ids),
+        "transferred_voxel_count": transferred_voxels,
+        "new_ids": [],
+        "bbox": list(bbox),
+        "count_delta": 0,
+        f"{source_type}_count_delta": -len(removed_source_ids),
+        "previous_status": {},
+        "processing_mode": processing_mode,
+        "undone": False,
+        "undo_available": True,
+        "undo_datasets": [source_name, destination_name],
+    }
+    specimen["review"]["history"].append(history_entry)
+    maximum_undo = int(manifest["review_settings"].get("maximum_undo_actions", 100))
+    mask_undo_entries = [
+        item
+        for item in specimen["review"]["history"]
+        if (item.get("bbox") is not None or item.get("bboxes"))
+        and not item.get("undone")
+        and item.get("undo_available", True)
+    ]
+    while len(mask_undo_entries) > maximum_undo:
+        expired = mask_undo_entries.pop(0)
+        undo_key = f"undo/{expired['action_id']}"
+        if undo_key in group:
+            del group[undo_key]
+        expired["undo_available"] = False
+    specimen["review"]["state"] = "in_progress"
+    checkpoint = specimen["checkpoints"]["review"]
+    checkpoint.update(
+        {
+            "state": "in_progress",
+            "updated_at": time.time(),
+            "edit_count": int(checkpoint.get("edit_count", 0)) + 1,
+            "cache_path": str(review_cache_path(manifest)),
+            "detection_signature": group.attrs["detection_signature"],
+        }
+    )
+    specimen["checkpoints"].setdefault("measurements", {}).update(
+        {"state": "not_started", "updated_at": time.time()}
+    )
+    save_project(project_path, manifest)
+    return ReviewResult(
+        specimen_index=specimen_index,
+        action_id=action_id,
+        operation=operation,
+        object_type=destination_type,
+        affected_ids=(destination_id,),
+        new_ids=(),
+        edit_count=int(checkpoint["edit_count"]),
+        dendrite_count=int(group.attrs["dendrite_count"]),
+        spine_count=int(group.attrs["spine_count"]),
+        checkpoint_written=True,
+        processing_mode=processing_mode,
+        transferred_voxel_count=transferred_voxels,
     )
 
 
@@ -1070,6 +1411,25 @@ def apply_review_action(
         progress=progress,
         cancel_event=cancel_event,
     )
+    if action.operation in {"dendrite_to_spine", "spine_to_dendrite"}:
+        source_type: ObjectType = (
+            "dendrite" if action.operation == "dendrite_to_spine" else "spine"
+        )
+        destination_type: ObjectType = (
+            "spine" if action.operation == "dendrite_to_spine" else "dendrite"
+        )
+        return _apply_projection_mask_transfer(
+            manifest,
+            project_path,
+            specimen_index,
+            action,
+            group,
+            source_type=source_type,
+            destination_type=destination_type,
+            operation=action.operation,
+            progress=progress,
+            cancel_event=cancel_event,
+        )
     dataset_name = f"{action.object_type}_labels"
     target = group[dataset_name]
     if not 0 <= action.z_index < target.shape[0]:
@@ -1252,15 +1612,23 @@ def apply_review_action(
 
             object_id = selected_ids[0]
             if action.operation == "trim":
+                processed = _processed_dendrite_data(manifest, specimen_index)
+                threshold = float(
+                    processed.attrs["statistics"]["applied_threshold"]
+                )
+                trim_threshold = threshold * float(action.sensitivity) * 0.8
                 if low_memory:
                     assert temporary is not None
                     candidate = _disk_backed_array(
                         temporary, "trim-candidate.dat", tuple(patch.shape), np.bool_
                     )
-                    for z_index in range(patch.shape[0]):
+                    for z_index, source_z in enumerate(range(bbox[0], bbox[1])):
+                        signal = np.asarray(
+                            processed[source_z, slices[1], slices[2]]
+                        )
                         candidate[z_index] = (
                             np.asarray(before[z_index]) == object_id
-                        ) & ~hint_plane(z_index)
+                        ) & ~hint_plane(z_index) & (signal >= trim_threshold)
                     components, count, sizes = _label_disk_backed_mask(
                         candidate, temporary
                     )
@@ -1268,7 +1636,12 @@ def apply_review_action(
                     hint_3d = np.zeros(patch.shape, dtype=bool)
                     for z_index in range(patch.shape[0]):
                         hint_3d[z_index] = hint_plane(z_index)
-                    candidate = (patch == object_id) & ~hint_3d
+                    signal = np.asarray(processed[slices])
+                    candidate = (
+                        (patch == object_id)
+                        & ~hint_3d
+                        & (signal >= trim_threshold)
+                    )
                     components, count = ndimage.label(
                         candidate, structure=np.ones((3, 3, 3), dtype=bool)
                     )
@@ -1283,9 +1656,7 @@ def apply_review_action(
                     patch[z_index] = plane
             else:
                 processed = _processed_dendrite_data(manifest, specimen_index)
-                sensitivity = float(
-                    manifest["detection"]["settings"]["dendrite_sensitivity"]
-                )
+                sensitivity = float(action.sensitivity)
                 threshold = float(
                     processed.attrs["statistics"]["applied_threshold"]
                 )
@@ -1375,6 +1746,11 @@ def apply_review_action(
         "projection_hint": action.projection_hint,
         "hint_point_count": len(action.points),
         "brush_radius_pixels": action.brush_radius_pixels,
+        "sensitivity": (
+            float(action.sensitivity)
+            if action.operation in {"add", "expand", "trim"}
+            else None
+        ),
         "affected_ids": list(affected_ids),
         "new_ids": list(new_ids),
         "bbox": list(bbox) if bbox else None,
@@ -1447,7 +1823,12 @@ def undo_last_review_action(
     group = root[_review_group_key(specimen_index)]
     action_id = str(entry["action_id"])
     undo = group[f"undo/{action_id}"] if (entry.get("bbox") is not None or entry.get("bboxes")) else None
-    if entry.get("bboxes") and undo is not None:
+    if entry.get("undo_datasets") and undo is not None:
+        bbox = tuple(int(value) for value in undo.attrs["bbox"])
+        for dataset_name in entry["undo_datasets"]:
+            saved = undo[f"datasets/{dataset_name}"]
+            _write_review_patch(group[str(dataset_name)], bbox, saved)
+    elif entry.get("bboxes") and undo is not None:
         patch_group = undo["patches"]
         for name in sorted(patch_group.keys()):
             saved = patch_group[name]
@@ -1472,6 +1853,15 @@ def undo_last_review_action(
     group.attrs[count_key] = max(
         0, int(group.attrs[count_key]) - int(entry.get("count_delta", 0))
     )
+    for source_type in ("dendrite", "spine"):
+        delta_key = f"{source_type}_count_delta"
+        if entry.get(delta_key) is not None:
+            source_count_key = f"{source_type}_count"
+            group.attrs[source_count_key] = max(
+                0,
+                int(group.attrs[source_count_key])
+                - int(entry.get(delta_key, 0)),
+            )
     entry["undone"] = True
     checkpoint = specimen["checkpoints"]["review"]
     checkpoint["updated_at"] = time.time()

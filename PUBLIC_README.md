@@ -125,9 +125,11 @@ Detection uses **Automatic (fast when safe)** by default. Choose **Always use lo
 
 The correction canvas can show an individual Z slice or a drawable XY maximum projection. Drawn hints are instructions rather than final masks. The brushes are:
 
-- **Add — green:** draw separately inside each missed object; each stroke seeds an independent 3D object whose boundary follows preprocessed signal.
+- **Add — green:** draw separately inside missed objects. Touching new regions become one object; a new region touching exactly one existing object of the same category joins it, while ambiguous multiple-object contact is skipped.
+- **Assign dendrite area to spine — lime:** on the drawable XY projection, touch exactly one spine and paint over shaft voxels that belong to it. Covered dendrite-mask voxels across every Z slice are transferred literally to that spine.
+- **Assign spine area to dendrite — coral:** the reverse projection-only brush. Touch exactly one dendrite and paint over spine voxels that belong to it. Covered voxels from all touched spine IDs are transferred through every Z slice; ambiguous contact with multiple dendrites is rejected without changing the masks.
 - **Exclude — red:** touch an unwanted object to remove that complete 3D object.
-- **Trim — magenta:** draw across excess segmentation; Synpo removes the hint and keeps the largest connected remainder.
+- **Trim — magenta:** draw across excess segmentation; Synpo removes the hint and keeps the largest connected image-supported remainder.
 - **Expand — blue:** draw from an existing object toward missed signal so its boundary is regrown locally.
 - **Split — yellow:** draw through a neck or contact to divide one object into separately numbered objects.
 - **Mark as filopodium — purple:** touch a spine to exclude it and record the filopodium decision in the audit trail.
@@ -135,7 +137,9 @@ The correction canvas can show an individual Z slice or a drawable XY maximum pr
 - **Accept — cyan:** retain the mask unchanged and record the object as accepted.
 - **Needs attention — orange:** retain the mask unchanged and explicitly flag it for later review.
 
-Multiple missed-object hints remain separate objects. Protein clusters are detected automatically and are not manually redrawn.
+Add, Expand, and Trim use a per-application sensitivity slider; it is visibly disabled for other brushes. Higher sensitivity expands Add/Expand results and removes more weak signal during Trim. The brush diameter ranges from 1 to 1000 pixels. A display toggle assigns stable contrasting colors to individual dendrites and spines so their borders remain visible. Protein clusters are detected automatically and are not manually redrawn.
+
+The **Save project** button remains visible below every workflow step and saves committed state without applying pending controls.
 
 Correction uses ordinary RAM when safe and automatically switches oversized edits to slower disk-backed processing. An **Always use slow low-memory correction** option is available for low-RAM computers, with undo retained in both modes.
 

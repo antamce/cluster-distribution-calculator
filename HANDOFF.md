@@ -386,14 +386,31 @@ laptop. Treat these as historical guidance, not guaranteed performance.
 
 - Review queue fills as detection pairs complete. Review can run concurrently with
   later detection.
-- Actions: add, exclude, exclude as filopodium, split, merge, expand, trim, accept,
+- Actions: add, projection-only dendrite-to-spine and spine-to-dendrite mask
+  transfers, exclude, exclude as filopodium, split, merge, expand, trim, accept,
   and flag as needing attention.
 - Hint colors are add green, exclude red, trim magenta, expand blue, split yellow,
   filopodium purple, merge `#ED6291`, accept cyan, and needs-attention orange.
 - Hints can be drawn on Z slices or XY maximum projections. Projection hints search
   touched labels through Z or infer a plane from strongest nearby processed signal.
-- Each hint-assisted added object is independent. Boundaries are derived from the
-  local preprocessed dendrite-channel signal, not the drawn rectangle/stroke shape.
+- Added-object boundaries come from the local preprocessed dendrite-channel signal.
+  Touching new regions become one object; a region touching exactly one existing
+  same-category object joins it, while contact with multiple existing IDs is
+  skipped. Pre-existing objects are never implicitly merged with each other.
+- The projection-only transfer brush must touch exactly one spine and literally
+  moves every covered dendrite voxel through all Z slices to that spine. It changes
+  neither background nor other masks and records/restores both label volumes in one
+  undo checkpoint.
+- The coral reverse-transfer brush must touch exactly one dendrite; zero or multiple
+  touched dendrites are rejected without a write. It transfers every covered spine
+  voxel from all covered spine IDs through all Z slices to the selected dendrite.
+  Partial source objects retain their IDs, fully consumed spines decrement the
+  count, and undo restores both masks and counts.
+- Add, expand, and intensity-aware trim capture a 0.25–10.0 sensitivity value per
+  applied action. Higher values grow Add/Expand and remove more weak Trim signal.
+  Other actions visibly disable this control. Brush diameter ranges from 1–1000 px.
+- The main review canvas has an optional stable high-contrast color per individual
+  dendrite/spine ID; clusters retain their category color.
 - Undo exists both for the current drawing and the last applied correction. Applied
   actions atomically checkpoint masks and object statuses.
 - Review can be completed without corrections. Any later correction returns it to
@@ -401,6 +418,8 @@ laptop. Treat these as historical guidance, not guaranteed performance.
 - Correction memory mode automatically moves oversized edits to disk-backed
   workspaces; a forced slow low-memory option is also saved per project. Undo is
   retained for low-memory exclude, filopodium, merge, split, trim, and expand.
+- One persistent Save-project button is outside the tab widget and remains
+  available at every workflow stage without applying pending controls.
 
 ### Stage 5 - association and measurements (approved)
 
