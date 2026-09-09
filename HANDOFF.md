@@ -58,6 +58,9 @@ the same publishing target.
 - The portable Conda/macOS update was published on 2026-09-08 as curated commit
   `27bd6f3`, based on public commit `5523392`. Its temporary checkout was verified
   clean at the remote commit and deleted.
+- The manual-correction update was published on 2026-09-09 as curated commit
+  `5ad52bc`, based on public commit `27bd6f3`. The public commit and its README
+  release note are in English; its temporary checkout was verified and deleted.
 - The public tree contains user-facing source, both environment files, Windows and
   macOS launcher files, launcher helpers, icons, package metadata, and README. It
   intentionally excludes `HANDOFF.md`, `tests/`, `PUBLIC_README.md`, development
@@ -82,7 +85,8 @@ Before any future public release:
 Do not rewrite the public repository's existing history unless the user explicitly
 requests it. The original alpha is `f3bf194`, beta 0.7.0 is `03a9108`, the initial
 beta 0.8.0 is `54b77fa`, the preprocessing/review workflow update is `5523392`,
-and the macOS/portable-launcher update is `27bd6f3`.
+the macOS/portable-launcher update is `27bd6f3`, and the manual-correction update
+is `5ad52bc`.
 
 ## Running, setup, and testing
 
@@ -594,23 +598,22 @@ For a material change:
   bar-chart alternative.
 - Statistics remain external to Synpo.
 
-## State after the 2026-09-08 public release
+## State after the 2026-09-09 public release
 
-- Development implementation: `8ba4ebc`; context-safe pre-release documentation:
-  `7373b8f`. Both are on development `origin/lsh`.
+- Development implementation: `a319f1a` on development `origin/lsh`.
 - Public repository: `antamce/cluster-distribution`, branch `main`, verified remote
-  commit `27bd6f3152191d49ad27299efdb8da8efff04d4e`.
+  commit `5ad52bcb8606afddcd12b670fecc31e3d5af35a2`.
 - The public commit contains 27 distributable files. It excludes tests,
   `HANDOFF.md`, `PUBLIC_README.md`, microscopy data, caches, and pytest-only
   dependencies/configuration. The public `README.md` came from `PUBLIC_README.md`
   and includes all correction-brush functions and colors.
-- Validation immediately before publication: `46 passed, 1 skipped`; offscreen
-  application construction, PowerShell launcher parsing, Bash launcher parsing,
-  macOS LF line endings, and executable mode `100755` passed. Prior Conda dry-runs
-  covered Catalina Intel, macOS 11 Apple Silicon, and macOS 12 Intel/Apple Silicon.
+- Validation immediately before publication: all 24 focused review/UI tests
+  passed, and the broader run passed 54 tests with 1 skipped after excluding one
+  pre-existing Windows/Matplotlib native crash in measurement PDF generation. The
+  curated public source passed byte-compilation.
 - Public push was verified with `git ls-remote`. The exact temporary checkout
   `C:\Users\user\Documents\code2\Synpo\.public-release-work` was confirmed clean at
-  `27bd6f3` and then deleted. The development worktree should be clean after this
+  `5ad52bc` and then deleted. The development worktree should be clean after this
   handoff record is committed.
 - Next expected activity is user testing, particularly on the Intel Catalina
   device. Do not describe macOS as field-validated until those results arrive.
