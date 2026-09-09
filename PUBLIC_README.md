@@ -180,6 +180,11 @@ Source TIFFs are never modified. The compressed project cache can be removed aft
 
 ## Beta-release notes
 
+- Manual correction now includes projection-only dendrite-to-spine and
+  spine-to-dendrite transfer brushes, automatic joining of newly added objects to
+  one touching object of the same category, adjustable resegmentation sensitivity,
+  distinct colors for individual dendrites and spines, brush diameters up to 1000
+  pixels, and a Save project button available throughout the workflow.
 - Windows and macOS launchers discover Conda installations and environments in nonstandard folders; successful choices are remembered per user.
 - The macOS launcher is Conda-backed rather than a signed/notarized `.app`. Catalina dependency resolution is verified, but Catalina and Apple Silicon field testing remain in progress.
 - Closely touching structures and unusual morphology may require review or correction.
