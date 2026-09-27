@@ -94,6 +94,7 @@ class ReviewTests(unittest.TestCase):
     def test_exclude_checkpoint_undo_and_reopen(self) -> None:
         with workspace_directory() as root:
             manifest, project_path = self.make_detected_project(root)
+            diagnostic_events: list[tuple[str, str, dict[str, object]]] = []
             initial = load_review_slice(manifest, 0, 3, "ChanB")
             self.assertFalse(initial.corrected)
             automatic_context = generate_context_volume(
@@ -143,7 +144,16 @@ class ReviewTests(unittest.TestCase):
                     brush_radius_pixels=1,
                     projection_hint=True,
                 ),
+                diagnostic=lambda event, scope, details: diagnostic_events.append(
+                    (event, scope, details)
+                ),
             )
+            diagnostic_names = {event for event, _scope, _details in diagnostic_events}
+            self.assertIn("editable_masks_initialization_finished", diagnostic_names)
+            self.assertIn("full_volume_object_bbox_search_finished", diagnostic_names)
+            self.assertIn("undo_checkpoint_write_finished", diagnostic_names)
+            self.assertIn("corrected_mask_write_finished", diagnostic_names)
+            self.assertIn("project_checkpoint_save_finished", diagnostic_names)
             corrected = load_review_slice(manifest, 0, 3, "ChanB")
             self.assertTrue(corrected.corrected)
             self.assertFalse(np.any(corrected.dendrites == object_id))
@@ -777,6 +787,97 @@ class ReviewTests(unittest.TestCase):
             )
             self.assertEqual(result.processing_mode, "low_memory")
             self.assertTrue(result.checkpoint_written)
+
+    def test_eraser_clears_both_mask_types_on_one_slice_and_undoes(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            detection = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )["specimens/0000"]
+            dendrites = np.asarray(detection["dendrite_labels"])
+            spines = np.asarray(detection["spine_labels"])
+            dendrites[3:5, 20:28, 20:28] = 1
+            spines[3:5, 20:28, 20:28] = 1
+            detection["dendrite_labels"][:] = dendrites
+            detection["spine_labels"][:] = spines
+
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="dendrite",
+                    operation="erase",
+                    z_index=3,
+                    points=((24, 24),),
+                    brush_radius_pixels=2,
+                ),
+            )
+            self.assertEqual(result.object_type, "all")
+            erased = load_review_slice(manifest, 0, 3, "ChanB")
+            self.assertEqual(int(erased.dendrites[24, 24]), 0)
+            self.assertEqual(int(erased.spines[24, 24]), 0)
+            untouched = load_review_slice(manifest, 0, 4, "ChanB")
+            self.assertGreater(int(untouched.dendrites[24, 24]), 0)
+            self.assertGreater(int(untouched.spines[24, 24]), 0)
+
+            undo_last_review_action(manifest, project_path, 0)
+            restored = load_review_slice(manifest, 0, 3, "ChanB")
+            self.assertGreater(int(restored.dendrites[24, 24]), 0)
+            self.assertGreater(int(restored.spines[24, 24]), 0)
+
+            apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="spine",
+                    operation="erase",
+                    z_index=3,
+                    points=((24, 24),),
+                    brush_radius_pixels=2,
+                    projection_hint=True,
+                ),
+            )
+            for z_index in (3, 4):
+                erased_column = load_review_slice(manifest, 0, z_index, "ChanB")
+                self.assertEqual(int(erased_column.dendrites[24, 24]), 0)
+                self.assertEqual(int(erased_column.spines[24, 24]), 0)
+
+    def test_split_with_three_fragments_still_creates_exactly_two_ids(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_detected_project(root)
+            detection = zarr.open_group(
+                str(detection_cache_path(manifest)), mode="a"
+            )["specimens/0000"]
+            custom = np.zeros(detection["spine_labels"].shape, dtype=np.uint32)
+            custom[3:5, 31:34, 10:29] = 1
+            custom[3:5, 31:34, 35:51] = 1
+            custom[3:5, 10:29, 31:34] = 1
+            custom[3:5, 28:36, 28:37] = 1
+            detection["spine_labels"][:] = custom
+            summary = dict(detection.attrs["summary"])
+            summary["spine_count"] = 1
+            detection.attrs["summary"] = summary
+
+            result = apply_review_action(
+                manifest,
+                project_path,
+                0,
+                ReviewAction(
+                    object_type="spine",
+                    operation="split",
+                    z_index=3,
+                    points=((31, 32),),
+                    brush_radius_pixels=4,
+                ),
+            )
+            self.assertEqual(len(result.new_ids), 2)
+            labels = zarr.open_group(str(review_cache_path(manifest)), mode="r")[
+                "specimens/0000/spine_labels"
+            ]
+            present = set(int(value) for value in np.unique(np.asarray(labels)) if value)
+            self.assertEqual(present, set(result.new_ids))
 
 
 if __name__ == "__main__":

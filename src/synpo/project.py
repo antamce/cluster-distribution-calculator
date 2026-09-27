@@ -24,7 +24,8 @@ def default_preprocessing_manifest() -> dict[str, object]:
         "threshold_sensitivity": 1.0,
     }
     return {
-        "algorithm_version": 1,
+        "algorithm_version": 2,
+        "parameter_model": "per_specimen_v1",
         "settings_by_channel": {
             "ChanA": dict(settings),
             "ChanB": dict(settings),
@@ -32,6 +33,7 @@ def default_preprocessing_manifest() -> dict[str, object]:
         "representative_specimens": [],
         "special_specimens": [],
         "settings_by_specimen": {},
+        "parameters_set_by_specimen": {},
     }
 
 
@@ -39,6 +41,7 @@ def default_detection_manifest() -> dict[str, object]:
     return {
         "algorithm_version": 2,
         "memory_mode": "automatic",
+        "settings_by_specimen": {},
         "settings": {
             "dendrite_sensitivity": 1.25,
             "cluster_sensitivity": 0.65,
@@ -64,13 +67,14 @@ def default_review_manifest() -> dict[str, object]:
 
 def default_measurements_manifest() -> dict[str, object]:
     return {
-        "algorithm_version": 2,
+        "algorithm_version": 3,
         "settings": {
             "minimum_cluster_spine_overlap_percent": 80.0,
             "cluster_end_method": "adaptive",
             "fixed_end_slices": 3,
             "adaptive_area_factor": 1.8,
             "minimum_retained_slices": 2,
+            "maximum_centerline_gap_um": 1.0,
         },
     }
 
@@ -87,17 +91,29 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     preprocessing = manifest.setdefault(
         "preprocessing", default_preprocessing_manifest()
     )
+    legacy_preprocessing = preprocessing.get("parameter_model") != "per_specimen_v1"
     preprocessing.setdefault("representative_specimens", [])
     preprocessing.setdefault("special_specimens", [])
     preprocessing.setdefault("settings_by_specimen", {})
+    preprocessing.setdefault("parameters_set_by_specimen", {})
     manifest.setdefault("detection", default_detection_manifest())
     manifest["detection"].setdefault("memory_mode", "automatic")
+    manifest["detection"].setdefault("settings_by_specimen", {})
     review_settings = manifest.setdefault("review_settings", default_review_manifest())
     review_settings["algorithm_version"] = 2
     review_settings.setdefault("memory_mode", "automatic")
     review_settings.setdefault("correction_sensitivity", 1.0)
     review_settings.setdefault("add_z_radius_slices", 6)
-    manifest.setdefault("measurements", default_measurements_manifest())
+    existing_measurements = manifest.get("measurements")
+    previous_measurement_algorithm = (
+        int(existing_measurements.get("algorithm_version", 0))
+        if isinstance(existing_measurements, dict)
+        else 0
+    )
+    measurements = manifest.setdefault("measurements", default_measurements_manifest())
+    measurements["algorithm_version"] = 3
+    measurements.setdefault("settings", {})
+    measurements["settings"].setdefault("maximum_centerline_gap_um", 1.0)
     import_settings = manifest.setdefault(
         "import_settings",
         {
@@ -117,7 +133,14 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     cache.setdefault("format", "zarr-v2-blosc-zstd")
     cache.setdefault("path", None)
     cache.setdefault("deletion_eligible", False)
-    for specimen in manifest.get("specimens", []):
+    legacy_special = {
+        int(value) for value in preprocessing.get("special_specimens", [])
+    }
+    legacy_saved = preprocessing.get("settings_by_specimen", {})
+    legacy_defaults = preprocessing.get(
+        "settings_by_channel", default_preprocessing_manifest()["settings_by_channel"]
+    )
+    for specimen_index, specimen in enumerate(manifest.get("specimens", [])):
         for channel_data in specimen.get("channels", {}).values():
             channel_data.setdefault(
                 "source_path",
@@ -162,6 +185,17 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
         else:
             measurement_checkpoint.setdefault("state", "not_started")
             measurement_checkpoint.setdefault("updated_at", None)
+        if (
+            previous_measurement_algorithm < 3
+            and checkpoints["measurements"].get("state") == "complete"
+        ):
+            checkpoints["measurements"].update(
+                {
+                    "state": "not_started",
+                    "updated_at": None,
+                    "reason": "Centerline component handling was updated; recalculate measurements.",
+                }
+            )
         review = specimen.setdefault(
             "review", {"state": "needs_attention", "comment": "", "history": []}
         )
@@ -178,6 +212,26 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
         )
         distribution_review.setdefault("spines", {})
         distribution_review.setdefault("updated_at", None)
+        analysis = specimen.setdefault(
+            "analysis", {"excluded": False, "exclusion_reason": "", "rois_xy": []}
+        )
+        analysis.setdefault("excluded", False)
+        analysis.setdefault("exclusion_reason", "")
+        analysis.setdefault("rois_xy", [])
+        if legacy_preprocessing:
+            specimen_settings = legacy_saved.setdefault(str(specimen_index), {})
+            for channel in ("ChanA", "ChanB"):
+                if not (specimen_index in legacy_special and channel in specimen_settings):
+                    specimen_settings[channel] = dict(legacy_defaults[channel])
+            completed_channels = checkpoints["preprocessing"].get("channels", {})
+            if checkpoints["preprocessing"].get("state") == "complete":
+                preprocessing["parameters_set_by_specimen"][str(specimen_index)] = [
+                    channel
+                    for channel in ("ChanA", "ChanB")
+                    if channel in completed_channels
+                ] or ["ChanA", "ChanB"]
+    preprocessing["parameter_model"] = "per_specimen_v1"
+    preprocessing["algorithm_version"] = 2
     return manifest
 
 
@@ -315,6 +369,7 @@ def verify_project_sources(
     *,
     source_directory: str | Path | None = None,
     full_checksums: bool = True,
+    allow_renamed: bool = False,
     progress: ProgressCallback | None = None,
 ) -> list[dict[str, str]]:
     directory = (
@@ -329,6 +384,12 @@ def verify_project_sources(
 
     results: list[dict[str, str]] = []
     total = len(expected)
+    renamed_candidates_by_size: dict[int, list[Path]] = {}
+    fingerprint_cache: dict[Path, object] = {}
+    if directory is not None and directory.is_dir() and allow_renamed:
+        for path in sorted(directory.rglob("*"), key=lambda value: str(value).casefold()):
+            if path.is_file() and path.suffix.casefold() in {".tif", ".tiff"}:
+                renamed_candidates_by_size.setdefault(path.stat().st_size, []).append(path)
     for index, (channel, channel_data) in enumerate(expected, start=1):
         filename = str(channel_data["filename"])
         if directory is None:
@@ -347,6 +408,13 @@ def verify_project_sources(
         status, detail = "missing", "File not found"
         matched_path: Path | None = None
         saved = channel_data["fingerprint"]
+        exact_candidates = list(candidates)
+        if allow_renamed and saved.get("sha256"):
+            for candidate in renamed_candidates_by_size.get(
+                int(saved["size_bytes"]), []
+            ):
+                if candidate not in candidates:
+                    candidates.append(candidate)
         for path in candidates:
             stat = path.stat()
             if stat.st_size != int(saved["size_bytes"]):
@@ -356,7 +424,10 @@ def verify_project_sources(
                 status, detail = "ok", "File size matches; checksum not recalculated"
                 matched_path = path
                 break
-            current = fingerprint_file(path, include_checksum=True)
+            current = fingerprint_cache.get(path)
+            if current is None:
+                current = fingerprint_file(path, include_checksum=True)
+                fingerprint_cache[path] = current
             saved_hash = saved.get("sha256")
             if not saved_hash:
                 status, detail = "unverified", "Project has no saved checksum"
@@ -367,6 +438,24 @@ def verify_project_sources(
                 matched_path = path
                 break
             status, detail = "modified", "SHA-256 checksum differs"
+        duplicate_matches = 0
+        if matched_path is not None and allow_renamed and saved.get("sha256"):
+            matching_paths: list[Path] = []
+            for candidate in candidates:
+                if candidate.stat().st_size != int(saved["size_bytes"]):
+                    continue
+                fingerprint = fingerprint_cache.get(candidate)
+                if fingerprint is None:
+                    fingerprint = fingerprint_file(candidate, include_checksum=True)
+                    fingerprint_cache[candidate] = fingerprint
+                if fingerprint.sha256 == saved["sha256"]:
+                    matching_paths.append(candidate)
+            duplicate_matches = max(0, len(matching_paths) - 1)
+            if duplicate_matches:
+                detail = (
+                    f"Checksum matches; {duplicate_matches + 1} identical copies found, "
+                    f"using {matched_path}"
+                )
         results.append(
             {
                 "filename": filename,
@@ -374,6 +463,14 @@ def verify_project_sources(
                 "status": status,
                 "detail": detail,
                 "path": str(matched_path or (candidates[0] if candidates else "")),
+                "matched_by": (
+                    "filename"
+                    if matched_path is not None and matched_path in exact_candidates
+                    else "size_and_sha256"
+                    if matched_path is not None
+                    else "none"
+                ),
+                "duplicate_matches": duplicate_matches,
             }
         )
         if progress:
@@ -392,6 +489,7 @@ def relink_project_sources(
         manifest,
         source_directory=directory,
         full_checksums=True,
+        allow_renamed=True,
         progress=progress,
     )
     if all(item["status"] == "ok" for item in results):

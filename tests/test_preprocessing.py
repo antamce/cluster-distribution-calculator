@@ -105,6 +105,30 @@ class PreprocessingTests(unittest.TestCase):
             self.assertEqual(dataset.dtype, np.dtype("uint16"))
             self.assertEqual(int(dataset[2, 0, 0]), 0)
 
+    def test_cache_is_zero_outside_multiple_rois(self) -> None:
+        with workspace_directory() as root:
+            source = root / "stack.tif"
+            self.make_stack(source)
+            cache = root / "cache.zarr"
+            process_stack_to_cache(
+                source,
+                cache,
+                "specimens/0000/ChanA/data",
+                PreprocessingSettings(gaussian_sigma_xy_um=0.0),
+                xy_um_per_pixel=0.05,
+                z_step_um=0.5,
+                source_sha256="roi-example",
+                rois_xy=[(12, 9, 25, 23), (30, 25, 35, 31)],
+            )
+            dataset = zarr.open_group(str(cache), mode="r")[
+                "specimens/0000/ChanA/data"
+            ]
+            self.assertEqual(int(dataset[2, 0, 0]), 0)
+            self.assertGreater(int(dataset[2, 16, 19]), 0)
+            self.assertEqual(
+                dataset.attrs["rois_xy"], [[12, 9, 25, 23], [30, 25, 35, 31]]
+            )
+
     def test_project_batch_writes_pair_checkpoint(self) -> None:
         with workspace_directory() as root:
             source = root / "source"

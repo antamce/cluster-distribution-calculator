@@ -18,6 +18,7 @@ from synpo.detection import (
     InsufficientDetectionDiskSpace,
     detect_project,
     detection_cache_path,
+    effective_detection_settings,
     load_detection_slice,
 )
 from synpo.importer import scan_batch
@@ -37,6 +38,19 @@ def workspace_directory():
 
 
 class DetectionTests(unittest.TestCase):
+    def test_specimen_detection_override_does_not_replace_batch_defaults(self) -> None:
+        manifest = {
+            "detection": {
+                "settings": DetectionSettings().to_dict(),
+                "settings_by_specimen": {
+                    "1": DetectionSettings(dendrite_sensitivity=2.5).to_dict()
+                },
+            }
+        }
+
+        self.assertEqual(effective_detection_settings(manifest, 0).dendrite_sensitivity, 1.25)
+        self.assertEqual(effective_detection_settings(manifest, 1).dendrite_sensitivity, 2.5)
+
     def make_pair(self, source: Path, specimen: str = "specimen") -> None:
         shape = (8, 64, 80)
         dendrites = np.full(shape, 100, dtype=np.uint16)

@@ -22,10 +22,11 @@ from .models import ProgressCallback
 from .preprocessing import ProcessingCancelled, project_cache_path
 from .project import channel_source_path, save_project
 from .review import review_cache_path
+from .regions import normalize_rectangles, roi_id_for_mask
 
 
 ClusterEndMethod = Literal["untrimmed", "fixed", "adaptive"]
-ALGORITHM_VERSION = 2
+ALGORITHM_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class MeasurementSettings:
     fixed_end_slices: int = 3
     adaptive_area_factor: float = 1.8
     minimum_retained_slices: int = 2
+    maximum_centerline_gap_um: float = 1.0
 
     def validate(self) -> None:
         if not 0 <= self.minimum_cluster_spine_overlap_percent <= 100:
@@ -47,6 +49,8 @@ class MeasurementSettings:
             raise ValueError("Adaptive area factor must be between 1 and 10.")
         if not 1 <= self.minimum_retained_slices <= 20:
             raise ValueError("At least one cluster slice must be retained.")
+        if not 0.0 <= self.maximum_centerline_gap_um <= 10.0:
+            raise ValueError("Maximum centerline gap must be between 0 and 10 µm.")
 
     def to_dict(self) -> dict[str, object]:
         self.validate()
@@ -62,6 +66,7 @@ class MeasurementSettings:
             fixed_end_slices=int(value.get("fixed_end_slices", 3)),
             adaptive_area_factor=float(value.get("adaptive_area_factor", 1.8)),
             minimum_retained_slices=int(value.get("minimum_retained_slices", 2)),
+            maximum_centerline_gap_um=float(value.get("maximum_centerline_gap_um", 1.0)),
         )
         settings.validate()
         return settings
@@ -100,6 +105,7 @@ class DistributionPreview:
     axis_points_local_zyx: tuple[tuple[int, int, int], ...]
     base_point_local_zyx: tuple[int, int, int] | None
     endpoint_local_zyx: tuple[int, int, int] | None
+    bridge_points_local_zyx: tuple[tuple[int, int, int], ...]
     crop_origin_yx: tuple[int, int]
     spine_z_range: tuple[int, int]
     row: dict[str, object]
@@ -158,6 +164,27 @@ def _mask_sources(
                 )
                 return review, detection, True, f"{signature}:review:{edit_count}"
     return detection, detection, False, f"{signature}:automatic"
+
+
+def _distribution_guidance(
+    manifest: dict[str, object],
+    specimen_index: int,
+    y_slice: slice,
+    x_slice: slice,
+) -> np.ndarray | None:
+    dendrite_channel = next(
+        channel
+        for channel, role in manifest["channel_roles"].items()
+        if role == "dendrite_spines"
+    )
+    try:
+        key = manifest["specimens"][specimen_index]["checkpoints"]["preprocessing"][
+            "channels"
+        ][dendrite_channel]["dataset_key"]
+        root = zarr.open_group(str(project_cache_path(manifest)), mode="r")
+        return np.asarray(root[key][:, y_slice, x_slice], dtype=np.float32)
+    except (KeyError, OSError, ValueError):
+        return None
 
 
 def measurement_signature(
@@ -394,12 +421,15 @@ def _refresh_result_summaries(result: dict[str, object]) -> None:
         if bool(row.get("spine_valid", True))
         and bool(row.get("distribution_included", False))
     ]
+    total_dendrite_length = sum(float(row.get("length_um") or 0.0) for row in dendrite_rows)
     specimen.update(
         {
             "spine_count": len(valid_spines),
             "included_cluster_count": len(valid_clusters),
-            "average_spine_density_per_um": _mean(
-                [float(row["spine_density_per_um"]) for row in dendrite_rows if row.get("spine_density_per_um") is not None]
+            "average_spine_density_per_um": (
+                len(valid_spines) / total_dendrite_length
+                if total_dendrite_length
+                else None
             ),
             "average_spine_volume_um3": _mean([float(row["volume_um3"]) for row in valid_spines]),
             "spines_with_clusters_percent": (
@@ -424,6 +454,46 @@ def _refresh_result_summaries(result: dict[str, object]) -> None:
             "distribution_included_spine_count": len(included_distribution),
         }
     )
+    for roi in result.get("roi_rows", []):
+        roi_id = int(roi["roi_id"])
+        roi_dendrites = [row for row in dendrite_rows if int(row.get("roi_id", 0)) == roi_id]
+        roi_spines = [row for row in valid_spines if int(row.get("roi_id", 0)) == roi_id]
+        roi_clusters = [row for row in valid_clusters if int(row.get("roi_id", 0)) == roi_id]
+        roi_distributions = [
+            row
+            for row in distribution_rows
+            if int(row.get("roi_id", 0)) == roi_id
+            and bool(row.get("spine_valid", True))
+            and bool(row.get("distribution_included", False))
+        ]
+        roi_length = sum(float(row.get("length_um") or 0.0) for row in roi_dendrites)
+        roi.update(
+            {
+                "dendrite_count": len(roi_dendrites),
+                "dendrite_length_um": roi_length,
+                "spine_count": len(roi_spines),
+                "included_cluster_count": len(roi_clusters),
+                "spine_density_per_um": len(roi_spines) / roi_length if roi_length else None,
+                "average_spine_volume_um3": _mean(
+                    [float(row["volume_um3"]) for row in roi_spines]
+                ),
+                "spines_with_clusters_percent": (
+                    100.0 * sum(bool(row["has_protein_cluster"]) for row in roi_spines) / len(roi_spines)
+                    if roi_spines else None
+                ),
+                "average_cluster_to_spine_volume_ratio": _mean(
+                    [
+                        float(row["cluster_to_spine_volume_ratio"])
+                        for row in roi_spines
+                        if row.get("cluster_to_spine_volume_ratio") is not None
+                    ]
+                ),
+                "average_cluster_volume_um3": _mean(
+                    [float(row["volume_inside_spine_um3"]) for row in roi_clusters]
+                ),
+                "average_protein_distribution": _profile(roi_distributions),
+            }
+        )
 
 
 def set_distribution_review(
@@ -623,6 +693,14 @@ def _recalculate_distribution_spine(
         sampling_zyx_um=(z_step, xy_size, xy_size),
         global_offset_zyx=(0, y_slice.start, x_slice.start),
         endpoint_hint_zyx=hint if hint_valid else None,
+        guidance_image=_distribution_guidance(
+            manifest, specimen_index, y_slice, x_slice
+        ),
+        maximum_gap_um=float(
+            manifest["measurements"]["settings"].get(
+                "maximum_centerline_gap_um", 1.0
+            )
+        ),
     )
     recalculated = distribution_row(
         calculated,
@@ -634,6 +712,7 @@ def _recalculate_distribution_spine(
     )
     recalculated.update(
         {
+            "roi_id": row.get("roi_id", 0),
             "distribution_reviewed": bool(
                 decision.get(
                     "distribution_reviewed",
@@ -655,6 +734,8 @@ def _recalculate_distribution_spine(
             "axis_points_zyx": [list(point) for point in calculated.axis_points_zyx],
             "base_point_zyx": list(calculated.base_point_zyx) if calculated.base_point_zyx else None,
             "endpoint_zyx": list(calculated.endpoint_zyx) if calculated.endpoint_zyx else None,
+            "bridge_points_zyx": [list(point) for point in calculated.bridge_points_zyx],
+            "bridge_length_um": calculated.bridge_length_um,
         }
     )
     for spine_row in result.get("spine_rows", []):
@@ -967,6 +1048,14 @@ def load_distribution_preview(
         sampling_zyx_um=(z_step, xy_size, xy_size),
         global_offset_zyx=(0, y_slice.start, x_slice.start),
         endpoint_hint_zyx=endpoint_hint,
+        guidance_image=_distribution_guidance(
+            manifest, specimen_index, y_slice, x_slice
+        ),
+        maximum_gap_um=float(
+            manifest["measurements"]["settings"].get(
+                "maximum_centerline_gap_um", 1.0
+            )
+        ),
     )
     if calculated.voxel_bins is None:
         spine_bins = np.zeros(spine.shape[1:], dtype=np.uint8)
@@ -1024,6 +1113,14 @@ def load_distribution_preview(
         if calculated.endpoint_zyx
         else None
     )
+    bridge_local = tuple(
+        (
+            int(point[0]),
+            int(point[1]) - y_slice.start,
+            int(point[2]) - x_slice.start,
+        )
+        for point in calculated.bridge_points_zyx
+    )
     occupied_z = np.flatnonzero(np.any(spine, axis=(1, 2)))
     z_range = (
         (int(occupied_z[0]), int(occupied_z[-1]))
@@ -1041,6 +1138,7 @@ def load_distribution_preview(
         axis_points_local_zyx=axis_local,
         base_point_local_zyx=base_local,
         endpoint_local_zyx=endpoint_local,
+        bridge_points_local_zyx=bridge_local,
         crop_origin_yx=(y_slice.start, x_slice.start),
         spine_z_range=z_range,
         row=dict(row),
@@ -1234,6 +1332,19 @@ def measure_specimen(
     voxel_volume = xy_size * xy_size * z_step
     spine_parent = _assign_spines_to_dendrites(spine_projection, dendrite_projection)
     dendrite_lengths = _dendrite_lengths(dendrite_projection, xy_size)
+    rectangles = normalize_rectangles(
+        specimen.get("analysis", {}).get("rois_xy", []), (y_count, x_count)
+    ) or [(0, 0, x_count, y_count)]
+    spine_roi = {
+        spine_id: roi_id_for_mask(spine_projection == spine_id, rectangles)
+        for spine_id in range(1, maximum_spine + 1)
+        if np.any(spine_projection == spine_id)
+    }
+    dendrite_roi = {
+        dendrite_id: roi_id_for_mask(dendrite_projection == dendrite_id, rectangles)
+        for dendrite_id in range(1, maximum_dendrite + 1)
+        if np.any(dendrite_projection == dendrite_id)
+    }
 
     cluster_rows: list[dict[str, object]] = []
     included_by_spine: dict[int, list[dict[str, object]]] = {}
@@ -1260,6 +1371,7 @@ def measure_specimen(
             "row_type": "individual_cluster",
             "experimental_group": specimen["experimental_group"],
             "specimen_id": specimen["specimen_id"],
+            "roi_id": spine_roi.get(spine_id, 0),
             "dendrite_id": spine_parent.get(spine_id, 0),
             "spine_id": spine_id,
             "cluster_id": cluster_id,
@@ -1353,6 +1465,10 @@ def measure_specimen(
             sampling_zyx_um=(z_step, xy_size, xy_size),
             global_offset_zyx=(0, y_slice.start, x_slice.start),
             endpoint_hint_zyx=hint if hint_valid else None,
+            guidance_image=_distribution_guidance(
+                manifest, specimen_index, y_slice, x_slice
+            ),
+            maximum_gap_um=settings.maximum_centerline_gap_um,
         )
         row = distribution_row(
             calculated,
@@ -1368,6 +1484,7 @@ def measure_specimen(
         }
         row.update(
             {
+                "roi_id": spine_roi.get(spine_id, 0),
                 "distribution_reviewed": bool(
                     decision.get("distribution_reviewed", decision.get("reviewed", False))
                 ),
@@ -1393,6 +1510,8 @@ def measure_specimen(
             "axis_points_zyx": [list(point) for point in calculated.axis_points_zyx],
             "base_point_zyx": list(calculated.base_point_zyx) if calculated.base_point_zyx else None,
             "endpoint_zyx": list(calculated.endpoint_zyx) if calculated.endpoint_zyx else None,
+            "bridge_points_zyx": [list(point) for point in calculated.bridge_points_zyx],
+            "bridge_length_um": calculated.bridge_length_um,
         }
 
     spine_rows: list[dict[str, object]] = []
@@ -1407,6 +1526,7 @@ def measure_specimen(
             {
                 "experimental_group": specimen["experimental_group"],
                 "specimen_id": specimen["specimen_id"],
+                "roi_id": spine_roi.get(spine_id, 0),
                 "dendrite_id": spine_parent.get(spine_id, 0),
                 "spine_id": spine_id,
                 "voxel_count": voxel_count,
@@ -1446,6 +1566,7 @@ def measure_specimen(
                     "row_type": "spine_cluster_sum",
                     "experimental_group": specimen["experimental_group"],
                     "specimen_id": specimen["specimen_id"],
+                    "roi_id": spine_roi.get(spine_id, 0),
                     "dendrite_id": spine_parent.get(spine_id, 0),
                     "spine_id": spine_id,
                     "cluster_id": None,
@@ -1484,6 +1605,7 @@ def measure_specimen(
             {
                 "experimental_group": specimen["experimental_group"],
                 "specimen_id": specimen["specimen_id"],
+                "roi_id": dendrite_roi.get(dendrite_id, 0),
                 "dendrite_id": dendrite_id,
                 "length_um": length_um,
                 "spine_count": len(dendrite_spines),
@@ -1515,14 +1637,28 @@ def measure_specimen(
     individual_clusters = [
         row for row in cluster_rows if row["row_type"] == "individual_cluster"
     ]
+    total_dendrite_length = sum(float(row.get("length_um") or 0.0) for row in dendrite_rows)
+    roi_rows = [
+        {
+            "experimental_group": specimen["experimental_group"],
+            "specimen_id": specimen["specimen_id"],
+            "roi_id": roi_id,
+            "x0": rectangle[0],
+            "y0": rectangle[1],
+            "x1": rectangle[2],
+            "y1": rectangle[3],
+        }
+        for roi_id, rectangle in enumerate(rectangles, start=1)
+    ]
     specimen_row = {
         "experimental_group": specimen["experimental_group"],
         "specimen_id": specimen["specimen_id"],
         "dendrite_count": len(dendrite_rows),
         "spine_count": len(spine_rows),
         "included_cluster_count": len(individual_clusters),
-        "average_spine_density_per_um": _mean(
-            [float(row["spine_density_per_um"]) for row in dendrite_rows if row["spine_density_per_um"] is not None]
+        "roi_count": len(rectangles),
+        "average_spine_density_per_um": (
+            len(spine_rows) / total_dendrite_length if total_dendrite_length else None
         ),
         "average_spine_volume_um3": _mean(
             [float(row["volume_um3"]) for row in spine_rows]
@@ -1552,6 +1688,7 @@ def measure_specimen(
         "corrected_masks": corrected,
         "voxel_volume_um3": voxel_volume,
         "specimen_rows": [specimen_row],
+        "roi_rows": roi_rows,
         "dendrite_rows": dendrite_rows,
         "spine_rows": spine_rows,
         "cluster_rows": cluster_rows,

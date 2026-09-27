@@ -18,6 +18,7 @@ from scipy import ndimage
 
 from .models import ProgressCallback
 from .project import channel_source_path, save_project
+from .regions import Rectangle, normalize_rectangles, roi_mask, roi_signature, specimen_rectangles
 
 
 ALGORITHM_VERSION = 1
@@ -97,16 +98,26 @@ def effective_preprocessing_settings(
 ) -> PreprocessingSettings:
     """Return the active channel settings, including a specimen-pair override."""
     preprocessing = manifest["preprocessing"]
-    active = {
-        int(value) for value in preprocessing.get("special_specimens", [])
-    }
     saved = preprocessing.get("settings_by_specimen", {})
     specimen_settings = saved.get(str(specimen_index), {})
-    if specimen_index in active and channel in specimen_settings:
+    if preprocessing.get("parameter_model") == "per_specimen_v1" and channel in specimen_settings:
+        value = specimen_settings[channel]
+    elif specimen_index in {
+        int(value) for value in preprocessing.get("special_specimens", [])
+    } and channel in specimen_settings:
         value = specimen_settings[channel]
     else:
         value = preprocessing["settings_by_channel"][channel]
     return PreprocessingSettings.from_dict(value)
+
+
+def preprocessing_parameters_set(
+    manifest: dict[str, object], specimen_index: int, channel: str
+) -> bool:
+    values = manifest["preprocessing"].get("parameters_set_by_specimen", {}).get(
+        str(specimen_index), []
+    )
+    return channel in values
 
 
 def _cancel_if_requested(cancel_event: Event | None) -> None:
@@ -222,6 +233,7 @@ def estimate_stack_statistics(
     xy_um_per_pixel: float,
     z_step_um: float,
     cancel_event: Event | None = None,
+    rois_xy: list[Rectangle] | None = None,
 ) -> StackStatistics:
     settings.validate()
     sigma_z, sigma_xy = _physical_sigmas(settings, xy_um_per_pixel, z_step_um)
@@ -230,7 +242,11 @@ def estimate_stack_statistics(
         series = tiff.series[0]
         shape = tuple(int(value) for value in series.shape)
         z_count, y, x = (1, *shape) if len(shape) == 2 else shape
-        stride = _sample_stride(y, x)
+        rectangles = normalize_rectangles(rois_xy or [(0, 0, x, y)], (y, x))
+        if not rectangles:
+            raise ValueError("At least one non-empty analysis ROI is required.")
+        selected_pixels = sum((x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in rectangles)
+        stride = _sample_stride(1, selected_pixels)
         for z_index in _sample_indices(z_count):
             _cancel_if_requested(cancel_event)
             raw = (
@@ -238,7 +254,10 @@ def estimate_stack_statistics(
                 if z_count == 1
                 else _read_series_slice(series, int(z_index))
             )
-            raw_samples.append(np.asarray(raw[::stride, ::stride]))
+            raw_samples.extend(
+                np.asarray(raw[y0:y1:stride, x0:x1:stride])
+                for x0, y0, x1, y1 in rectangles
+            )
     sampled_raw = np.concatenate([sample.reshape(-1) for sample in raw_samples])
     background = float(np.percentile(sampled_raw, settings.background_percentile))
     raw_low, raw_high = (
@@ -275,6 +294,7 @@ def make_preview(
     z_step_um: float,
     statistics: StackStatistics | None = None,
     cancel_event: Event | None = None,
+    rois_xy: list[Rectangle] | None = None,
 ) -> PreviewResult:
     stats = statistics or estimate_stack_statistics(
         path,
@@ -282,6 +302,7 @@ def make_preview(
         xy_um_per_pixel=xy_um_per_pixel,
         z_step_um=z_step_um,
         cancel_event=cancel_event,
+        rois_xy=rois_xy,
     )
     sigma_z, sigma_xy = _physical_sigmas(settings, xy_um_per_pixel, z_step_um)
     radius = int(math.ceil(3 * sigma_z)) if sigma_z > 0 else 0
@@ -314,6 +335,9 @@ def make_preview(
                 sigma_xy=sigma_xy,
                 center=0,
             )
+    if rois_xy is not None:
+        selected = roi_mask(processed.shape, normalize_rectangles(rois_xy, processed.shape))
+        processed = np.where(selected, processed, 0)
     return PreviewResult(
         z_index=z_index,
         z_count=z_count,
@@ -332,6 +356,7 @@ def settings_signature(
     source_sha256: str | None,
     xy_um_per_pixel: float,
     z_step_um: float,
+    rois_xy: list[Rectangle] | None = None,
 ) -> str:
     payload = {
         "algorithm_version": ALGORITHM_VERSION,
@@ -339,6 +364,7 @@ def settings_signature(
         "source_sha256": source_sha256,
         "xy_um_per_pixel": xy_um_per_pixel,
         "z_step_um": z_step_um,
+        "roi_signature": roi_signature(rois_xy or []),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -370,6 +396,7 @@ def process_stack_to_cache(
     maximum_ram_fraction: float = 0.8,
     progress: ProgressCallback | None = None,
     cancel_event: Event | None = None,
+    rois_xy: list[Rectangle] | None = None,
 ) -> CachedStackResult:
     started = time.monotonic()
     settings.validate()
@@ -380,6 +407,7 @@ def process_stack_to_cache(
         source_sha256=source_sha256,
         xy_um_per_pixel=xy_um_per_pixel,
         z_step_um=z_step_um,
+        rois_xy=rois_xy,
     )
     statistics = estimate_stack_statistics(
         path,
@@ -387,6 +415,7 @@ def process_stack_to_cache(
         xy_um_per_pixel=xy_um_per_pixel,
         z_step_um=z_step_um,
         cancel_event=cancel_event,
+        rois_xy=rois_xy,
     )
 
     cache_path = Path(cache_path)
@@ -396,7 +425,12 @@ def process_stack_to_cache(
         series = tiff.series[0]
         shape = tuple(int(value) for value in series.shape)
         z_count, y, x = (1, *shape) if len(shape) == 2 else shape
-        _enforce_ram_policy((y, x), radius, maximum_ram_fraction)
+        rectangles = normalize_rectangles(rois_xy or [(0, 0, x, y)], (y, x))
+        if not rectangles:
+            raise ValueError("At least one non-empty analysis ROI is required.")
+        widest = max(x1 - x0 for x0, _y0, x1, _y1 in rectangles)
+        tallest = max(y1 - y0 for _x0, y0, _x1, y1 in rectangles)
+        _enforce_ram_policy((tallest, widest), radius, maximum_ram_fraction)
 
         if dataset_key in root:
             existing = root[dataset_key]
@@ -423,6 +457,7 @@ def process_stack_to_cache(
                     "settings": settings.to_dict(),
                     "statistics": statistics.to_dict(),
                     "source_sha256": source_sha256 or "",
+                    "rois_xy": [list(value) for value in rectangles],
                     "slices_completed": 0,
                     "complete": False,
                 }
@@ -451,24 +486,32 @@ def process_stack_to_cache(
             if radius:
                 indices = range(z_index - radius, z_index + radius + 1)
                 slab = np.stack([read(index) for index in indices])
-                processed = _process_plane_or_slab(
-                    slab,
-                    background=statistics.background,
-                    sigma_z=sigma_z,
-                    sigma_xy=sigma_xy,
-                    center=radius,
-                )
+                source_data = slab
                 keep = {min(max(index, 0), z_count - 1) for index in range(z_index - radius + 1, z_index + radius + 2)}
                 slice_cache = {key: value for key, value in slice_cache.items() if key in keep}
             else:
-                processed = _process_plane_or_slab(
-                    read(z_index),
-                    background=statistics.background,
-                    sigma_z=0.0,
-                    sigma_xy=sigma_xy,
-                    center=0,
-                )
+                source_data = read(z_index)
                 slice_cache.clear()
+            processed = np.zeros((y, x), dtype=np.float32)
+            padding = int(math.ceil(3 * sigma_xy)) if sigma_xy > 0 else 0
+            for x0, y0, x1, y1 in rectangles:
+                ex0, ey0 = max(0, x0 - padding), max(0, y0 - padding)
+                ex1, ey1 = min(x, x1 + padding), min(y, y1 + padding)
+                local = (
+                    source_data[:, ey0:ey1, ex0:ex1]
+                    if np.asarray(source_data).ndim == 3
+                    else source_data[ey0:ey1, ex0:ex1]
+                )
+                local_processed = _process_plane_or_slab(
+                    local,
+                    background=statistics.background,
+                    sigma_z=sigma_z if np.asarray(local).ndim == 3 else 0.0,
+                    sigma_xy=sigma_xy,
+                    center=radius if np.asarray(local).ndim == 3 else 0,
+                )
+                processed[y0:y1, x0:x1] = local_processed[
+                    y0 - ey0 : y1 - ey0, x0 - ex0 : x1 - ex0
+                ]
             dataset[z_index, :, :] = np.clip(np.rint(processed), 0, 65535).astype(np.uint16)
             dataset.attrs["slices_completed"] = z_index + 1
             if progress:
@@ -508,6 +551,8 @@ def process_project_cache(
     *,
     progress: ProgressCallback | None = None,
     cancel_event: Event | None = None,
+    specimen_indices: list[int] | None = None,
+    channels: list[str] | None = None,
 ) -> dict[str, object]:
     cache_path = project_cache_path(manifest)
     manifest["cache"].update(
@@ -518,19 +563,36 @@ def process_project_cache(
     z_step = float(calibration["z_step_um"])
     ram_fraction = min(0.8, float(manifest["resource_policy"].get("maximum_ram_fraction", 0.8)))
     specimens = manifest["specimens"]
+    selected_indices = (
+        list(range(len(specimens))) if specimen_indices is None else sorted(set(specimen_indices))
+    )
+    selected_channels = tuple(channels or ("ChanA", "ChanB"))
+    included_indices = [
+        index
+        for index in selected_indices
+        if not bool(specimens[index].get("analysis", {}).get("excluded", False))
+    ]
     total_slices = sum(
         _z_count_and_shape(channel_data)[0]
-        for specimen in specimens
-        for channel_data in specimen["channels"].values()
+        for index, specimen in enumerate(specimens)
+        if index in included_indices
+        for channel, channel_data in specimen["channels"].items()
+        if channel in selected_channels
     )
     completed_before = 0
     started = time.monotonic()
     channel_results: list[dict[str, object]] = []
 
-    for specimen_index, specimen in enumerate(specimens):
+    for specimen_index in selected_indices:
+        specimen = specimens[specimen_index]
         checkpoint = specimen["checkpoints"]["preprocessing"]
+        if bool(specimen.get("analysis", {}).get("excluded", False)):
+            checkpoint.update({"state": "excluded", "updated_at": time.time()})
+            save_project(project_path, manifest)
+            continue
         checkpoint["state"] = "in_progress"
-        for channel in ("ChanA", "ChanB"):
+        rectangles = specimen_rectangles(manifest, specimen_index)
+        for channel in selected_channels:
             _cancel_if_requested(cancel_event)
             channel_data = specimen["channels"][channel]
             z_count, _, _ = _z_count_and_shape(channel_data)
@@ -562,6 +624,7 @@ def process_project_cache(
                 maximum_ram_fraction=ram_fraction,
                 progress=channel_progress,
                 cancel_event=cancel_event,
+                rois_xy=rectangles,
             )
             completed_before += z_count
             if progress:
@@ -579,13 +642,17 @@ def process_project_cache(
                     source_sha256=channel_data["fingerprint"].get("sha256"),
                     xy_um_per_pixel=xy,
                     z_step_um=z_step,
+                    rois_xy=rectangles,
                 ),
                 "statistics": result.statistics.to_dict(),
                 "elapsed_seconds": result.elapsed_seconds,
             }
             checkpoint["state"] = (
                 "complete"
-                if set(checkpoint["channels"]) == {"ChanA", "ChanB"}
+                if all(
+                    checkpoint["channels"].get(candidate, {}).get("state") == "complete"
+                    for candidate in ("ChanA", "ChanB")
+                )
                 else "in_progress"
             )
             checkpoint["updated_at"] = time.time()

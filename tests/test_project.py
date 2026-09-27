@@ -120,6 +120,39 @@ class ProjectTests(unittest.TestCase):
                 loaded["specimens"][0]["checkpoints"]["preprocessing"], dict
             )
 
+    def test_old_centerline_results_are_marked_for_recalculation(self) -> None:
+        with workspace_directory() as root:
+            source = root / "source"
+            source.mkdir()
+            self.make_pair(source)
+            manifest = create_project_manifest(
+                scan_batch(source),
+                output_directory=root / "output",
+                channel_roles={"ChanA": "protein_clusters", "ChanB": "dendrite_spines"},
+                calibration=Calibration("example", 0.05, 0.5),
+            )
+            manifest["measurements"]["algorithm_version"] = 2
+            manifest["specimens"][0]["checkpoints"]["measurements"] = {
+                "state": "complete",
+                "settings_signature": "old-centerline-result",
+            }
+            manifest["specimens"][0]["distribution_review"] = {
+                "spines": {"7": {"distribution_included": False}},
+                "updated_at": 123.0,
+            }
+
+            loaded = load_project(save_project(root / "old-centerline.synpo.json", manifest))
+
+            checkpoint = loaded["specimens"][0]["checkpoints"]["measurements"]
+            self.assertEqual(checkpoint["state"], "not_started")
+            self.assertIn("recalculate", checkpoint["reason"].lower())
+            self.assertEqual(
+                loaded["specimens"][0]["distribution_review"]["spines"]["7"][
+                    "distribution_included"
+                ],
+                False,
+            )
+
     def test_manual_sources_keep_individual_paths_and_relink_recursively(self) -> None:
         with workspace_directory() as root:
             source_a = root / "original" / "protein"
@@ -172,6 +205,27 @@ class ProjectTests(unittest.TestCase):
             self.assertEqual(
                 channel_source_path(manifest, manifest["specimens"][0]["channels"]["ChanA"]),
                 moved_a.resolve(),
+            )
+
+    def test_relink_recovers_renamed_tiffs_by_size_and_checksum(self) -> None:
+        with workspace_directory() as root:
+            source = root / "source"
+            source.mkdir()
+            self.make_pair(source)
+            manifest = create_project_manifest(
+                scan_batch(source),
+                output_directory=root / "output",
+                channel_roles={"ChanA": "protein_clusters", "ChanB": "dendrite_spines"},
+                calibration=Calibration("example", 0.05, 0.5),
+            )
+            relocated = root / "relocated"
+            relocated.mkdir()
+            for index, path in enumerate(sorted(source.glob("*.tif")), start=1):
+                shutil.copy2(path, relocated / f"renamed-{index}.tiff")
+            results = relink_project_sources(manifest, relocated)
+            self.assertTrue(all(item["status"] == "ok" for item in results))
+            self.assertTrue(
+                all(item["matched_by"] == "size_and_sha256" for item in results)
             )
 
 

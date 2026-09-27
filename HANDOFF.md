@@ -3,7 +3,7 @@
 This document is the context-free continuation record for Synpo. Read it before
 changing code, publishing a release, or proposing the next stage. It describes the
 current approved behavior, scientific invariants, architecture, repository state,
-validation procedure, and remaining work as of 2026-09-08.
+validation procedure, and remaining work as of 2026-09-27.
 
 ## One-minute orientation
 
@@ -16,25 +16,33 @@ validation procedure, and remaining work as of 2026-09-08.
 - Dedicated Conda environment: `synpo-microscopy`. Never modify the user's separate
   environment named `synpo`.
 - Current development branch: `lsh`.
-- Current development macOS feature commit: `8ba4ebc` (`Add macOS launch and
-  portable Conda discovery`); context-safe release documentation is `7373b8f`.
+- Current development release: `lsh` HEAD, titled `Add tested project transfer and
+  review workflow updates`.
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
-- Current public beta commit: `27bd6f3` (`Add macOS launch and portable Conda
-  discovery`).
-- Current full Windows result: 46 passed and 1 platform-specific test skipped.
+- Current public beta commit: `a7991f5a263ecac126263ad890b4cc86040b1a7a`
+  (`Add project transfer and tested workflow improvements`).
+- Current full Windows result: 79 passed and 1 platform-specific test skipped.
   PowerShell and Bash syntax checks, Windows runtime resolution, Python 3.10 syntax
   parsing, and the offscreen application construction smoke test also passed.
   Conda dry-run resolution passed for Catalina `osx-64`, macOS 11 `osx-arm64`,
   and macOS 12 on both `osx-64` and `osx-arm64`.
-- Current user status: the 0.8.0 beta now includes pair-specific preprocessing
-  overrides, action-colored correction brushes, non-modal context-generation
-  progress, high-visibility spine-map outlines, low-memory corrections, and
-  reviewed-pair measurement gating with partial export. Development commit
-  `8ba4ebc` adds robust Conda discovery on Windows and macOS, a Finder launcher,
-  and a separately pinned Catalina/macOS 11 environment. This was published as
-  curated public commit `27bd6f3` on 2026-09-08 so the user can test it. An actual
-  approximately `80 x 2048 x 2048` stack on a 4 GB device and a Catalina launch
-  remain preferred field tests.
+- Current user status: the complete approved post-testing update was published to
+  public `main` as `a7991f5` on 2026-09-27. An actual approximately
+  `80 x 2048 x 2048` stack on a 4 GB device and a Catalina launch remain preferred
+  field tests.
+- This release adds an Advanced-menu diagnostic mode for an
+  intermittent work-PC correction slowdown. Full-session capture is the default
+  level, diagnostics remain opt-in per launch, and a standalone bundled PDF gives
+  the controlled cross-machine protocol.
+- It also contains the user's post-testing
+  workflow changes: per-specimen preprocessing/detection reruns, marked/reviewed
+  preprocessing state, specimen exclusion and multi-ROI analysis, a literal
+  eraser, exactly-two-way splitting, fixed review hotkeys and disjoint palettes,
+  and review-required virtual bridging for two-part spines. It also adds validated
+  full-state/settings-only transfer ZIPs, optional embedded raw TIFFs, transactional
+  import, and checksum recovery for renamed external TIFFs. The user explicitly
+  requested publication of this complete scope to the curated public repository,
+  and the verified publication is complete.
 - Development method: build in stages and do not move to a new stage until the user
   explicitly approves the previous one. All behavior through the current beta is
   approved.
@@ -61,6 +69,10 @@ the same publishing target.
 - The manual-correction update was published on 2026-09-09 as curated commit
   `5ad52bc`, based on public commit `27bd6f3`. The public commit and its README
   release note are in English; its temporary checkout was verified and deleted.
+- The full post-testing workflow and transfer update was published on 2026-09-27
+  as curated commit `a7991f5`, based on `5ad52bc`. Its exact 31-file public tree
+  passed the complete 80-test suite (79 passed, 1 platform skip) and an offscreen
+  application-construction smoke test before publication.
 - The public tree contains user-facing source, both environment files, Windows and
   macOS launcher files, launcher helpers, icons, package metadata, and README. It
   intentionally excludes `HANDOFF.md`, `tests/`, `PUBLIC_README.md`, development
@@ -258,7 +270,11 @@ and optional registered flag follow them.
 - `src/synpo/importer.py`: configurable filename parsing, automatic/manual pairing,
   TIFF inspection, checksums, validation, and source metadata.
 - `src/synpo/project.py`: schema-1 manifest creation/migration, atomic serialization,
-  source verification, relinking, and checkpoint state.
+  source verification, and recursive filename/checksum relinking (including renamed
+  TIFF recovery by size plus SHA-256).
+- `src/synpo/transfer.py`: versioned `.synpo-transfer.zip` creation, inventory and
+  checksum validation, full-state/settings-only reset policy, transactional import,
+  embedded-raw mapping, cache-path rewriting, and cache-damage recovery.
 - `src/synpo/preprocessing.py`: per-stack adaptive background/threshold estimation,
   physical-unit Gaussian filtering, slice-wise execution, RAM guards, Zarr cache,
   signatures, and resume.
@@ -268,6 +284,9 @@ and optional registered flag follow them.
   and checkpoints.
 - `src/synpo/review.py`: editable mask initialization, signal-guided hint handling,
   local 3D resegmentation, object statuses, undo patches, and checkpoints.
+- `src/synpo/diagnostics.py`: thread-safe append-only diagnostic sessions, sanitized
+  environment/process inventory, two-second system sampling, JSON summaries, and
+  ZIP packaging. Logging failures must never interrupt scientific work.
 - `src/synpo/visualization.py`: slice-streamed XY/XZ/YZ projections, label overlays,
   physical aspect handling, cropped marching-cubes meshes, RAM/face limits, and the
   native Qt 3D renderer.
@@ -279,8 +298,9 @@ and optional registered flag follow them.
 - `src/synpo/exporting.py`: verified Excel/CSV exports and optional validation/audit
   PDF generation.
 - `src/synpo/cli.py`: non-GUI scan/inspection command.
-- `tests/`: 47-test release suite, including importer, project, preprocessing,
-  detection, review, measurement, 3D rendering, and beta UI regression coverage.
+- `tests/`: 80-test release suite, including importer, project, preprocessing,
+  detection, diagnostics, review, measurement, 3D rendering, and beta UI regression
+  coverage.
 
 Keep project manifests at schema version 1 unless a real schema break is needed.
 Extend old manifests through `migrate_manifest`; do not silently make existing
@@ -324,12 +344,20 @@ Runtime data live below the chosen output directory:
 
 ### Stage 2 - preprocessing (approved)
 
-- Scrollable Z viewer, zoom, contrast adjustment and representative-specimen tuning.
+- Scrollable Z viewer, zoom, contrast adjustment and direct clicked-slice mapping.
 - Independent channel settings: adaptive background percentile, physical XY/Z
   Gaussian smoothing and sensitivity/threshold controls with expanded beta ranges.
-- Pair-level special-setting checkmarks activate separate ChanA/ChanB overrides;
-  clearing a checkmark leaves its saved values dormant. Effective setting changes
-  invalidate only affected preprocessing and downstream checkpoints.
+- Every specimen has independent ChanA/ChanB parameters by default. Channels are
+  marked individually and the specimen is green/reviewed only when both are set.
+  A fill-unset checkbox copies the current-channel values only to unmarked images.
+- Included images with unset parameters block batch preprocessing. Up/Down moves
+  between specimens from the combo or canvas.
+- Whole specimen pairs may be reversibly excluded with a reason. Multiple XY
+  rectangular ROIs apply across both channels/all Z; they clip at the boundary and
+  touching/overlapping fields merge. Original coordinates/raw pixels are retained.
+- Parameter or ROI changes invalidate affected downstream checkpoints. Explicit
+  selected-specimen preprocessing continues into forced detection and permanently
+  discards that specimen's corrections/history after confirmation.
 - Background and threshold are estimated per stack.
 - Compressed, slice-wise, RAM-guarded batch processing with resume and progress/ETA.
 - Preprocessed data are used for detection/boundary guidance only.
@@ -345,6 +373,8 @@ laptop. Treat these as historical guidance, not guaranteed performance.
   dendrites, cyan spines and magenta clusters.
 - Detection settings expose expanded sensitivity ranges and candidate size/length
   controls.
+- Settings may be saved per specimen. Selected-specimen detection reruns only that
+  pair and permanently discards its prior review cache/history after confirmation.
 - Each completed pair is checkpointed and available to review while the worker
   continues later pairs. Progress and ETA are visible.
 - Automatic mode keeps the fast in-memory path when its conservative estimate fits
@@ -391,8 +421,8 @@ laptop. Treat these as historical guidance, not guaranteed performance.
 - Review queue fills as detection pairs complete. Review can run concurrently with
   later detection.
 - Actions: add, projection-only dendrite-to-spine and spine-to-dendrite mask
-  transfers, exclude, exclude as filopodium, split, merge, expand, trim, accept,
-  and flag as needing attention.
+  transfers, exclude, exclude as filopodium, split, merge, expand, trim, literal
+  eraser, accept, and flag as needing attention.
 - Hint colors are add green, exclude red, trim magenta, expand blue, split yellow,
   filopodium purple, merge `#ED6291`, accept cyan, and needs-attention orange.
 - Hints can be drawn on Z slices or XY maximum projections. Projection hints search
@@ -414,7 +444,16 @@ laptop. Treat these as historical guidance, not guaranteed performance.
   applied action. Higher values grow Add/Expand and remove more weak Trim signal.
   Other actions visibly disable this control. Brush diameter ranges from 1–1000 px.
 - The main review canvas has an optional stable high-contrast color per individual
-  dendrite/spine ID; clusters retain their category color.
+  dendrite/spine ID; its type palettes are disjoint so the exact same color can
+  never represent both types. Clusters retain their category color.
+- Split always returns exactly two IDs: the two largest post-stroke components seed
+  the result and all smaller pieces join the physically nearest seed. It rejects a
+  stroke without a meaningful second component.
+- Eraser clears painted dendrite and spine voxels without relabeling survivors:
+  current Z only in slice mode, or painted XY columns across Z in projection mode.
+- Hotkeys are Ctrl+1 Add, Ctrl+2 Exclude, Ctrl+3 Split, Ctrl+4 Merge, Ctrl+5
+  spine-to-dendrite, Ctrl+6 dendrite-to-spine, Ctrl+7 Trim, Ctrl+8 Expand, Ctrl+9
+  Eraser, Ctrl+0 Filopodium, and Enter Apply.
 - Undo exists both for the current drawing and the last applied correction. Applied
   actions atomically checkpoint masks and object statuses.
 - Review can be completed without corrections. Any later correction returns it to
@@ -422,6 +461,12 @@ laptop. Treat these as historical guidance, not guaranteed performance.
 - Correction memory mode automatically moves oversized edits to disk-backed
   workspaces; a forced slow low-memory option is also saved per project. Undo is
   retained for low-memory exclude, filopodium, merge, split, trim, and expand.
+- **Advanced → Diagnostic mode** records correction/cache/projection phase timings
+  and, at the default full-session level, other worker activity. Sessions live at
+  `<output>/Synpo diagnostics/<timestamp>/`; they exclude image pixels, comments,
+  command lines, and window titles, sanitize the user-profile prefix, and can be
+  finalized as a ZIP. The single protocol PDF remains an application asset and is
+  not copied into every session folder.
 - One persistent Save-project button is outside the tab widget and remains
   available at every workflow stage without applying pending controls.
 
@@ -468,6 +513,15 @@ laptop. Treat these as historical guidance, not guaranteed performance.
   rows.
 - Empty spine-volume bins remain blank and are flagged as insufficient axis
   resolution; ambiguous/unusable axes are explicit, never silently fabricated.
+- Exactly two meaningful disconnected spine components may be connected by a
+  signal-guided virtual centerline bridge up to a configurable 1.0 um default.
+  The bridge does not alter masks or volumes, is previewed/exported, and defaults
+  to excluded until reviewed. Tiny satellites are ignored for topology but remain
+  in volume/bin assignment. A failed bridge or more than two substantial pieces
+  retains the base-component path with a review-required status; a manual endpoint
+  selects the distal component before bridging. Measurement algorithm version 3
+  marks older completed measurement checkpoints for recalculation on project load
+  without deleting saved distribution-review decisions.
 - Distribution review automatically begins with the first pending spine and advances
   after decisions. Excluding a distribution affects only profile aggregation.
 - **Invalid spine** excludes that spine from every downstream count/metric but
@@ -481,6 +535,9 @@ laptop. Treat these as historical guidance, not guaranteed performance.
 - Excel export contains all raw specimen/dendrite/spine/cluster measurements,
   individual distributions, specimen/group distributions, exclusion/invalid audits,
   compact group counts/means/variability/inclusion percentages, and settings.
+- ROI IDs are attached to object rows. `ROI_Master` includes original rectangle
+  coordinates and per-ROI summaries; specimen rows pool across ROIs, and
+  `Excluded_Specimens` preserves exclusion reasons.
 - CSV versions of every sheet are written and verified.
 - Partial export is permitted and includes only completed measurement checkpoints;
   the measurement panel reports omitted unfinished pairs.
@@ -598,22 +655,23 @@ For a material change:
   bar-chart alternative.
 - Statistics remain external to Synpo.
 
-## State after the 2026-09-09 public release
+## State after the 2026-09-27 public release
 
-- Development implementation: `a319f1a` on development `origin/lsh`.
+- Development implementation: the current release commit on development branch
+  `lsh`; push it only to development `origin/lsh`.
 - Public repository: `antamce/cluster-distribution`, branch `main`, verified remote
-  commit `5ad52bcb8606afddcd12b670fecc31e3d5af35a2`.
-- The public commit contains 27 distributable files. It excludes tests,
+  commit `a7991f5a263ecac126263ad890b4cc86040b1a7a`.
+- The public commit contains 31 distributable files. It excludes tests,
   `HANDOFF.md`, `PUBLIC_README.md`, microscopy data, caches, and pytest-only
   dependencies/configuration. The public `README.md` came from `PUBLIC_README.md`
-  and includes all correction-brush functions and colors.
-- Validation immediately before publication: all 24 focused review/UI tests
-  passed, and the broader run passed 54 tests with 1 skipped after excluding one
-  pre-existing Windows/Matplotlib native crash in measurement PDF generation. The
-  curated public source passed byte-compilation.
+  and documents diagnostics, per-specimen reruns, exclusions/ROIs, correction
+  tools, centerline bridging, and project transfers.
+- Validation immediately before publication: the development tree and exact
+  curated public source both passed all 80 tests (79 passed, 1 platform-specific
+  launcher skip). The curated public application also passed offscreen construction.
 - Public push was verified with `git ls-remote`. The exact temporary checkout
   `C:\Users\user\Documents\code2\Synpo\.public-release-work` was confirmed clean at
-  `5ad52bc` and then deleted. The development worktree should be clean after this
+  `a7991f5` and then deleted. The development worktree should be clean after this
   handoff record is committed.
 - Next expected activity is user testing, particularly on the Intel Catalina
   device. Do not describe macOS as field-validated until those results arrive.

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 import unittest
+import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -11,10 +14,20 @@ import numpy as np
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import QApplication
 
-from synpo.app import MainWindow, REVIEW_BRUSH_COLORS, ReviewCanvas, SliceView, SpineMapView
+from synpo.app import (
+    BatchPreprocessWorker,
+    MainWindow,
+    PreviewWorker,
+    REVIEW_BRUSH_COLORS,
+    ReviewCanvas,
+    ReviewWorker,
+    SliceView,
+    SpineMapView,
+)
 from synpo.detection import ALWAYS_LOW_MEMORY_MODE, DetectionSettings
 from synpo.preprocessing import PreprocessingSettings
 from synpo.project import default_preprocessing_manifest, migrate_manifest
+from synpo.review import ReviewAction, ReviewResult
 
 
 class Stage7AUiTests(unittest.TestCase):
@@ -85,6 +98,12 @@ class Stage7AUiTests(unittest.TestCase):
 
     def test_stage7c_review_controls_and_numbered_map_render(self) -> None:
         window = MainWindow()
+        menu_titles = [action.text().replace("&", "") for action in window.menuBar().actions()]
+        self.assertIn("Advanced", menu_titles)
+        self.assertFalse(window.diagnostic_mode_action.isChecked())
+        self.assertTrue(window.diagnostic_full_action.isChecked())
+        self.assertFalse(window.finish_diagnostic_action.isEnabled())
+        self.assertTrue(window.open_diagnostic_protocol_action.isEnabled())
         self.assertEqual(window.distribution_review_mode.count(), 2)
         self.assertEqual(
             window.distribution_review_mode.itemData(1), "cluster_less"
@@ -108,6 +127,86 @@ class Stage7AUiTests(unittest.TestCase):
         view.close()
         window.deleteLater()
         self.app.processEvents()
+
+    def test_diagnostic_menu_starts_and_finalizes_full_session(self) -> None:
+        root = Path.cwd() / ".test-work" / uuid.uuid4().hex
+        root.mkdir(parents=True)
+        try:
+            window = MainWindow()
+            window.output_edit.setText(str(root))
+            window.diagnostic_mode_action.setChecked(True)
+            self.assertIsNotNone(window._diagnostics)
+            self.assertEqual(window._diagnostics.level, "full")
+            directory = window._diagnostics.directory
+            self.assertTrue(window.finish_diagnostic_action.isEnabled())
+            self.assertFalse(window.diagnostic_level_menu.isEnabled())
+
+            window.diagnostic_mode_action.setChecked(False)
+            self.assertIsNone(window._diagnostics)
+            self.assertTrue((directory / "session-summary.json").is_file())
+            self.assertTrue(window.diagnostic_level_menu.isEnabled())
+            window.deleteLater()
+            self.app.processEvents()
+        finally:
+            shutil.rmtree(root)
+
+    def test_worker_diagnostics_are_attached_only_to_review_worker(self) -> None:
+        preview_results: list[object] = []
+        preview = PreviewWorker(
+            Path("unused.tif"),
+            0,
+            PreprocessingSettings(),
+            0.1,
+            0.5,
+            None,
+            ("preview",),
+        )
+        preview.completed.connect(preview_results.append)
+        with patch("synpo.app.make_preview", return_value="preview-result"):
+            preview.run()
+        self.assertEqual(preview_results, [(('preview',), "preview-result")])
+
+        batch_results: list[object] = []
+        batch = BatchPreprocessWorker({}, Path("unused.synpo.json"))
+        batch.completed.connect(batch_results.append)
+        with patch("synpo.app.process_project_cache", return_value="batch-result"):
+            batch.run()
+        self.assertEqual(batch_results, ["batch-result"])
+
+        diagnostic_events: list[tuple[str, str, dict[str, object]]] = []
+        action = ReviewAction(
+            object_type="spine",
+            operation="accept",
+            z_index=0,
+            points=((1, 1),),
+        )
+        review_result = ReviewResult(
+            specimen_index=0,
+            action_id="test",
+            operation="accept",
+            object_type="spine",
+            affected_ids=(1,),
+            new_ids=(),
+            edit_count=1,
+            dendrite_count=1,
+            spine_count=1,
+        )
+        worker = ReviewWorker(
+            {},
+            Path("unused.synpo.json"),
+            0,
+            action,
+            diagnostic=lambda event, scope, details: diagnostic_events.append(
+                (event, scope, details)
+            ),
+        )
+        with patch("synpo.app.apply_review_action", return_value=review_result):
+            worker.run()
+        self.assertEqual(
+            [event for event, _scope, _details in diagnostic_events],
+            ["correction_started", "correction_finished"],
+        )
+        self.assertEqual(diagnostic_events[-1][2]["status"], "completed")
 
     def test_review_brush_palette_changes_with_action(self) -> None:
         window = MainWindow()
@@ -191,11 +290,17 @@ class Stage7AUiTests(unittest.TestCase):
         self.assertNotEqual(
             view._image.pixelColor(1, 3), view._image.pixelColor(2, 3)
         )
+        for dendrite_x in (1, 2):
+            for spine_x in (1, 2):
+                self.assertNotEqual(
+                    view._image.pixelColor(dendrite_x, 1),
+                    view._image.pixelColor(spine_x, 3),
+                )
         self.assertEqual(
             view._image.pixelColor(1, 5), view._image.pixelColor(2, 5)
         )
 
-    def test_special_preprocessing_invalidates_only_effectively_changed_pairs(self) -> None:
+    def test_independent_preprocessing_invalidates_only_changed_specimen(self) -> None:
         window = MainWindow()
         manifest = {
             "application": {},
@@ -224,12 +329,9 @@ class Stage7AUiTests(unittest.TestCase):
         window.preprocess_specimen.addItem("second", 1)
         window.preprocess_specimen.setCurrentIndex(0)
         window.preprocess_specimen.blockSignals(False)
-        window.special_preprocessing_check.blockSignals(True)
-        window.special_preprocessing_check.setChecked(True)
-        window.special_preprocessing_check.blockSignals(False)
         window.sensitivity_spin.setValue(2.0)
         window._store_preprocessing_selection()
-        self.assertEqual(manifest["preprocessing"]["special_specimens"], [0])
+        self.assertEqual(manifest["preprocessing"]["special_specimens"], [])
         self.assertEqual(
             manifest["specimens"][0]["checkpoints"]["preprocessing"]["state"],
             "not_started",
@@ -244,6 +346,34 @@ class Stage7AUiTests(unittest.TestCase):
             ],
             2.0,
         )
+        self.assertIn(
+            "ChanA",
+            manifest["preprocessing"]["parameters_set_by_specimen"]["0"],
+        )
+        window.deleteLater()
+        self.app.processEvents()
+
+    def test_review_shortcuts_match_the_approved_tool_order(self) -> None:
+        window = MainWindow()
+        shortcuts = {
+            action.shortcut().toString(): action.text()
+            for action in window.review_shortcut_actions
+        }
+        expected = {
+            "Ctrl+1": "add",
+            "Ctrl+2": "exclude",
+            "Ctrl+3": "split",
+            "Ctrl+4": "merge",
+            "Ctrl+5": "spine_to_dendrite",
+            "Ctrl+6": "dendrite_to_spine",
+            "Ctrl+7": "trim",
+            "Ctrl+8": "expand",
+            "Ctrl+9": "erase",
+            "Ctrl+0": "filopodium",
+        }
+        for shortcut, operation in expected.items():
+            self.assertEqual(shortcuts[shortcut], f"Select {operation}")
+        self.assertEqual(shortcuts["Return"], "Apply correction")
         window.deleteLater()
         self.app.processEvents()
 

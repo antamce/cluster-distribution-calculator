@@ -135,6 +135,11 @@ class MeasurementTests(unittest.TestCase):
             result = load_measurement_result(manifest, 0)
             self.assertEqual(len(result["spine_rows"]), 1)
             self.assertEqual(len(result["distribution_rows"]), 1)
+            self.assertEqual(
+                {key: result["roi_rows"][0][key] for key in ("x0", "y0", "x1", "y1")},
+                {"x0": 0, "y0": 0, "x1": 24, "y1": 24},
+            )
+            self.assertEqual(result["roi_rows"][0]["spine_count"], 1)
 
             self.assertEqual(result["distribution_rows"][0]["spine_id"], 1)
             self.assertEqual(result["spine_rows"][0]["included_cluster_count"], 1)
@@ -225,6 +230,13 @@ class MeasurementTests(unittest.TestCase):
             self.assertTrue(Path(str(export["workbook"])).is_file())
             self.assertTrue((root / "measurements_csv" / "Distribution_Individual.csv").is_file())
             self.assertEqual(len(export["pdfs"]), 1)
+            self.assertEqual(len(collect_export_tables(manifest)["ROI_Master"]), 1)
+            manifest["specimens"][0]["analysis"].update(
+                {"excluded": True, "exclusion_reason": "out of focus"}
+            )
+            excluded = collect_export_tables(manifest)["Excluded_Specimens"]
+            self.assertEqual(excluded[0]["reason"], "out of focus")
+            manifest["specimens"][0]["analysis"]["excluded"] = False
 
             clear_centerline_endpoint_hint(manifest, project_path, 0, 1)
             cleared = load_measurement_result(manifest, 0)["distribution_rows"][0]

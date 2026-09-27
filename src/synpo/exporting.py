@@ -76,6 +76,7 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
         if specimen["checkpoints"].get("measurements", {}).get("state") == "complete"
     ]
     specimen = [row for result in results for row in result.get("specimen_rows", [])]
+    roi = [row for result in results for row in result.get("roi_rows", [])]
     dendrite = [row for result in results for row in result.get("dendrite_rows", [])]
     spine = [row for result in results for row in result.get("spine_rows", [])]
     clusters = [
@@ -125,8 +126,18 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
             "ratio_units": "fraction 0-1",
         },
     ]
+    excluded_specimens = [
+        {
+            "experimental_group": specimen.get("experimental_group", ""),
+            "specimen_id": specimen.get("specimen_id", ""),
+            "reason": specimen.get("analysis", {}).get("exclusion_reason", ""),
+        }
+        for specimen in manifest["specimens"]
+        if bool(specimen.get("analysis", {}).get("excluded", False))
+    ]
     return {
         "Specimen_Master": sorted(specimen, key=lambda row: (str(row.get("experimental_group")), str(row.get("specimen_id")))),
+        "ROI_Master": sorted(roi, key=lambda row: (str(row.get("experimental_group")), str(row.get("specimen_id")), int(row.get("roi_id", 0)))),
         "Dendrite_Master": sorted(dendrite, key=lambda row: (str(row.get("experimental_group")), str(row.get("specimen_id")), int(row.get("dendrite_id", 0)))),
         "Spine_Master": sorted(spine, key=lambda row: (str(row.get("experimental_group")), str(row.get("specimen_id")), int(row.get("spine_id", 0)))),
         "Cluster_Individual": clusters,
@@ -137,6 +148,7 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
         "Distribution_Excluded": excluded,
         "Invalid_Spines": invalid,
         "Spine_Review_Audit": reviewed_spines,
+        "Excluded_Specimens": excluded_specimens,
         "Group_Summary": _group_summary(specimen),
         "Settings": settings,
     }
@@ -175,7 +187,7 @@ def _write_csvs(directory: Path, tables: dict[str, list[dict[str, object]]]) -> 
     return written
 
 
-def _pdf_pages(
+def _pdf_pages_matplotlib_legacy(
     manifest: dict[str, object],
     path: Path,
     selected: list[tuple[int, dict[str, object]]],
@@ -211,7 +223,14 @@ def _pdf_pages(
                     dtype=np.float64,
                 )
                 figure, axis = plt.subplots(figsize=(9, 6))
-                axis.errorbar(range(1, 11), means, yerr=sem, marker="o", capsize=3)
+                x_values = np.arange(1, 11, dtype=np.float64)
+                axis.plot(x_values, means, marker="o")
+                for x_value, mean, error in zip(x_values, means, sem):
+                    if not np.isfinite(mean) or not np.isfinite(error):
+                        continue
+                    axis.plot([x_value, x_value], [mean - error, mean + error], color="C0")
+                    axis.plot([x_value - 0.08, x_value + 0.08], [mean - error, mean - error], color="C0")
+                    axis.plot([x_value - 0.08, x_value + 0.08], [mean + error, mean + error], color="C0")
                 axis.set(xlabel="Spine part (shaft → tip)", ylabel="Cluster volume / spine-part volume", title=f"{group['experimental_group']} — specimen-weighted mean ± SEM")
                 axis.set_xlim(0.5, 10.5)
                 axis.set_ylim(bottom=0)
@@ -301,6 +320,146 @@ def _pdf_pages(
             )
             pdf.savefig(figure, bbox_inches="tight")
             plt.close(figure)
+
+
+def _pdf_pages(
+    manifest: dict[str, object],
+    path: Path,
+    selected: list[tuple[int, dict[str, object]]],
+    group_rows: list[dict[str, object]],
+    margin_um: float,
+    *,
+    include_group_summary: bool,
+    progress: Progress | None,
+) -> None:
+    """Render validation pages without depending on matplotlib native DLLs."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    page_size = (1400, 1000)
+    font = ImageFont.load_default()
+
+    def page_and_draw():  # type: ignore[no-untyped-def]
+        page = Image.new("RGB", page_size, "white")
+        return page, ImageDraw.Draw(page)
+
+    def safe_text(value: object) -> str:
+        return str(value).encode("ascii", "replace").decode("ascii")
+
+    def draw_chart(draw, values: np.ndarray, errors: np.ndarray | None, box):  # type: ignore[no-untyped-def]
+        left, top, right, bottom = box
+        finite = values[np.isfinite(values)]
+        maximum = float(np.max(finite)) if finite.size else 1.0
+        if errors is not None:
+            upper = values + np.nan_to_num(errors, nan=0.0)
+            upper = upper[np.isfinite(upper)]
+            maximum = max(maximum, float(np.max(upper)) if upper.size else 1.0)
+        maximum = max(maximum, 1e-12)
+        draw.rectangle(box, outline=(80, 80, 80), width=2)
+        points: list[tuple[int, int]] = []
+        for index, value in enumerate(values):
+            if not np.isfinite(value):
+                continue
+            x = int(left + (index + 0.5) * (right - left) / len(values))
+            y = int(bottom - float(value) / maximum * (bottom - top))
+            points.append((x, y))
+            if errors is not None and np.isfinite(errors[index]):
+                delta = int(float(errors[index]) / maximum * (bottom - top))
+                draw.line((x, y - delta, x, y + delta), fill=(35, 100, 175), width=2)
+                draw.line((x - 5, y - delta, x + 5, y - delta), fill=(35, 100, 175), width=2)
+                draw.line((x - 5, y + delta, x + 5, y + delta), fill=(35, 100, 175), width=2)
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(35, 100, 175))
+            draw.text((x - 3, bottom + 8), str(index + 1), fill="black", font=font)
+        if len(points) > 1:
+            draw.line(points, fill=(35, 100, 175), width=3)
+
+    def projection(raw: np.ndarray, bins: np.ndarray, alpha: float):  # type: ignore[no-untyped-def]
+        array = np.asarray(raw, dtype=np.float64)
+        low, high = np.percentile(array, (0.5, 99.8))
+        gray = np.clip((array - low) / max(float(high - low), 1e-12) * 255.0, 0, 255)
+        rgb = np.repeat(gray[..., None], 3, axis=2)
+        for bin_index, color in enumerate(BIN_COLORS, start=1):
+            mask = np.asarray(bins) == bin_index
+            rgb[mask] = (1.0 - alpha) * rgb[mask] + alpha * np.asarray(color)
+        return Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8), mode="RGB")
+
+    def paste_projection(page, source, box):  # type: ignore[no-untyped-def]
+        left, top, right, bottom = box
+        available = (right - left, bottom - top)
+        resized = source.copy()
+        resized.thumbnail(available, Image.Resampling.NEAREST)
+        x = left + (available[0] - resized.width) // 2
+        y = top + (available[1] - resized.height) // 2
+        page.paste(resized, (x, y))
+        return x, y, resized.width / source.width, resized.height / source.height
+
+    pages = []
+    if include_group_summary:
+        for group in group_rows:
+            means = np.asarray([
+                np.nan if group.get(f"bin_{index:02d}_mean") is None else float(group[f"bin_{index:02d}_mean"])
+                for index in range(1, 11)
+            ])
+            sem = np.asarray([
+                np.nan if group.get(f"bin_{index:02d}_sem") is None else float(group[f"bin_{index:02d}_sem"])
+                for index in range(1, 11)
+            ])
+            page, draw = page_and_draw()
+            title = f"{group['experimental_group']} - specimen-weighted mean +/- SEM"
+            draw.text((70, 45), safe_text(title), fill="black", font=font)
+            draw_chart(draw, means, sem, (100, 130, 1320, 850))
+            draw.text((520, 900), "Spine part (shaft -> tip)", fill="black", font=font)
+            pages.append(page)
+
+    for position, (specimen_index, row) in enumerate(selected):
+        preview = load_distribution_preview(
+            manifest, specimen_index, int(row["spine_id"]), margin_um=margin_um
+        )
+        page, draw = page_and_draw()
+        title = (
+            f"{row['experimental_group']} | {row['specimen_id']} | spine {row['spine_id']} | "
+            f"axis: {row['distribution_axis_status']} | included: {row.get('distribution_included')} | "
+            f"valid: {row.get('spine_valid')} | endpoint: {row.get('centerline_endpoint_source', 'automatic')}"
+        )
+        draw.text((45, 30), safe_text(title), fill="black", font=font)
+        draw.text((45, 55), safe_text(row.get("review_note", "")), fill="black", font=font)
+        left_box = (40, 105, 680, 570)
+        right_box = (720, 105, 1360, 570)
+        left_image = projection(preview.dendrite_projection, preview.spine_bins_projection, 0.55)
+        right_image = projection(preview.protein_projection, preview.cluster_bins_projection, 0.85)
+        left_x, left_y, scale_x, scale_y = paste_projection(page, left_image, left_box)
+        paste_projection(page, right_image, right_box)
+        draw.text((40, 85), "Dendrite/spine channel", fill="black", font=font)
+        draw.text((720, 85), "Protein channel", fill="black", font=font)
+        if preview.axis_xy:
+            axis_points = [
+                (left_x + int(point[0] * scale_x), left_y + int(point[1] * scale_y))
+                for point in preview.axis_xy
+            ]
+            if len(axis_points) > 1:
+                draw.line(axis_points, fill="white", width=3)
+        for point, color in (
+            (preview.base_point_local_zyx, (32, 208, 96)),
+            (preview.endpoint_local_zyx, (237, 50, 200)),
+        ):
+            if point is not None:
+                x = left_x + int(point[2] * scale_x)
+                y = left_y + int(point[1] * scale_y)
+                draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=color, outline="black", width=2)
+        ratios = np.asarray([
+            np.nan if row.get(f"bin_{index:02d}_ratio") is None else float(row[f"bin_{index:02d}_ratio"])
+            for index in range(1, 11)
+        ])
+        draw_chart(draw, ratios, None, (100, 650, 1320, 910))
+        draw.text((520, 940), "Spine part (shaft -> tip)", fill="black", font=font)
+        pages.append(page)
+        if progress:
+            progress("Exporting validation PDF", position + 1, len(selected), f"Spine {row['spine_id']}")
+
+    if not pages:
+        page, draw = page_and_draw()
+        draw.text((500, 480), "No spines matched this optional PDF category.", fill="black", font=font)
+        pages.append(page)
+    pages[0].save(path, "PDF", resolution=150.0, save_all=True, append_images=pages[1:])
 
 
 def export_measurements(

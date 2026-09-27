@@ -108,8 +108,10 @@ Channel roles are confirmed for every batch. By default, Channel A contains prot
 
 1. Select and scan a TIFF folder, or manually choose one channel pair.
 2. Confirm channel markers and roles, voxel calibration, experimental groups, specimen names, and output location.
-3. Tune preprocessing on representative specimens. Mark unusual pairs for saved
-   per-pair ChanA/ChanB overrides when they need different parameters.
+3. Review both channels for every included specimen. Settings are independent by
+   default; an optional checkbox fills only currently unmarked images without
+   overwriting reviewed parameters. Exclude whole pairs with a reason or define
+   multiple rectangular XY analysis ROIs when needed.
 4. Preprocess the entire batch and run automatic detection.
 5. Review detected specimens and optionally apply local corrections.
 6. After at least one specimen is marked manual-review complete, calculate its
@@ -118,6 +120,22 @@ Channel roles are confirmed for every batch. By default, Channel A contains prot
 8. Export the workbook, CSV tables, and any requested validation PDFs.
 
 Automatic checkpoints are written throughout preprocessing, detection, correction, and measurement. Completed specimens remain available if a later batch operation is cancelled or interrupted.
+
+## Moving a project to another computer
+
+Choose **Project → Create transfer ZIP…** and select either **Full project state**
+or **Settings only**. Full state carries all cached processing, corrections, and
+measurements. Settings only keeps calibration, parameters, labels, exclusions,
+ROIs, and specimen comments while resetting analysis and correction history. Raw
+TIFFs can optionally be included; they are excluded by default to keep the archive
+smaller.
+
+On the destination computer, choose **File → Open project or transfer ZIP…**,
+select the ZIP, and choose where Synpo should create its project folder. If raw
+TIFFs were not included, select their new parent folder. Synpo searches subfolders,
+accepts exact filenames, and can identify renamed TIFFs by file size plus SHA-256.
+The project opens only after validation succeeds. A damaged full cache may be
+recovered explicitly as settings-only, and the original ZIP is never changed.
 
 Detection uses **Automatic (fast when safe)** by default. Choose **Always use low-memory detection** in Stage 3 to use the disk-backed method for every pending specimen in that project. This execution choice does not invalidate completed masks. Detection reports completed, low-memory, skipped, and failed specimens separately; skipped or failed specimens are retried when the batch is run again.
 
@@ -131,7 +149,10 @@ The correction canvas can show an individual Z slice or a drawable XY maximum pr
 - **Exclude — red:** touch an unwanted object to remove that complete 3D object.
 - **Trim — magenta:** draw across excess segmentation; Synpo removes the hint and keeps the largest connected image-supported remainder.
 - **Expand — blue:** draw from an existing object toward missed signal so its boundary is regrown locally.
-- **Split — yellow:** draw through a neck or contact to divide one object into separately numbered objects.
+- **Split — yellow:** draw through a neck or contact. The two largest pieces seed
+  exactly two output IDs and all smaller fragments join the physically nearest side.
+- **Eraser:** clear only painted dendrite/spine voxels of either type. Slice mode
+  affects one Z plane; XY projection mode clears the painted columns through Z.
 - **Mark as filopodium — purple:** touch a spine to exclude it and record the filopodium decision in the audit trail.
 - **Merge objects — `#ED6291`:** draw through at least two objects to combine them under one stable ID.
 - **Accept — cyan:** retain the mask unchanged and record the object as accepted.
@@ -139,15 +160,43 @@ The correction canvas can show an individual Z slice or a drawable XY maximum pr
 
 Add, Expand, and Trim use a per-application sensitivity slider; it is visibly disabled for other brushes. Higher sensitivity expands Add/Expand results and removes more weak signal during Trim. The brush diameter ranges from 1 to 1000 pixels. A display toggle assigns stable contrasting colors to individual dendrites and spines so their borders remain visible. Protein clusters are detected automatically and are not manually redrawn.
 
+Dendrite and spine object colors are guaranteed distinct. Brush hotkeys are
+Ctrl+1 through Ctrl+9 in the displayed tool order (Add, Exclude, Split, Merge,
+spine-to-dendrite, dendrite-to-spine, Trim, Expand, Eraser), Ctrl+0 selects
+Filopodium, and Enter applies the correction.
+
+From Review, use the preprocessing or detection rerun buttons to edit parameters
+for the selected specimen. A preprocessing rerun automatically continues into
+detection. Either route warns before permanently discarding that specimen's manual
+corrections and history.
+
 The **Save project** button remains visible below every workflow step and saves committed state without applying pending controls.
 
 Correction uses ordinary RAM when safe and automatically switches oversized edits to slower disk-backed processing. An **Always use slow low-memory correction** option is available for low-RAM computers, with undo retained in both modes.
+
+For intermittent performance problems, **Advanced → Diagnostic mode** records
+phase timings and two-second system samples in
+`<output>/Synpo diagnostics/<timestamp>/`. Full-session capture is the default;
+correction-only capture is also available, and diagnostics start disabled on every
+launch. The report excludes microscopy pixels, comments, command lines, and window
+titles, while sanitizing home-directory paths. **Finish and package diagnostic
+session** creates a shareable ZIP. The Advanced menu also opens the single bundled
+PDF protocol for controlled cross-machine testing. Review every report before
+sharing it, and never disable workplace protection software without IT approval.
 
 Maximum projections and 3D context are available during detection and correction. Their progress and Cancel control appear in the bottom status line instead of a modal popup. Before creating a 3D surface, select a rectangular area on the XY projection to control memory use. Dendrite and spine surfaces can be translucent while protein clusters remain opaque. Colors, opacity, rotation on all three axes, and displayed Z spacing are adjustable; these display settings never alter masks or measurements.
 
 ## Spine distribution review
 
 Protein-cluster-positive spines are divided voxel-by-voxel into ten parts along a calibrated curved centerline from the shaft contact to the distal endpoint. For each part, Synpo saves spine volume, inside-cluster volume, and their ratio.
+
+Exactly two meaningful disconnected spine pieces can be joined by a virtual
+signal-guided centerline bridge up to 1.0 µm by default. It never changes the
+segmentation mask or measured volume. The bridge is shown and exported, and the
+spine stays out of distribution summaries until reviewed. Tiny satellite fragments
+do not invalidate the main centerline. Failed bridges and spines with more than two
+substantial pieces retain the path in the component nearest the dendrite and remain
+flagged; a manual endpoint can select the intended distal component.
 
 If the automatic centerline endpoint is correct, no action is required. Otherwise:
 
@@ -169,6 +218,8 @@ included, and the measurement panel reports how many unfinished pairs were omitt
 The verified export contains:
 
 - Master specimen-, dendrite-, spine-, and cluster-level measurements.
+- ROI coordinates and per-ROI summaries, plus pooled specimen metrics and an
+  excluded-specimen audit table.
 - One row per individual included cluster plus per-spine cluster sums.
 - Individual ten-part protein distributions for every qualifying spine.
 - Specimen and experimental-group summaries with counts, means, variability, inclusion percentages, and SEM profiles.
@@ -180,6 +231,19 @@ Source TIFFs are never modified. The compressed project cache can be removed aft
 
 ## Beta-release notes
 
+- Projects can now be moved between computers as validated compressed transfer
+  ZIPs. Full transfers retain cached results and corrections; settings-only
+  transfers retain setup and specimen comments while resetting derived state.
+- Preprocessing now uses independent per-specimen parameters, reviewed markers,
+  specimen exclusion, multiple rectangular analysis ROIs, direct Z-slider mapping,
+  keyboard specimen navigation, and explicit per-specimen preprocessing/detection
+  reruns.
+- Manual correction adds a literal eraser, exactly-two-way splitting, fixed brush
+  hotkeys, Enter-to-apply, and disjoint dendrite/spine object colors.
+- Disconnected two-part spines can use a review-required virtual centerline bridge;
+  tiny satellite fragments no longer unnecessarily discard a usable main path.
+- Opt-in diagnostics can package privacy-conscious performance evidence and include
+  a bundled cross-machine testing protocol.
 - Manual correction now includes projection-only dendrite-to-spine and
   spine-to-dendrite transfer brushes, automatic joining of newly added objects to
   one touching object of the same category, adjustable resegmentation sensitivity,

@@ -1,0 +1,161 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [6 0 R 8 0 R 10 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Length 5934 >>
+stream
+BT /F2 21.0 Tf 0.090 0.212 0.365 rg 1 0 0 1 44.0 786.0 Tm (Synpo Performance Diagnostic Protocol) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 752.0 Tm (Purpose: identify why manual corrections can take 10-15 minutes on one computer while the same data and) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 739.0 Tm (software run normally elsewhere.) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 721.0 Tm (Protocol for Synpo 0.8.x. Use a duplicate project or a test specimen so the prescribed corrections do not) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 708.0 Tm (alter the production review record.) Tj ET
+BT /F2 14.0 Tf 0.137 0.310 0.490 rg 1 0 0 1 44.0 685.0 Tm (1. What Synpo records) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 660.0 Tm (Open Advanced -> Diagnostic level -> Full-session diagnostics, then enable Advanced -> Diagnostic mode.) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 647.0 Tm (Synpo creates a timestamped folder below:) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 629.0 Tm (<project output>\\Synpo diagnostics\\<timestamp>\\) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 613.0 Tm (- events.jsonl - operation and correction phase timings.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 597.5 Tm (- system-samples.csv - two-second CPU, memory, and disk-I/O samples.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 582.0 Tm (- environment.json - operating system, hardware, package versions, and process names.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 566.5 Tm (- session-summary.json - elapsed time and aggregated phase durations.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 551.0 Tm (- README.txt - privacy and sharing notes.) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 533.5 Tm (No microscopy pixels, project comments, command lines, or window titles are collected. Home-directory) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 520.5 Tm (prefixes are replaced with %USERPROFILE%. Review the JSON and CSV files before sharing them.) Tj ET
+BT /F2 14.0 Tf 0.137 0.310 0.490 rg 1 0 0 1 44.0 497.5 Tm (2. Prepare a controlled comparison) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 474.5 Tm (1. Use the same Synpo version, Conda environment, source TIFF pair, project settings, and correction) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 66.0 462.0 Tm (sequence on the work PC and one normally performing PC.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 446.5 Tm (2. Use a duplicate project/output directory for the experiment.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 431.0 Tm (3. Connect laptop power. Record Windows power mode and whether an external monitor or Remote Desktop is in) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 66.0 418.5 Tm (use.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 403.0 Tm (4. Wait for automatic detection to finish. Close unrelated CPU-, memory-, or disk-heavy applications.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 387.5 Tm (5. Confirm correction memory strategy is Automatic.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 372.0 Tm (6. Start Full-session diagnostics before opening the test project.) Tj ET
+BT /F2 14.0 Tf 0.137 0.310 0.490 rg 1 0 0 1 44.0 349.5 Tm (3. Run the correction sequence) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 324.5 Tm (Use one detected specimen. Note the wall-clock duration and the exact status message after every step.) Tj ET
+BT /F2 8.2 Tf 0.060 0.150 0.250 rg 1 0 0 1 44.0 307.5 Tm (Step | Action | What it isolates | Duration / notes) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 292.0 Tm (1 | Individual Z-slice mode: accept a small object. | First editable-mask initialization plus metadata checkpoint. |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 277.0 Tm (2 | Accept a second small object. | Recurring metadata/checkpoint cost without initialization. |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 262.0 Tm (3 | Add one small missed object. | Bounded local segmentation and undo write. |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 247.0 Tm (4 | Exclude one small spine. | Full-volume object lookup plus a small object patch. |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 232.0 Tm (5 | Exclude or split one large dendrite. | Full-volume lookup, large patch computation, compression, and write. |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 217.0 Tm (6 | Switch to drawable XY maximum projection and repeat a small status or mask action. | Full projection selection and) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 206.5 Tm (post-correction projection regeneration. |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 191.5 Tm (7 | If scientifically safe in the duplicate, perform one projection transfer. | Full-Z reads, two undo volumes, and full-Z writes.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 181.0 Tm (|) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 164.0 Tm (For every correction, record whether Synpo reports Slow low-memory correction was used. Also record) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 151.0 Tm (whether Preparing editable masks appears after the first correction; it normally should not.) Tj ET
+BT /F2 14.0 Tf 0.137 0.310 0.490 rg 1 0 0 1 44.0 128.0 Tm (4. Observe Windows while a correction is slow) Tj ET
+BT /F2 11.5 Tf 0.192 0.373 0.553 rg 1 0 0 1 44.0 101.0 Tm (Task Manager) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 80.0 Tm (Open Task Manager -> Details or Performance. During the correction, record:) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 64.0 Tm (- Python/Synpo CPU percentage and whether one logical CPU is saturated.) Tj ET
+BT /F1 7.5 Tf 0.350 0.350 0.350 rg 1 0 0 1 44.0 24.0 Tm (Synpo Performance Diagnostic Protocol - page 1 of 3) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 5 0 R >>
+endobj
+7 0 obj
+<< /Length 1927 >>
+stream
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 791.0 Tm (- Current CPU speed compared with the base speed.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 775.5 Tm (- Total memory use, Synpo working set, and committed memory.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 760.0 Tm (- Disk active time, transfer rate, and response time.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 744.5 Tm (- Activity from MsMpEng.exe, OneDrive, backup, DLP, indexing, or other security software.) Tj ET
+BT /F2 11.5 Tf 0.192 0.373 0.553 rg 1 0 0 1 44.0 725.0 Tm (Resource Monitor) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 704.0 Tm (Open Resource Monitor -> Disk. Select the Python/Synpo process and any active security or synchronization) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 691.0 Tm (processes. Record:) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 675.0 Tm (- Which process accesses .synpo-cache, review.zarr, undo, or .synpo-review-*.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 659.5 Tm (- Disk response time and queue length.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 644.0 Tm (- Whether active time is near 100% despite low throughput.) Tj ET
+BT /F2 11.5 Tf 0.192 0.373 0.553 rg 1 0 0 1 44.0 624.5 Tm (Optional: Process Monitor with IT approval) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 603.5 Tm (Capture only the slow operation. Filter to the Python process and paths containing .synpo-cache. Do not) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 590.5 Tm (collect unrelated activity longer than necessary. Look for repeated access by antivirus/security filters,) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 577.5 Tm (long file-operation durations, sharing violations, and repeated retries.) Tj ET
+BT /F1 7.5 Tf 0.350 0.350 0.350 rg 1 0 0 1 44.0 24.0 Tm (Synpo Performance Diagnostic Protocol - page 2 of 3) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 7 0 R >>
+endobj
+9 0 obj
+<< /Length 6113 >>
+stream
+BT /F2 14.0 Tf 0.137 0.310 0.490 rg 1 0 0 1 44.0 784.0 Tm (5. Test the cache location) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 759.0 Tm (The source TIFF being local is not sufficient: corrections primarily use the project output cache. Create) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 746.0 Tm (one duplicate test whose output is a plain local SSD folder such as C:\\SynpoBench. Keep the original data) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 733.0 Tm (and settings unchanged.) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 715.0 Tm (Check whether the original output path is under Documents, Desktop, OneDrive, Dropbox, SharePoint, a) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 702.0 Tm (mapped drive, or a corporate redirected folder. On Windows, IT can inspect a suspected path with:) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 684.0 Tm (fsutil reparsepoint query "C:\\path\\to\\output") Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 666.0 Tm (Record drive type, free space, BitLocker status if known, and whether the folder is synchronized or backed) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 653.0 Tm (up. Do not change security settings merely to complete this comparison.) Tj ET
+BT /F2 14.0 Tf 0.137 0.310 0.490 rg 1 0 0 1 44.0 630.0 Tm (6. Repeatability matrix) Tj ET
+BT /F2 8.2 Tf 0.060 0.150 0.250 rg 1 0 0 1 44.0 606.0 Tm (Computer | Output/cache location | Detection running? | View mode | Operation | Processing mode | Seconds) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 590.5 Tm (Work PC |  |  | Z slice | First accept |  |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 575.5 Tm (Work PC |  |  | Z slice | Second accept |  |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 560.5 Tm (Work PC |  |  | Z slice | Small add |  |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 545.5 Tm (Work PC |  |  | Z slice | Small exclude |  |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 530.5 Tm (Work PC |  |  | XY maximum | Small correction |  |) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 515.5 Tm (Reference PC |  |  | Z slice | Same sequence |  |) Tj ET
+BT /F2 14.0 Tf 0.137 0.310 0.490 rg 1 0 0 1 44.0 493.5 Tm (7. Interpret the evidence) Tj ET
+BT /F2 8.2 Tf 0.060 0.150 0.250 rg 1 0 0 1 44.0 469.5 Tm (Finding | Likely cause) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 454.0 Tm (editable_masks_initialization_finished dominates only the first correction. | Normal one-time editable-mask creation; optimize) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 443.5 Tm (initialization only if excessive.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 428.5 Tm (Editable-mask initialization occurs repeatedly for the same specimen. | Review cache is incomplete, rejected, deleted, or) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 418.0 Tm (mismatched to the detection signature.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 403.0 Tm (full_volume_object_bbox_search_finished dominates. | Repeated whole-volume scanning; object extent metadata/indexing should be) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 392.5 Tm (optimized.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 377.5 Tm (undo_checkpoint_write_finished or corrected_mask_write_finished dominates. | Compression, storage latency, synchronization, or) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 367.0 Tm (endpoint scanning.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 352.0 Tm (context_generation_completed dominates after each edit. | Projection regeneration; compare Z-slice mode and avoid unnecessary) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 341.5 Tm (invalidation.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 326.5 Tm (Low CPU, 100% disk active time, low throughput, high response time. | Small-file latency, security scanning, synchronization, or) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 316.0 Tm (paging.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 301.0 Tm (High CPU on one logical processor with normal disk response. | CPU-bound single-threaded correction or compression.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 286.0 Tm (.synpo-review-* receives heavy traffic. | Disk-backed low-memory correction.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 271.0 Tm (The same action alternates between fast and slow with different competing processes. | External contention, scheduled scanning,) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 260.5 Tm (power/thermal state, or storage filtering.) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 245.5 Tm (A plain C:\\SynpoBench output is fast while the normal output is slow. | Folder redirection, synchronization, security policy, or) Tj ET
+BT /F1 7.8 Tf 0.100 0.100 0.100 rg 1 0 0 1 44.0 235.0 Tm (storage-path characteristics.) Tj ET
+BT /F2 14.0 Tf 0.137 0.310 0.490 rg 1 0 0 1 44.0 213.0 Tm (8. Finish and share safely) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 190.0 Tm (1. Select Advanced -> Finish and package diagnostic session.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 174.5 Tm (2. Open the ZIP and review environment.json, events.jsonl, and session-summary.json.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 159.0 Tm (3. Attach the work-PC and reference-PC ZIPs together, labeled by machine.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 143.5 Tm (4. Include the completed repeatability matrix and any Task Manager/Resource Monitor observations.) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 56.0 128.0 Tm (5. If endpoint software appears involved, provide the bundle to IT. Request investigation or an approved) Tj ET
+BT /F1 9.3 Tf 0.080 0.080 0.080 rg 1 0 0 1 66.0 115.5 Tm (narrow test-not blanket disabling of protection.) Tj ET
+BT /F1 9.5 Tf 0.080 0.080 0.080 rg 1 0 0 1 44.0 98.0 Tm (End of protocol.) Tj ET
+BT /F1 7.5 Tf 0.350 0.350 0.350 rg 1 0 0 1 44.0 24.0 Tm (Synpo Performance Diagnostic Protocol - page 3 of 3) Tj ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 9 0 R >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000134 00000 n 
+0000000231 00000 n 
+0000000333 00000 n 
+0000006318 00000 n 
+0000006454 00000 n 
+0000008432 00000 n 
+0000008568 00000 n 
+0000014732 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+14869
+%%EOF

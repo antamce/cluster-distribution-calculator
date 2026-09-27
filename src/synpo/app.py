@@ -7,9 +7,10 @@ from threading import Event
 from pathlib import Path
 
 import numpy as np
+import tifffile
 from scipy import ndimage
-from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSettings, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSettings, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -53,6 +55,14 @@ from .project import (
     save_project,
     verify_project_sources,
 )
+from .transfer import (
+    TRANSFER_SUFFIX,
+    TransferCacheError,
+    TransferImportResult,
+    create_transfer_archive,
+    import_transfer_archive,
+    inspect_transfer_archive,
+)
 from .preprocessing import (
     PreprocessingSettings,
     PreviewResult,
@@ -61,6 +71,7 @@ from .preprocessing import (
     effective_preprocessing_settings,
     make_preview,
     process_project_cache,
+    preprocessing_parameters_set,
 )
 from .detection import (
     ALWAYS_LOW_MEMORY_MODE,
@@ -68,7 +79,16 @@ from .detection import (
     DetectionSettings,
     DetectionSlice,
     detect_project,
+    effective_detection_settings,
     load_detection_slice,
+)
+from .diagnostics import (
+    DIAGNOSTIC_LEVEL_CORRECTION,
+    DIAGNOSTIC_LEVEL_FULL,
+    DiagnosticCallback,
+    DiagnosticSession,
+    diagnostic_protocol_path,
+    diagnostic_session_parent,
 )
 from .review import (
     ALWAYS_LOW_MEMORY_REVIEW_MODE,
@@ -79,7 +99,9 @@ from .review import (
     load_review_slice,
     set_specimen_review_state,
     undo_last_review_action,
+    discard_specimen_review,
 )
+from .regions import normalize_rectangles, rectangle_records, specimen_rectangles
 from .visualization import (
     ContextVolume,
     ProjectionData,
@@ -130,6 +152,7 @@ REVIEW_BRUSH_COLORS = {
     "merge": QColor("#ED6291"),
     "accept": QColor("#22d3ee"),
     "needs_attention": QColor("#ff8c1a"),
+    "erase": QColor("#ffffff"),
 }
 
 DISTINCT_OBJECT_PALETTE = np.asarray(
@@ -181,10 +204,16 @@ def _label_colors(labels: np.ndarray, kind: int) -> np.ndarray:
 
 def _distinct_object_colors(labels: np.ndarray, kind: int) -> np.ndarray:
     values = np.asarray(labels, dtype=np.uint64)
-    indices = (
-        values * np.uint64(2654435761) + np.uint64(kind * 7)
-    ) % np.uint64(len(DISTINCT_OBJECT_PALETTE))
-    return DISTINCT_OBJECT_PALETTE[indices.astype(np.intp)]
+    indices = (values * np.uint64(2654435761)) % np.uint64(len(DISTINCT_OBJECT_PALETTE))
+    base = DISTINCT_OBJECT_PALETTE[indices.astype(np.intp)].astype(np.uint16)
+    if kind == 0:
+        # Reserve a disjoint blue range so a dendrite can never equal a spine color.
+        base[..., 2] //= 2
+        return base.astype(np.uint8)
+    if kind == 1:
+        base[..., 2] = 160 + base[..., 2] * 95 // 255
+        return np.clip(base, 0, 255).astype(np.uint8)
+    return base.astype(np.uint8)
 
 
 def _screen_limited_size(widget: QWidget, width: int, height: int) -> tuple[int, int]:
@@ -198,8 +227,28 @@ def _screen_limited_size(widget: QWidget, width: int, height: int) -> tuple[int,
     )
 
 
+class AbsoluteSlider(QSlider):
+    """A slider whose mouse click maps directly to the clicked value."""
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.orientation() == Qt.Orientation.Horizontal
+            and self.maximum() > self.minimum()
+        ):
+            fraction = max(0.0, min(1.0, event.position().x() / max(1, self.width() - 1)))
+            self.setValue(
+                self.minimum()
+                + round(fraction * (self.maximum() - self.minimum()))
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class SliceView(QLabel):
     zoom_changed = Signal(int)
+    navigate_requested = Signal(int)
 
     def __init__(self, placeholder: str) -> None:
         super().__init__(placeholder)
@@ -212,6 +261,14 @@ class SliceView(QLabel):
         self._panning = False
         self._last_pan_position: QPointF | None = None
         self._cursor_before_pan = self.cursor()
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() in {Qt.Key.Key_Up, Qt.Key.Key_Down}:
+            self.navigate_requested.emit(-1 if event.key() == Qt.Key.Key_Up else 1)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _display_aspect_ratio(self) -> float:
         if self._image is None:
@@ -429,6 +486,188 @@ class SliceView(QLabel):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+
+class MultiRoiView(SliceView):
+    rectangle_drawn = Signal(object)
+
+    def __init__(self) -> None:
+        super().__init__("Analysis ROI projection")
+        self._rectangles: list[tuple[int, int, int, int]] = []
+        self._drawing_start: tuple[int, int] | None = None
+        self._drawing_end: tuple[int, int] | None = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def set_rectangles(self, rectangles: list[tuple[int, int, int, int]]) -> None:
+        self._rectangles = list(rectangles)
+        self._render()
+
+    def _render(self) -> None:
+        super()._render()
+        current = self.pixmap()
+        if self._image is None or current is None:
+            return
+        canvas = current.copy()
+        painter = QPainter(canvas)
+        target = self._target_rect()
+        sx = target.width() / max(1, self._image.width())
+        sy = target.height() / max(1, self._image.height())
+        for index, (x0, y0, x1, y1) in enumerate(self._rectangles, start=1):
+            painter.setPen(QPen(QColor(40, 230, 100), 3))
+            rectangle = QRectF(
+                target.left() + x0 * sx,
+                target.top() + y0 * sy,
+                (x1 - x0) * sx,
+                (y1 - y0) * sy,
+            )
+            painter.drawRect(rectangle)
+            painter.drawText(rectangle.topLeft() + QPointF(5, 17), f"ROI {index}")
+        if self._drawing_start is not None and self._drawing_end is not None:
+            x0, y0 = self._drawing_start
+            x1, y1 = self._drawing_end
+            painter.setPen(QPen(QColor(255, 145, 20), 3))
+            painter.drawRect(
+                QRectF(
+                    target.left() + min(x0, x1) * sx,
+                    target.top() + min(y0, y1) * sy,
+                    (abs(x1 - x0) + 1) * sx,
+                    (abs(y1 - y0) + 1) * sy,
+                )
+            )
+        painter.end()
+        self.setPixmap(canvas)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() == Qt.MouseButton.LeftButton:
+            point = self.image_coordinate(event.position())
+            if point is not None:
+                self._drawing_start = point
+                self._drawing_end = point
+                self._render()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._drawing_start is not None:
+            point = self.image_coordinate(event.position())
+            if point is not None:
+                self._drawing_end = point
+                self._render()
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() == Qt.MouseButton.LeftButton and self._drawing_start is not None:
+            point = self.image_coordinate(event.position())
+            if point is not None:
+                self._drawing_end = point
+            start, end = self._drawing_start, self._drawing_end
+            self._drawing_start = None
+            self._drawing_end = None
+            self._render()
+            if start is not None and end is not None:
+                x0, x1 = sorted((start[0], end[0]))
+                y0, y1 = sorted((start[1], end[1]))
+                if x1 - x0 >= 3 and y1 - y0 >= 3:
+                    self.rectangle_drawn.emit((x0, y0, x1 + 1, y1 + 1))
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class AnalysisRoiDialog(QDialog):
+    def __init__(
+        self,
+        projection: np.ndarray,
+        rectangles: list[tuple[int, int, int, int]],
+        parent=None,
+    ) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(parent)
+        self.setWindowTitle("Analysis regions")
+        self.resize(*_screen_limited_size(self, 1050, 820))
+        self._shape_yx = tuple(int(value) for value in projection.shape)
+        full = [(0, 0, self._shape_yx[1], self._shape_yx[0])]
+        normalized = normalize_rectangles(rectangles, self._shape_yx)
+        self._rectangles = [] if normalized == full else normalized
+        self._replace_index: int | None = None
+        layout = QVBoxLayout(self)
+        instructions = QLabel(
+            "Draw one or more rectangles on the XY maximum projection. Separate regions "
+            "are analyzed independently; touching or overlapping regions merge automatically."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        self.view = MultiRoiView()
+        low, high = np.percentile(projection, (0.5, 99.8))
+        self.view.show_array(projection, float(low), float(max(low + 1, high)))
+        self.view.rectangle_drawn.connect(self._rectangle_drawn)
+        layout.addWidget(self.view, 1)
+        layout.addWidget(ZoomControls(self.view))
+        controls = QHBoxLayout()
+        self.roi_list = QComboBox()
+        controls.addWidget(self.roi_list, 1)
+        redraw = QPushButton("Redraw selected")
+        redraw.clicked.connect(self._redraw_selected)
+        controls.addWidget(redraw)
+        remove = QPushButton("Remove selected")
+        remove.clicked.connect(self._remove_selected)
+        controls.addWidget(remove)
+        full_button = QPushButton("Use full image")
+        full_button.clicked.connect(self._use_full_image)
+        controls.addWidget(full_button)
+        layout.addLayout(controls)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        apply_button = QPushButton("Save regions")
+        apply_button.clicked.connect(self.accept)
+        buttons.addWidget(apply_button)
+        layout.addLayout(buttons)
+        self._refresh()
+
+    def rectangles(self) -> list[tuple[int, int, int, int]]:
+        return list(self._rectangles)
+
+    def _refresh(self) -> None:
+        self._rectangles = normalize_rectangles(self._rectangles, self._shape_yx)
+        self.view.set_rectangles(self._rectangles)
+        self.roi_list.clear()
+        if not self._rectangles:
+            self.roi_list.addItem("Full image", -1)
+        else:
+            for index, (x0, y0, x1, y1) in enumerate(self._rectangles):
+                self.roi_list.addItem(
+                    f"ROI {index + 1}: X {x0}-{x1 - 1}, Y {y0}-{y1 - 1}", index
+                )
+
+    @Slot(object)
+    def _rectangle_drawn(self, rectangle) -> None:  # type: ignore[no-untyped-def]
+        if self._replace_index is not None and self._replace_index < len(self._rectangles):
+            self._rectangles[self._replace_index] = tuple(rectangle)
+        else:
+            self._rectangles.append(tuple(rectangle))
+        self._replace_index = None
+        self._refresh()
+
+    def _redraw_selected(self) -> None:
+        value = self.roi_list.currentData()
+        self._replace_index = int(value) if value is not None and int(value) >= 0 else None
+
+    def _remove_selected(self) -> None:
+        value = self.roi_list.currentData()
+        if value is not None and 0 <= int(value) < len(self._rectangles):
+            self._rectangles.pop(int(value))
+        self._replace_index = None
+        self._refresh()
+
+    def _use_full_image(self) -> None:
+        self._rectangles = []
+        self._replace_index = None
+        self._refresh()
 
 
 class ZoomControls(QWidget):
@@ -1809,6 +2048,7 @@ class PreviewWorker(QObject):
         z_step_um: float,
         statistics: StackStatistics | None,
         cache_key: tuple[object, ...],
+        rois_xy: list[tuple[int, int, int, int]] | None = None,
     ) -> None:
         super().__init__()
         self.path = path
@@ -1818,6 +2058,7 @@ class PreviewWorker(QObject):
         self.z_step_um = z_step_um
         self.statistics = statistics
         self.cache_key = cache_key
+        self.rois_xy = rois_xy
 
     @Slot()
     def run(self) -> None:
@@ -1830,6 +2071,7 @@ class PreviewWorker(QObject):
                 xy_um_per_pixel=self.xy_um_per_pixel,
                 z_step_um=self.z_step_um,
                 statistics=self.statistics,
+                rois_xy=self.rois_xy,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -1844,11 +2086,17 @@ class BatchPreprocessWorker(QObject):
     failed = Signal(str)
     cancelled = Signal(str)
 
-    def __init__(self, manifest: dict[str, object], project_path: Path) -> None:
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        project_path: Path,
+        specimen_indices: list[int] | None = None,
+    ) -> None:
         super().__init__()
         self.manifest = manifest
         self.project_path = project_path
         self.cancel_event = Event()
+        self.specimen_indices = specimen_indices
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -1863,6 +2111,7 @@ class BatchPreprocessWorker(QObject):
                     phase, current, total, detail
                 ),
                 cancel_event=self.cancel_event,
+                specimen_indices=self.specimen_indices,
             )
         except ProcessingCancelled as exc:
             self.cancelled.emit(str(exc))
@@ -1880,11 +2129,19 @@ class DetectionWorker(QObject):
     cancelled = Signal(str)
     pair_completed = Signal(int, object)
 
-    def __init__(self, manifest: dict[str, object], project_path: Path) -> None:
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        project_path: Path,
+        specimen_indices: list[int] | None = None,
+        force: bool = False,
+    ) -> None:
         super().__init__()
         self.manifest = manifest
         self.project_path = project_path
         self.cancel_event = Event()
+        self.specimen_indices = specimen_indices
+        self.force = force
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -1902,6 +2159,8 @@ class DetectionWorker(QObject):
                     index, summary
                 ),
                 cancel_event=self.cancel_event,
+                specimen_indices=self.specimen_indices,
+                force=self.force,
             )
         except ProcessingCancelled as exc:
             self.cancelled.emit(str(exc))
@@ -2110,19 +2369,46 @@ class ReviewWorker(QObject):
         project_path: Path,
         specimen_index: int,
         action: ReviewAction | None,
+        diagnostic: DiagnosticCallback | None = None,
     ) -> None:
         super().__init__()
         self.manifest = manifest
         self.project_path = project_path
         self.specimen_index = specimen_index
         self.action = action
+        self.diagnostic = diagnostic
 
     @Slot()
     def run(self) -> None:
+        started = time.monotonic()
+        operation = self.action.operation if self.action is not None else "undo"
+        if self.diagnostic is not None:
+            self.diagnostic(
+                "correction_started",
+                "correction",
+                {
+                    "specimen_index": self.specimen_index,
+                    "operation": operation,
+                    "object_type": (
+                        self.action.object_type if self.action is not None else None
+                    ),
+                    "projection_hint": (
+                        self.action.projection_hint if self.action is not None else None
+                    ),
+                    "brush_radius_pixels": (
+                        self.action.brush_radius_pixels
+                        if self.action is not None
+                        else None
+                    ),
+                },
+            )
         try:
             if self.action is None:
                 result = undo_last_review_action(
-                    self.manifest, self.project_path, self.specimen_index
+                    self.manifest,
+                    self.project_path,
+                    self.specimen_index,
+                    diagnostic=self.diagnostic,
                 )
             else:
                 result = apply_review_action(
@@ -2133,10 +2419,37 @@ class ReviewWorker(QObject):
                     progress=lambda phase, current, total, detail: self.progress.emit(
                         phase, current, total, detail
                     ),
+                    diagnostic=self.diagnostic,
                 )
         except Exception as exc:
+            if self.diagnostic is not None:
+                self.diagnostic(
+                    "correction_finished",
+                    "correction",
+                    {
+                        "specimen_index": self.specimen_index,
+                        "operation": operation,
+                        "status": "failed",
+                        "duration_seconds": round(time.monotonic() - started, 6),
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                )
             self.failed.emit(str(exc))
             return
+        if self.diagnostic is not None:
+            self.diagnostic(
+                "correction_finished",
+                "correction",
+                {
+                    "specimen_index": self.specimen_index,
+                    "operation": operation,
+                    "status": "completed",
+                    "duration_seconds": round(time.monotonic() - started, 6),
+                    "processing_mode": result.processing_mode,
+                    "checkpoint_written": result.checkpoint_written,
+                },
+            )
         self.completed.emit(result)
 
 
@@ -2277,6 +2590,93 @@ class VerifyWorker(QObject):
         self.completed.emit(results)
 
 
+class TransferCreateWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        project_path: Path,
+        archive_path: Path,
+        mode: str,
+        include_raw: bool,
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        self.archive_path = archive_path
+        self.mode = mode
+        self.include_raw = include_raw
+
+    @Slot()
+    def run(self) -> None:
+        def report(phase: str, current: int, total: int, detail: str) -> None:
+            units = 10_000
+            scaled = min(units, int(current * units / max(1, total)))
+            self.progress.emit(phase, scaled, units, detail)
+
+        try:
+            result = create_transfer_archive(
+                self.manifest,
+                self.project_path,
+                self.archive_path,
+                mode=self.mode,
+                include_raw=self.include_raw,
+                progress=report,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
+class TransferImportWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        archive_path: Path,
+        destination_parent: Path,
+        external_raw_directory: Path | None,
+        conflict_policy: str,
+        recover_as_settings_only: bool = False,
+    ) -> None:
+        super().__init__()
+        self.archive_path = archive_path
+        self.destination_parent = destination_parent
+        self.external_raw_directory = external_raw_directory
+        self.conflict_policy = conflict_policy
+        self.recover_as_settings_only = recover_as_settings_only
+
+    @Slot()
+    def run(self) -> None:
+        def report(phase: str, current: int, total: int, detail: str) -> None:
+            units = 10_000
+            scaled = min(units, int(current * units / max(1, total)))
+            self.progress.emit(phase, scaled, units, detail)
+
+        try:
+            result = import_transfer_archive(
+                self.archive_path,
+                self.destination_parent,
+                external_raw_directory=self.external_raw_directory,
+                conflict_policy=self.conflict_policy,
+                recover_as_settings_only=self.recover_as_settings_only,
+                progress=report,
+            )
+        except TransferCacheError as exc:
+            self.completed.emit(exc)
+            return
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2295,6 +2695,7 @@ class MainWindow(QMainWindow):
         self._progress_last_current = 0
         self._progress_last_total = 0
         self._progress_rate_ema: float | None = None
+        self._diagnostic_job_phase: str | None = None
         self._preview_statistics: dict[tuple[object, ...], StackStatistics] = {}
         self._last_preview: PreviewResult | None = None
         self._last_detection: DetectionSlice | None = None
@@ -2312,9 +2713,12 @@ class MainWindow(QMainWindow):
         self._review_thread: QThread | None = None
         self._review_worker: ReviewWorker | None = None
         self._review_refresh_pending = False
+        self._diagnostic_review_phase: str | None = None
         self._context_thread: QThread | None = None
         self._context_worker: ContextWorker | None = None
         self._context_request: tuple[object, ...] | None = None
+        self._diagnostic_context_started_at = 0.0
+        self._diagnostic_context_phase: str | None = None
         self._context_cache: dict[tuple[object, ...], ContextVolume] = {}
         self._context_dialogs: list[ContextViewerDialog] = []
         self._area_dialog: AreaSelectionDialog | None = None
@@ -2322,11 +2726,17 @@ class MainWindow(QMainWindow):
         self._preprocess_view_specimen_key: tuple[int, int] | None = None
         self._detection_view_specimen_key: tuple[int, int] | None = None
         self._review_view_specimen_key: tuple[int, int] | None = None
+        self._diagnostics: DiagnosticSession | None = None
+        self._pending_transfer_recovery: tuple[Path, Path, Path | None, str] | None = None
+        self._diagnostic_last_directory: Path | None = None
         self._calibration_store = CalibrationStore()
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(180)
         self._preview_timer.timeout.connect(self._request_preview)
+        self._diagnostic_timer = QTimer(self)
+        self._diagnostic_timer.setInterval(2000)
+        self._diagnostic_timer.timeout.connect(self._sample_diagnostics)
 
         self._build_actions()
         self._build_interface()
@@ -2340,7 +2750,7 @@ class MainWindow(QMainWindow):
         self.new_action.triggered.connect(self._new_batch)
         file_menu.addAction(self.new_action)
 
-        self.open_action = QAction("Open project…", self)
+        self.open_action = QAction("Open project or transfer ZIP…", self)
         self.open_action.triggered.connect(self._open_project)
         file_menu.addAction(self.open_action)
 
@@ -2362,12 +2772,242 @@ class MainWindow(QMainWindow):
         self.relink_action.triggered.connect(self._relink_sources)
         project_menu.addAction(self.relink_action)
 
+        project_menu.addSeparator()
+        self.create_transfer_action = QAction("Create transfer ZIP…", self)
+        self.create_transfer_action.triggered.connect(self._create_transfer_zip)
+        project_menu.addAction(self.create_transfer_action)
+
+        advanced_menu = self.menuBar().addMenu("&Advanced")
+        self.diagnostic_mode_action = QAction("Diagnostic mode", self)
+        self.diagnostic_mode_action.setCheckable(True)
+        self.diagnostic_mode_action.setToolTip(
+            "Record privacy-conscious performance timings and system samples."
+        )
+        self.diagnostic_mode_action.toggled.connect(self._toggle_diagnostic_mode)
+        advanced_menu.addAction(self.diagnostic_mode_action)
+
+        diagnostic_level_menu = advanced_menu.addMenu("Diagnostic level")
+        self.diagnostic_level_group = QActionGroup(self)
+        self.diagnostic_level_group.setExclusive(True)
+        self.diagnostic_correction_action = QAction(
+            "Correction diagnostics only", self
+        )
+        self.diagnostic_correction_action.setCheckable(True)
+        self.diagnostic_correction_action.setData(DIAGNOSTIC_LEVEL_CORRECTION)
+        self.diagnostic_level_group.addAction(self.diagnostic_correction_action)
+        diagnostic_level_menu.addAction(self.diagnostic_correction_action)
+        self.diagnostic_full_action = QAction("Full-session diagnostics", self)
+        self.diagnostic_full_action.setCheckable(True)
+        self.diagnostic_full_action.setData(DIAGNOSTIC_LEVEL_FULL)
+        self.diagnostic_full_action.setChecked(True)
+        self.diagnostic_level_group.addAction(self.diagnostic_full_action)
+        diagnostic_level_menu.addAction(self.diagnostic_full_action)
+        self.diagnostic_level_menu = diagnostic_level_menu
+
+        advanced_menu.addSeparator()
+        self.finish_diagnostic_action = QAction(
+            "Finish and package diagnostic session…", self
+        )
+        self.finish_diagnostic_action.setEnabled(False)
+        self.finish_diagnostic_action.triggered.connect(
+            self._finish_and_package_diagnostics
+        )
+        advanced_menu.addAction(self.finish_diagnostic_action)
+
+        self.open_diagnostic_folder_action = QAction(
+            "Open diagnostic folder", self
+        )
+        self.open_diagnostic_folder_action.setEnabled(False)
+        self.open_diagnostic_folder_action.triggered.connect(
+            self._open_diagnostic_folder
+        )
+        advanced_menu.addAction(self.open_diagnostic_folder_action)
+
+        self.open_diagnostic_protocol_action = QAction(
+            "Open diagnostic protocol PDF", self
+        )
+        self.open_diagnostic_protocol_action.triggered.connect(
+            self._open_diagnostic_protocol
+        )
+        advanced_menu.addAction(self.open_diagnostic_protocol_action)
+
         view_menu = self.menuBar().addMenu("&View")
         self.fullscreen_action = QAction("Toggle full screen", self)
         self.fullscreen_action.setShortcut("F11")
         self.fullscreen_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self.fullscreen_action.triggered.connect(self._toggle_fullscreen)
         view_menu.addAction(self.fullscreen_action)
+
+    def _selected_diagnostic_level(self) -> str:
+        checked = self.diagnostic_level_group.checkedAction()
+        return str(checked.data()) if checked is not None else DIAGNOSTIC_LEVEL_FULL
+
+    def _diagnostic_parent_directory(self) -> Path | None:
+        if self.manifest is not None:
+            return diagnostic_session_parent(self.manifest["output_directory"])
+        output_text = self.output_edit.text().strip() if hasattr(self, "output_edit") else ""
+        if output_text:
+            return diagnostic_session_parent(output_text)
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select a folder for Synpo diagnostics",
+            "",
+        )
+        return Path(selected).resolve() / "Synpo diagnostics" if selected else None
+
+    @Slot(bool)
+    def _toggle_diagnostic_mode(self, enabled: bool) -> None:
+        if enabled:
+            if self._diagnostics is not None and self._diagnostics.active:
+                return
+            parent = self._diagnostic_parent_directory()
+            if parent is None:
+                self.diagnostic_mode_action.blockSignals(True)
+                self.diagnostic_mode_action.setChecked(False)
+                self.diagnostic_mode_action.blockSignals(False)
+                return
+            try:
+                session = DiagnosticSession.create(
+                    parent, level=self._selected_diagnostic_level()
+                )
+            except (OSError, ValueError) as exc:
+                self.diagnostic_mode_action.blockSignals(True)
+                self.diagnostic_mode_action.setChecked(False)
+                self.diagnostic_mode_action.blockSignals(False)
+                QMessageBox.warning(
+                    self, "Cannot start diagnostics", str(exc)
+                )
+                return
+            self._diagnostics = session
+            self._diagnostic_last_directory = session.directory
+            self.diagnostic_level_menu.setEnabled(False)
+            self.finish_diagnostic_action.setEnabled(True)
+            self.open_diagnostic_folder_action.setEnabled(True)
+            self._diagnostic_timer.start()
+            self._sample_diagnostics()
+            self._record_diagnostic_project_context()
+            self.statusBar().showMessage(
+                f"Diagnostic mode started: {session.directory}", 10000
+            )
+            return
+
+        if self._diagnostics is None:
+            return
+        if self._operation_in_progress():
+            self.diagnostic_mode_action.blockSignals(True)
+            self.diagnostic_mode_action.setChecked(True)
+            self.diagnostic_mode_action.blockSignals(False)
+            QMessageBox.information(
+                self,
+                "Diagnostic operation in progress",
+                "Wait for the current operation to finish before stopping diagnostics, "
+                "so its final timing records are preserved.",
+            )
+            return
+        self._finish_diagnostics(package=False, reason="diagnostic_mode_disabled")
+
+    def _operation_in_progress(self) -> bool:
+        return any(
+            worker is not None
+            for worker in (
+                self._job_thread,
+                self._review_thread,
+                self._context_thread,
+            )
+        )
+
+    def _record_diagnostic(
+        self, event: str, *, scope: str = "full", **details: object
+    ) -> None:
+        if self._diagnostics is not None:
+            self._diagnostics.record(event, scope=scope, **details)
+
+    def _diagnostic_callback(self) -> DiagnosticCallback | None:
+        if self._diagnostics is None or not self._diagnostics.active:
+            return None
+        return self._diagnostics.callback
+
+    def _sample_diagnostics(self) -> None:
+        if self._diagnostics is not None:
+            self._diagnostics.sample_system()
+
+    def _record_diagnostic_project_context(self) -> None:
+        if self._diagnostics is None or self.manifest is None:
+            return
+        try:
+            cache_path: Path | None = project_cache_path(self.manifest)
+        except (KeyError, TypeError, ValueError):
+            cache_path = None
+        self._diagnostics.record_project_context(
+            output_directory=self.manifest.get("output_directory"),
+            cache_path=cache_path,
+            specimen_count=len(self.manifest.get("specimens", [])),
+        )
+
+    def _finish_diagnostics(self, *, package: bool, reason: str) -> Path | None:
+        session = self._diagnostics
+        if session is None:
+            return None
+        self._diagnostic_timer.stop()
+        try:
+            result = session.package(reason=reason) if package else session.finish(reason=reason)
+        except OSError as exc:
+            QMessageBox.warning(self, "Cannot finish diagnostics", str(exc))
+            return None
+        self._diagnostic_last_directory = session.directory
+        self._diagnostics = None
+        self.diagnostic_mode_action.blockSignals(True)
+        self.diagnostic_mode_action.setChecked(False)
+        self.diagnostic_mode_action.blockSignals(False)
+        self.diagnostic_level_menu.setEnabled(True)
+        self.finish_diagnostic_action.setEnabled(False)
+        self.open_diagnostic_folder_action.setEnabled(True)
+        self.statusBar().showMessage(
+            f"Diagnostic {'bundle' if package else 'session'} saved: {result}", 12000
+        )
+        return result
+
+    def _finish_and_package_diagnostics(self) -> None:
+        if self._operation_in_progress():
+            QMessageBox.information(
+                self,
+                "Diagnostic operation in progress",
+                "Wait for the current operation to finish before packaging diagnostics.",
+            )
+            return
+        result = self._finish_diagnostics(
+            package=True, reason="user_finished_and_packaged"
+        )
+        if result is not None:
+            QMessageBox.information(
+                self,
+                "Diagnostic bundle ready",
+                f"The diagnostic ZIP was saved to:\n{result}",
+            )
+
+    def _open_diagnostic_folder(self) -> None:
+        directory = (
+            self._diagnostics.directory
+            if self._diagnostics is not None
+            else self._diagnostic_last_directory
+        )
+        if directory is None or not directory.is_dir():
+            QMessageBox.information(
+                self, "No diagnostic folder", "No diagnostic session folder is available."
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
+    def _open_diagnostic_protocol(self) -> None:
+        protocol = diagnostic_protocol_path()
+        if not protocol.is_file():
+            QMessageBox.warning(
+                self,
+                "Diagnostic protocol missing",
+                f"The bundled diagnostic protocol was not found:\n{protocol}",
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(protocol)))
 
     @staticmethod
     def _clamp_window_geometry(rect: QRect) -> QRect:
@@ -2590,7 +3230,7 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         outer = QVBoxLayout(tab)
 
-        selection = QGroupBox("Representative preview")
+        selection = QGroupBox("Specimen parameter review")
         selection_layout = QHBoxLayout(selection)
         self.preprocess_specimen = QComboBox()
         self.preprocess_specimen.currentIndexChanged.connect(
@@ -2606,20 +3246,30 @@ class MainWindow(QMainWindow):
         )
         selection_layout.addWidget(QLabel("Channel:"))
         selection_layout.addWidget(self.preprocess_channel)
-        self.representative_check = QCheckBox("Use as representative specimen")
-        selection_layout.addWidget(self.representative_check)
-        self.special_preprocessing_check = QCheckBox(
-            "Use special preprocessing settings for this pair"
+        self.fill_unset_preprocessing_check = QCheckBox(
+            "Make all unset images in this channel use these parameters"
         )
-        self.special_preprocessing_check.setToolTip(
-            "When checked, ChanA and ChanB keep specimen-specific settings. "
-            "Clearing the checkmark returns to batch defaults without deleting the saved override."
+        self.fill_unset_preprocessing_check.setToolTip(
+            "Copies the current values to this channel only for included specimens whose "
+            "parameters have not been set. Existing settings are never overwritten."
         )
-        self.special_preprocessing_check.toggled.connect(
-            self._special_preprocessing_toggled
-        )
-        selection_layout.addWidget(self.special_preprocessing_check)
+        selection_layout.addWidget(self.fill_unset_preprocessing_check)
         outer.addWidget(selection)
+
+        analysis_row = QHBoxLayout()
+        self.exclude_specimen_check = QCheckBox("Exclude this specimen pair from analysis")
+        self.exclude_specimen_check.toggled.connect(self._preprocess_exclusion_changed)
+        analysis_row.addWidget(self.exclude_specimen_check)
+        self.exclusion_reason = QLineEdit()
+        self.exclusion_reason.setPlaceholderText("Optional exclusion reason")
+        self.exclusion_reason.editingFinished.connect(self._save_exclusion_reason)
+        analysis_row.addWidget(self.exclusion_reason, 1)
+        self.manage_rois_button = QPushButton("Manage analysis ROIs…")
+        self.manage_rois_button.clicked.connect(self._manage_analysis_rois)
+        analysis_row.addWidget(self.manage_rois_button)
+        self.roi_status = QLabel("Full image")
+        analysis_row.addWidget(self.roi_status)
+        outer.addLayout(analysis_row)
 
         controls = QGroupBox("Adaptive preprocessing settings for this channel")
         controls_layout = QHBoxLayout(controls)
@@ -2667,7 +3317,7 @@ class MainWindow(QMainWindow):
         navigation = QHBoxLayout()
         self.z_label = QLabel("Z: —")
         navigation.addWidget(self.z_label)
-        self.z_slider = QSlider(Qt.Orientation.Horizontal)
+        self.z_slider = AbsoluteSlider(Qt.Orientation.Horizontal)
         self.z_slider.setRange(0, 0)
         self.z_slider.valueChanged.connect(self._z_changed)
         navigation.addWidget(self.z_slider, 1)
@@ -2703,6 +3353,7 @@ class MainWindow(QMainWindow):
             QLabel("Original 16-bit slice (measurements remain tied to this data)")
         )
         self.raw_view = SliceView("Choose a specimen to load a slice")
+        self.raw_view.navigate_requested.connect(self._move_preprocess_specimen)
         raw_layout.addWidget(ZoomControls(self.raw_view))
         raw_scroll = QScrollArea()
         raw_scroll.setWidgetResizable(True)
@@ -2717,6 +3368,7 @@ class MainWindow(QMainWindow):
             QLabel("Background-subtracted and smoothed detection image")
         )
         self.processed_view = SliceView("Processed preview")
+        self.processed_view.navigate_requested.connect(self._move_preprocess_specimen)
         processed_layout.addWidget(ZoomControls(self.processed_view))
         processed_scroll = QScrollArea()
         processed_scroll.setWidgetResizable(True)
@@ -2728,7 +3380,7 @@ class MainWindow(QMainWindow):
 
         batch_row = QHBoxLayout()
         self.preprocessing_status = QLabel(
-            "Save or open a project, tune representative specimens, then preprocess the batch."
+            "Save or open a project, mark both channels for each included specimen, then preprocess the batch."
         )
         self.preprocessing_status.setWordWrap(True)
         batch_row.addWidget(self.preprocessing_status, 1)
@@ -2737,6 +3389,13 @@ class MainWindow(QMainWindow):
         )
         self.run_preprocessing_button.clicked.connect(self._run_batch_preprocessing)
         batch_row.addWidget(self.run_preprocessing_button)
+        self.run_selected_preprocessing_button = QPushButton(
+            "Preprocess selected specimen"
+        )
+        self.run_selected_preprocessing_button.clicked.connect(
+            self._run_selected_preprocessing
+        )
+        batch_row.addWidget(self.run_selected_preprocessing_button)
         self.cancel_preprocessing_button = QPushButton("Cancel after current slice")
         self.cancel_preprocessing_button.clicked.connect(
             self._cancel_batch_preprocessing
@@ -2891,10 +3550,15 @@ class MainWindow(QMainWindow):
             "This execution setting does not invalidate completed masks."
         )
         settings_layout.addRow("Memory strategy:", self.detection_memory_mode)
-        self.apply_detection_button = QPushButton("Save these detection settings")
+        self.apply_detection_button = QPushButton("Save settings for selected specimen")
         self.apply_detection_button.setMinimumHeight(34)
         self.apply_detection_button.clicked.connect(self._apply_detection_settings)
         settings_layout.addRow(self.apply_detection_button)
+        self.apply_detection_defaults_button = QPushButton("Save as batch defaults")
+        self.apply_detection_defaults_button.clicked.connect(
+            self._apply_detection_default_settings
+        )
+        settings_layout.addRow(self.apply_detection_defaults_button)
         side_layout.addWidget(settings_group)
 
         results_group = QGroupBox("Detection status")
@@ -2937,6 +3601,13 @@ class MainWindow(QMainWindow):
         self.run_detection_button.setMinimumHeight(38)
         self.run_detection_button.clicked.connect(self._run_detection)
         results_layout.addWidget(self.run_detection_button)
+        self.run_selected_detection_button = QPushButton(
+            "Redo detection for selected specimen"
+        )
+        self.run_selected_detection_button.clicked.connect(
+            lambda: self._run_selected_detection(None, force=True)
+        )
+        results_layout.addWidget(self.run_selected_detection_button)
         self.cancel_detection_button = QPushButton(
             "Cancel safely after the current step"
         )
@@ -3011,6 +3682,18 @@ class MainWindow(QMainWindow):
         self.review_queue_status = QLabel("No detected specimens are ready for review.")
         self.review_queue_status.setWordWrap(True)
         queue_layout.addWidget(self.review_queue_status)
+        reprocess_buttons = QHBoxLayout()
+        self.review_reprocess_preprocessing_button = QPushButton(
+            "Edit preprocessing and rerun…"
+        )
+        self.review_reprocess_preprocessing_button.clicked.connect(
+            self._review_edit_preprocessing
+        )
+        reprocess_buttons.addWidget(self.review_reprocess_preprocessing_button)
+        self.review_redetect_button = QPushButton("Edit detection and rerun…")
+        self.review_redetect_button.clicked.connect(self._review_edit_detection)
+        reprocess_buttons.addWidget(self.review_redetect_button)
+        queue_layout.addLayout(reprocess_buttons)
         side_layout.addWidget(queue_group)
 
         display_group = QGroupBox("Display")
@@ -3089,6 +3772,7 @@ class MainWindow(QMainWindow):
         self.review_operation = QComboBox()
         for label, value in (
             ("Add missed object", "add"),
+            ("Erase painted dendrite and spine mask", "erase"),
             ("Assign painted dendrite area to spine", "dendrite_to_spine"),
             ("Assign painted spine area to dendrite", "spine_to_dendrite"),
             ("Exclude object", "exclude"),
@@ -3230,6 +3914,36 @@ class MainWindow(QMainWindow):
 
         tab.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.tabs.addTab(tab, "4. Review and correction")
+        shortcut_map = {
+            "Ctrl+1": "add",
+            "Ctrl+2": "exclude",
+            "Ctrl+3": "split",
+            "Ctrl+4": "merge",
+            "Ctrl+5": "spine_to_dendrite",
+            "Ctrl+6": "dendrite_to_spine",
+            "Ctrl+7": "trim",
+            "Ctrl+8": "expand",
+            "Ctrl+9": "erase",
+            "Ctrl+0": "filopodium",
+        }
+        self.review_shortcut_actions = []
+        for shortcut, operation in shortcut_map.items():
+            shortcut_action = QAction(f"Select {operation}", tab)
+            shortcut_action.setShortcut(shortcut)
+            shortcut_action.setShortcutContext(
+                Qt.ShortcutContext.WidgetWithChildrenShortcut
+            )
+            shortcut_action.triggered.connect(
+                lambda _checked=False, value=operation: self._select_review_operation(value)
+            )
+            tab.addAction(shortcut_action)
+            self.review_shortcut_actions.append(shortcut_action)
+        apply_action = QAction("Apply correction", tab)
+        apply_action.setShortcut("Return")
+        apply_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        apply_action.triggered.connect(self._apply_review_shortcut)
+        tab.addAction(apply_action)
+        self.review_shortcut_actions.append(apply_action)
         self._review_tool_changed()
 
     def _build_measurements_tab(self) -> None:
@@ -3289,6 +4003,16 @@ class MainWindow(QMainWindow):
         self.measurement_min_slices.setValue(2)
         self.measurement_min_slices.setSuffix(" slices")
         settings_form.addRow("Always retain at least:", self.measurement_min_slices)
+        self.maximum_centerline_gap = QDoubleSpinBox()
+        self.maximum_centerline_gap.setRange(0.0, 10.0)
+        self.maximum_centerline_gap.setDecimals(2)
+        self.maximum_centerline_gap.setSingleStep(0.1)
+        self.maximum_centerline_gap.setValue(1.0)
+        self.maximum_centerline_gap.setSuffix(" µm")
+        self.maximum_centerline_gap.setToolTip(
+            "Maximum signal-guided virtual bridge for a spine split into exactly two components."
+        )
+        settings_form.addRow("Maximum centerline gap:", self.maximum_centerline_gap)
         self.save_measurement_settings_button = QPushButton(
             "Save these measurement settings"
         )
@@ -3645,8 +4369,30 @@ class MainWindow(QMainWindow):
         self.preprocess_specimen.blockSignals(True)
         self.preprocess_specimen.clear()
         for index, specimen in enumerate(self.manifest["specimens"]):
+            set_count = sum(
+                preprocessing_parameters_set(self.manifest, index, channel)
+                for channel in ("ChanA", "ChanB")
+            )
+            excluded = bool(specimen.get("analysis", {}).get("excluded", False))
+            suffix = (
+                "excluded"
+                if excluded
+                else "reviewed ✓"
+                if set_count == 2
+                else f"marked {set_count}/2"
+            )
             self.preprocess_specimen.addItem(
-                f"{specimen['experimental_group']} — {specimen['specimen_id']}", index
+                f"{specimen['experimental_group']} — {specimen['specimen_id']} [{suffix}]",
+                index,
+            )
+            self.preprocess_specimen.setItemData(
+                self.preprocess_specimen.count() - 1,
+                QColor("#777777")
+                if excluded
+                else QColor("#16823b")
+                if set_count == 2
+                else QColor("#a65a00"),
+                Qt.ItemDataRole.ForegroundRole,
             )
         if current is not None:
             found = self.preprocess_specimen.findData(current)
@@ -3655,8 +4401,14 @@ class MainWindow(QMainWindow):
         roles = self.manifest["channel_roles"]
         for index in range(self.preprocess_channel.count()):
             channel = str(self.preprocess_channel.itemData(index))
+            specimen_index = int(self.preprocess_specimen.currentData() or 0)
+            state = (
+                "marked ✓"
+                if preprocessing_parameters_set(self.manifest, specimen_index, channel)
+                else "not marked"
+            )
             self.preprocess_channel.setItemText(
-                index, f"{channel} — {ROLE_LABELS[str(roles[channel])]}"
+                index, f"{channel} — {ROLE_LABELS[str(roles[channel])]} [{state}]"
             )
         self._preprocess_specimen_changed()
         completed = sum(
@@ -3686,36 +4438,43 @@ class MainWindow(QMainWindow):
             return
         index = self._selected_specimen_index()
         specimen_key = (id(self.manifest), index)
-        if specimen_key != self._preprocess_view_specimen_key:
+        specimen_changed = specimen_key != self._preprocess_view_specimen_key
+        if specimen_changed:
             self.raw_view.reset_view()
             self.processed_view.reset_view()
             self._preprocess_view_specimen_key = specimen_key
         channel = self._selected_preprocess_channel()
         shape = self.manifest["specimens"][index]["channels"][channel]["metadata"]["shape"]
         z_count = 1 if len(shape) == 2 else int(shape[0])
-        representatives = set(
-            int(value)
-            for value in self.manifest["preprocessing"].get(
-                "representative_specimens", []
-            )
-        )
-        self.representative_check.setChecked(index in representatives)
-        special = {
-            int(value)
-            for value in self.manifest["preprocessing"].get(
-                "special_specimens", []
-            )
-        }
-        self.special_preprocessing_check.blockSignals(True)
-        self.special_preprocessing_check.setChecked(index in special)
-        self.special_preprocessing_check.blockSignals(False)
+        specimen = self.manifest["specimens"][index]
+        analysis = specimen.get("analysis", {})
+        self.exclude_specimen_check.blockSignals(True)
+        self.exclude_specimen_check.setChecked(bool(analysis.get("excluded", False)))
+        self.exclude_specimen_check.blockSignals(False)
+        self.exclusion_reason.setText(str(analysis.get("exclusion_reason", "")))
+        rectangles = specimen_rectangles(self.manifest, index, full_if_empty=False)
+        self.roi_status.setText(f"{len(rectangles)} ROI(s)" if rectangles else "Full image")
+        self._preprocess_exclusion_changed(self.exclude_specimen_check.isChecked())
         self.z_slider.blockSignals(True)
         self.z_slider.setRange(0, max(0, z_count - 1))
-        self.z_slider.setValue(max(0, (z_count - 1) // 2))
+        if specimen_changed:
+            self.z_slider.setValue(max(0, (z_count - 1) // 2))
         self.z_slider.blockSignals(False)
         self.z_label.setText(f"Z: {self.z_slider.value() + 1}/{z_count}")
         self._last_preview = None
         self._load_channel_settings()
+        roles = self.manifest["channel_roles"]
+        for combo_index in range(self.preprocess_channel.count()):
+            candidate = str(self.preprocess_channel.itemData(combo_index))
+            state = (
+                "marked ✓"
+                if preprocessing_parameters_set(self.manifest, index, candidate)
+                else "not marked"
+            )
+            self.preprocess_channel.setItemText(
+                combo_index,
+                f"{candidate} — {ROLE_LABELS[str(roles[candidate])]} [{state}]",
+            )
         self._preview_timer.start()
 
     def _preprocess_channel_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
@@ -3725,27 +4484,83 @@ class MainWindow(QMainWindow):
         self._load_channel_settings()
         self._preprocess_specimen_changed()
 
-    def _special_preprocessing_toggled(self, _checked: bool) -> None:
-        if self.manifest is None:
+    def _move_preprocess_specimen(self, delta: int) -> None:
+        if self.preprocess_specimen.count() <= 0:
             return
+        self.preprocess_specimen.setCurrentIndex(
+            max(0, min(self.preprocess_specimen.count() - 1, self.preprocess_specimen.currentIndex() + delta))
+        )
+
+    def _preprocess_exclusion_changed(self, checked: bool) -> None:
+        self.exclusion_reason.setEnabled(checked)
+        self.manage_rois_button.setEnabled(not checked)
+        if self.manifest is None or self.preprocess_specimen.currentData() is None:
+            return
+        index = self._selected_specimen_index()
+        analysis = self.manifest["specimens"][index].setdefault("analysis", {})
+        previous = bool(analysis.get("excluded", False))
+        analysis["excluded"] = bool(checked)
+        if previous != bool(checked):
+            self._invalidate_preprocessing_channels(index, ["ChanA", "ChanB"])
+            if checked:
+                self.manifest["specimens"][index]["checkpoints"]["preprocessing"]["state"] = "excluded"
+            if self.project_path is not None:
+                save_project(self.project_path, self.manifest)
+
+    def _save_exclusion_reason(self) -> None:
+        if self.manifest is None or self.project_path is None or self.preprocess_specimen.currentData() is None:
+            return
+        analysis = self.manifest["specimens"][self._selected_specimen_index()].setdefault("analysis", {})
+        analysis["exclusion_reason"] = self.exclusion_reason.text().strip()
+        save_project(self.project_path, self.manifest)
+
+    @staticmethod
+    def _raw_xy_projection(path: Path) -> np.ndarray:
+        with tifffile.TiffFile(path) as tiff:
+            series = tiff.series[0]
+            shape = tuple(int(value) for value in series.shape)
+            if len(shape) == 2:
+                return np.squeeze(np.asarray(series.asarray()))
+            projection = np.zeros(shape[-2:], dtype=np.uint16)
+            for z_index in range(shape[0]):
+                plane = np.squeeze(np.asarray(series.asarray(key=z_index)))
+                np.maximum(projection, plane, out=projection)
+            return projection
+
+    def _manage_analysis_rois(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        index = self._selected_specimen_index()
+        channel = self._selected_preprocess_channel()
+        source = channel_source_path(
+            self.manifest, self.manifest["specimens"][index]["channels"][channel]
+        )
+        try:
+            projection = self._raw_xy_projection(source)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot load ROI projection", str(exc))
+            return
+        current = specimen_rectangles(self.manifest, index, full_if_empty=False)
+        dialog = AnalysisRoiDialog(projection, current, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated = normalize_rectangles(dialog.rectangles(), projection.shape)
+        if updated == current:
+            return
+        specimen = self.manifest["specimens"][index]
+        specimen.setdefault("analysis", {})["rois_xy"] = rectangle_records(updated)
+        self._invalidate_preprocessing_channels(index, ["ChanA", "ChanB"])
+        save_project(self.project_path, self.manifest)
+        self.roi_status.setText(f"{len(updated)} ROI(s)" if updated else "Full image")
         self._last_preview = None
-        self._load_channel_settings()
-        self._preview_timer.start()
+        self._request_preview()
 
     def _load_channel_settings(self) -> None:
         if self.manifest is None:
             return
         channel = self._selected_preprocess_channel()
         specimen_index = self._selected_specimen_index()
-        preprocessing = self.manifest["preprocessing"]
-        saved = preprocessing.get("settings_by_specimen", {}).get(
-            str(specimen_index), {}
-        )
-        if self.special_preprocessing_check.isChecked() and channel in saved:
-            value = saved[channel]
-        else:
-            value = preprocessing["settings_by_channel"][channel]
-        settings = PreprocessingSettings.from_dict(value)
+        settings = effective_preprocessing_settings(self.manifest, specimen_index, channel)
         for widget, value in (
             (self.background_spin, settings.background_percentile),
             (self.sigma_xy_spin, settings.gaussian_sigma_xy_um),
@@ -3797,12 +4612,7 @@ class MainWindow(QMainWindow):
             save_project(self.project_path, self.manifest)
             self._last_preview = None
             self.preprocessing_status.setText(
-                f"Saved {channel} "
-                + (
-                    "special settings for this pair"
-                    if self.special_preprocessing_check.isChecked()
-                    else "batch-default settings"
-                )
+                f"Saved independent {channel} settings"
                 + (
                     f"; invalidated {invalidated} affected preprocessing checkpoint(s)."
                     if invalidated
@@ -3811,6 +4621,7 @@ class MainWindow(QMainWindow):
                 + " Previewing with the updated parameters."
             )
             self._request_preview()
+            self._prepare_preprocessing_tab()
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot apply settings", str(exc))
 
@@ -3828,33 +4639,23 @@ class MainWindow(QMainWindow):
         specimen_index = self._selected_specimen_index()
         settings = self._current_preprocessing_settings().to_dict()
         preprocessing = self.manifest["preprocessing"]
-        representatives = {
-            int(value)
-            for value in preprocessing.get("representative_specimens", [])
-        }
-        if self.representative_check.isChecked():
-            representatives.add(specimen_index)
-        else:
-            representatives.discard(specimen_index)
-        preprocessing["representative_specimens"] = sorted(representatives)
+        by_specimen = preprocessing.setdefault("settings_by_specimen", {})
+        set_by_specimen = preprocessing.setdefault("parameters_set_by_specimen", {})
 
-        special = {
-            int(value) for value in preprocessing.get("special_specimens", [])
-        }
-        if self.special_preprocessing_check.isChecked():
-            special.add(specimen_index)
-            by_specimen = preprocessing.setdefault("settings_by_specimen", {})
-            specimen_settings = by_specimen.setdefault(str(specimen_index), {})
-            for candidate_channel in ("ChanA", "ChanB"):
-                specimen_settings.setdefault(
-                    candidate_channel,
-                    dict(preprocessing["settings_by_channel"][candidate_channel]),
-                )
-            specimen_settings[channel] = settings
-        else:
-            special.discard(specimen_index)
-            preprocessing["settings_by_channel"][channel] = settings
-        preprocessing["special_specimens"] = sorted(special)
+        def save_for(index: int) -> None:
+            by_specimen.setdefault(str(index), {})[channel] = dict(settings)
+            set_values = set(set_by_specimen.setdefault(str(index), []))
+            set_values.add(channel)
+            set_by_specimen[str(index)] = sorted(set_values)
+
+        save_for(specimen_index)
+        if self.fill_unset_preprocessing_check.isChecked():
+            for index, specimen in enumerate(self.manifest["specimens"]):
+                if bool(specimen.get("analysis", {}).get("excluded", False)):
+                    continue
+                if not preprocessing_parameters_set(self.manifest, index, channel):
+                    save_for(index)
+            self.fill_unset_preprocessing_check.setChecked(False)
 
         changed: dict[int, list[str]] = {}
         for key, prior in before.items():
@@ -3892,6 +4693,9 @@ class MainWindow(QMainWindow):
 
     def _preview_cache_key(self) -> tuple[object, ...]:
         settings = self._current_preprocessing_settings()
+        rectangles = specimen_rectangles(
+            self.manifest, self._selected_specimen_index()
+        ) if self.manifest is not None else []
         return (
             self._selected_specimen_index(),
             self._selected_preprocess_channel(),
@@ -3899,6 +4703,7 @@ class MainWindow(QMainWindow):
             settings.gaussian_sigma_xy_um,
             settings.gaussian_sigma_z_um,
             settings.threshold_sensitivity,
+            tuple(rectangles),
         )
 
     def _z_changed(self, value: int) -> None:
@@ -3929,6 +4734,7 @@ class MainWindow(QMainWindow):
                 float(calibration["z_step_um"]),
                 self._preview_statistics.get(key),
                 key,
+                specimen_rectangles(self.manifest, index),
             )
             worker.completed.connect(self._preview_completed)
             self._start_worker(worker, "preview")
@@ -3938,7 +4744,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _preview_completed(self, payload: tuple[tuple[object, ...], PreviewResult]) -> None:
         key, result = payload
-        sensitivity = float(key[-1])
+        sensitivity = float(key[-2])
         self._preview_statistics[key] = StackStatistics(
             background=result.background,
             otsu_threshold=result.threshold * sensitivity,
@@ -3995,10 +4801,69 @@ class MainWindow(QMainWindow):
             self._sync_manifest_edits()
             self._store_preprocessing_selection()
             save_project(self.project_path, self.manifest)
+            unset = [
+                f"{specimen['specimen_id']} {channel}"
+                for index, specimen in enumerate(self.manifest["specimens"])
+                if not bool(specimen.get("analysis", {}).get("excluded", False))
+                for channel in ("ChanA", "ChanB")
+                if not preprocessing_parameters_set(self.manifest, index, channel)
+            ]
+            if unset:
+                raise ValueError(
+                    "Set preprocessing parameters for every included image first. Unset: "
+                    + ", ".join(unset[:12])
+                    + ("…" if len(unset) > 12 else "")
+                )
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot start preprocessing", str(exc))
             return
         worker = BatchPreprocessWorker(self.manifest, self.project_path)
+        worker.completed.connect(self._batch_preprocessing_completed)
+        worker.cancelled.connect(self._batch_preprocessing_cancelled)
+        self._start_worker(worker, "preprocess")
+
+    def _run_selected_preprocessing(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        try:
+            index = self._selected_specimen_index()
+            specimen = self.manifest["specimens"][index]
+            has_review_work = bool(specimen.get("review", {}).get("history")) or (
+                specimen.get("checkpoints", {}).get("review", {}).get("state")
+                not in {None, "not_started"}
+            )
+            if has_review_work:
+                answer = QMessageBox.warning(
+                    self,
+                    "Discard manual corrections?",
+                    "Reprocessing permanently discards all manual corrections and their history "
+                    "for this specimen. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            self._store_preprocessing_selection()
+            missing = [
+                channel
+                for channel in ("ChanA", "ChanB")
+                if not preprocessing_parameters_set(self.manifest, index, channel)
+            ]
+            if missing:
+                raise ValueError(
+                    "Set both channel parameters before reprocessing this specimen: "
+                    + ", ".join(missing)
+                )
+            if bool(specimen.get("analysis", {}).get("excluded", False)):
+                raise ValueError("This specimen is excluded from analysis.")
+            if has_review_work:
+                discard_specimen_review(self.manifest, self.project_path, index)
+            save_project(self.project_path, self.manifest)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot reprocess specimen", str(exc))
+            return
+        self._pending_detection_after_preprocess = index
+        worker = BatchPreprocessWorker(self.manifest, self.project_path, [index])
         worker.completed.connect(self._batch_preprocessing_completed)
         worker.cancelled.connect(self._batch_preprocessing_cancelled)
         self._start_worker(worker, "preprocess")
@@ -4013,6 +4878,9 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _batch_preprocessing_completed(self, result: dict[str, object]) -> None:
+        self._pending_detection_ready = getattr(
+            self, "_pending_detection_after_preprocess", None
+        )
         elapsed = float(result["elapsed_seconds"])
         self.preprocessing_status.setText(
             f"Batch preprocessing complete in {elapsed / 60:.1f} min. "
@@ -4025,6 +4893,8 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _batch_preprocessing_cancelled(self, message: str) -> None:
+        self._pending_detection_after_preprocess = None
+        self._pending_detection_ready = None
         self.preprocessing_status.setText(message)
         if self.project_path is not None and self.manifest is not None:
             save_project(self.project_path, self.manifest)
@@ -4120,18 +4990,36 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No project", "Save or open a project first.")
             return
         try:
-            self.manifest["detection"]["settings"] = (
-                self._current_detection_settings().to_dict()
-            )
+            if self.detection_specimen.currentData() is None:
+                raise ValueError("Select a specimen first.")
+            index = int(self.detection_specimen.currentData())
+            self.manifest["detection"].setdefault("settings_by_specimen", {})[
+                str(index)
+            ] = self._current_detection_settings().to_dict()
             self.manifest["detection"]["memory_mode"] = str(
                 self.detection_memory_mode.currentData() or AUTOMATIC_MEMORY_MODE
             )
             save_project(self.project_path, self.manifest)
             self.detection_status.setText(
-                "Detection settings saved. Running again will replace stale automatic masks."
+                "Specimen-specific detection settings saved. Redo detection to apply them."
             )
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot save detection settings", str(exc))
+
+    def _apply_detection_default_settings(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        try:
+            self.manifest["detection"]["settings"] = self._current_detection_settings().to_dict()
+            self.manifest["detection"]["memory_mode"] = str(
+                self.detection_memory_mode.currentData() or AUTOMATIC_MEMORY_MODE
+            )
+            save_project(self.project_path, self.manifest)
+            self.detection_status.setText(
+                "Batch defaults saved. Existing specimen-specific overrides were preserved."
+            )
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot save detection defaults", str(exc))
 
     def _run_detection(self) -> None:
         if self.manifest is None or self.project_path is None:
@@ -4139,9 +5027,6 @@ class MainWindow(QMainWindow):
             return
         try:
             self._sync_manifest_edits()
-            self.manifest["detection"]["settings"] = (
-                self._current_detection_settings().to_dict()
-            )
             self.manifest["detection"]["memory_mode"] = str(
                 self.detection_memory_mode.currentData() or AUTOMATIC_MEMORY_MODE
             )
@@ -4150,6 +5035,54 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot start detection", str(exc))
             return
         worker = DetectionWorker(self.manifest, self.project_path)
+        worker.pair_completed.connect(self._detection_pair_completed)
+        worker.completed.connect(self._detection_completed)
+        worker.cancelled.connect(self._detection_cancelled)
+        self._start_worker(worker, "detection")
+
+    def _run_selected_detection(
+        self, specimen_index: int | None = None, *, force: bool = True
+    ) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        try:
+            index = (
+                int(self.detection_specimen.currentData())
+                if specimen_index is None
+                else int(specimen_index)
+            )
+            specimen = self.manifest["specimens"][index]
+            if specimen["checkpoints"]["preprocessing"].get("state") != "complete":
+                raise ValueError("Preprocessing must be complete for this specimen.")
+            if bool(specimen.get("analysis", {}).get("excluded", False)):
+                raise ValueError("This specimen is excluded from analysis.")
+            has_review_work = bool(specimen.get("review", {}).get("history")) or (
+                specimen.get("checkpoints", {}).get("review", {}).get("state")
+                not in {None, "not_started"}
+            )
+            if has_review_work:
+                answer = QMessageBox.warning(
+                    self,
+                    "Discard manual corrections?",
+                    "Redoing detection permanently discards all manual corrections and their "
+                    "history for this specimen. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            if specimen_index is None:
+                self.manifest["detection"].setdefault("settings_by_specimen", {})[
+                    str(index)
+                ] = self._current_detection_settings().to_dict()
+            discard_specimen_review(self.manifest, self.project_path, index)
+            save_project(self.project_path, self.manifest)
+        except (TypeError, ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot redo detection", str(exc))
+            return
+        worker = DetectionWorker(
+            self.manifest, self.project_path, [index], force=force
+        )
         worker.pair_completed.connect(self._detection_pair_completed)
         worker.completed.connect(self._detection_completed)
         worker.cancelled.connect(self._detection_cancelled)
@@ -4235,6 +5168,19 @@ class MainWindow(QMainWindow):
         if specimen_key != self._detection_view_specimen_key:
             self.detection_view.reset_view()
             self._detection_view_specimen_key = specimen_key
+        settings = effective_detection_settings(self.manifest, index)
+        for widget, value in (
+            (self.dendrite_detection_sensitivity, settings.dendrite_sensitivity),
+            (self.cluster_detection_sensitivity, settings.cluster_sensitivity),
+            (self.spine_branch_length, settings.spine_branch_length_um),
+            (self.minimum_dendrite_length, settings.minimum_dendrite_length_um),
+            (self.minimum_spine_pixels, settings.minimum_spine_projection_pixels),
+            (self.minimum_cluster_voxels, settings.minimum_cluster_voxels),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self._update_sensitivity_warnings()
         channel = str(self.detection_background_channel.currentData() or "ChanB")
         shape = self.manifest["specimens"][index]["channels"][channel]["metadata"]["shape"]
         z_count = 1 if len(shape) == 2 else int(shape[0])
@@ -4386,6 +5332,7 @@ class MainWindow(QMainWindow):
             fixed_end_slices=self.measurement_fixed_slices.value(),
             adaptive_area_factor=self.measurement_area_factor.value(),
             minimum_retained_slices=self.measurement_min_slices.value(),
+            maximum_centerline_gap_um=self.maximum_centerline_gap.value(),
         )
 
     def _measurement_method_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
@@ -4413,6 +5360,7 @@ class MainWindow(QMainWindow):
             self.measurement_fixed_slices,
             self.measurement_area_factor,
             self.measurement_min_slices,
+            self.maximum_centerline_gap,
         )
         for control in controls:
             control.blockSignals(True)
@@ -4426,6 +5374,7 @@ class MainWindow(QMainWindow):
         self.measurement_fixed_slices.setValue(settings.fixed_end_slices)
         self.measurement_area_factor.setValue(settings.adaptive_area_factor)
         self.measurement_min_slices.setValue(settings.minimum_retained_slices)
+        self.maximum_centerline_gap.setValue(settings.maximum_centerline_gap_um)
         self.measurement_end_method.blockSignals(False)
         for control in controls:
             control.blockSignals(False)
@@ -4821,6 +5770,11 @@ class MainWindow(QMainWindow):
             f"Spine {preview.row['spine_id']} | {preview.row['distribution_axis_status']} | "
             f"protein-cluster-positive | shaft-to-tip ratios: "
             + ", ".join("blank" if value is None else f"{float(value):.3g}" for value in ratios)
+            + (
+                f". Orange marks show a {float(preview.row.get('centerline_bridge_length_um', 0.0)):.3f} µm virtual bridge; review before inclusion."
+                if bool(preview.row.get("centerline_bridge_used", False))
+                else ""
+            )
             + ". Click either crop to locate it in the full specimen."
         )
         self.measurement_result_tabs.setCurrentIndex(1)
@@ -4832,6 +5786,7 @@ class MainWindow(QMainWindow):
         axis_xy: tuple[tuple[int, int], ...],
         base_xy: tuple[int, int] | None = None,
         endpoint_xy: tuple[int, int] | None = None,
+        bridge_xy: tuple[tuple[int, int], ...] = (),
     ) -> np.ndarray:
         low, high = np.percentile(raw, (0.5, 99.8))
         scale = max(1.0, float(high - low))
@@ -4844,6 +5799,9 @@ class MainWindow(QMainWindow):
         for x, y in axis_xy:
             if 0 <= y < rgb.shape[0] and 0 <= x < rgb.shape[1]:
                 rgb[max(0, y - 1) : y + 2, max(0, x - 1) : x + 2] = 255
+        for index, (x, y) in enumerate(bridge_xy):
+            if index % 2 == 0 and 0 <= y < rgb.shape[0] and 0 <= x < rgb.shape[1]:
+                rgb[max(0, y - 2) : y + 3, max(0, x - 2) : x + 3] = (255, 145, 20)
         for point, color in (
             (base_xy, np.asarray((32, 220, 88), dtype=np.uint8)),
             (endpoint_xy, np.asarray((238, 50, 200), dtype=np.uint8)),
@@ -4882,7 +5840,12 @@ class MainWindow(QMainWindow):
                 and preview.endpoint_local_zyx[0] == z_index
                 else None
             )
-            rgb = self._distribution_overlay(raw, bins, axis, base, endpoint)
+            bridge = tuple(
+                (point[2], point[1])
+                for point in preview.bridge_points_local_zyx
+                if point[0] == z_index
+            )
+            rgb = self._distribution_overlay(raw, bins, axis, base, endpoint, bridge)
             self.distribution_z_label.setText(
                 f"Spine Z: {z_index + 1} "
                 f"({preview.spine_z_range[0] + 1}–{preview.spine_z_range[1] + 1})"
@@ -4904,6 +5867,7 @@ class MainWindow(QMainWindow):
                 preview.axis_xy,
                 base,
                 endpoint,
+                tuple((point[2], point[1]) for point in preview.bridge_points_local_zyx),
             )
         self.distribution_dendrite_view.show_rgb(rgb)
 
@@ -5290,6 +6254,7 @@ class MainWindow(QMainWindow):
         if self.review_view_mode.currentData() == "xy_max":
             self._load_review_projection(auto_contrast=auto_contrast)
             return
+        started = time.monotonic()
         try:
             self._last_review = load_review_slice(
                 self.manifest,
@@ -5301,7 +6266,22 @@ class MainWindow(QMainWindow):
                 self._auto_review_contrast()
             else:
                 self._render_review_view()
+            self._record_diagnostic(
+                "review_slice_loaded",
+                scope="correction",
+                specimen_index=self._selected_review_specimen(),
+                z_index=self.review_z_slider.value(),
+                duration_seconds=round(time.monotonic() - started, 6),
+                corrected=self._last_review.corrected,
+            )
         except (OSError, ValueError, KeyError, IndexError) as exc:
+            self._record_diagnostic(
+                "review_slice_load_failed",
+                scope="correction",
+                duration_seconds=round(time.monotonic() - started, 6),
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
             self.review_view.setText(f"Cannot load review slice: {exc}")
 
     def _load_review_projection(self, *, auto_contrast: bool) -> None:
@@ -5437,6 +6417,11 @@ class MainWindow(QMainWindow):
                 "3D region. Touching new regions become one object; a region touching exactly "
                 "one existing object joins its stable ID. Ambiguous contact is skipped."
             ),
+            "erase": (
+                "Erase literal painted mask voxels from both dendrites and spines. In a single "
+                "Z slice only that slice is changed; on the XY projection all painted Z columns "
+                "are cleared. Object IDs are preserved."
+            ),
             "dendrite_to_spine": (
                 "On the XY maximum projection, paint across exactly one spine and any dendrite "
                 "area that belongs to it. Covered dendrite voxels in every Z slice are transferred "
@@ -5469,6 +6454,7 @@ class MainWindow(QMainWindow):
             "filopodium",
             "dendrite_to_spine",
             "spine_to_dendrite",
+            "erase",
         }
         self.review_object_type.setEnabled(available and not has_fixed_type)
         sensitivity_enabled = available and operation in {"add", "expand", "trim"}
@@ -5484,6 +6470,44 @@ class MainWindow(QMainWindow):
         drawing_available = available and not self._review_projection_loading
         self.review_view.setEnabled(drawing_available)
         self.apply_review_button.setEnabled(drawing_available and projection_valid)
+
+    def _select_review_operation(self, operation: str) -> None:
+        index = self.review_operation.findData(operation)
+        if index >= 0:
+            self.review_operation.setCurrentIndex(index)
+
+    def _apply_review_shortcut(self) -> None:
+        if isinstance(QApplication.focusWidget(), QLineEdit):
+            return
+        self._apply_review_action()
+
+    def _review_edit_preprocessing(self) -> None:
+        if self.review_specimen.currentData() is None:
+            return
+        specimen_index = int(self.review_specimen.currentData())
+        self._prepare_preprocessing_tab()
+        row = self.preprocess_specimen.findData(specimen_index)
+        if row >= 0:
+            self.preprocess_specimen.setCurrentIndex(row)
+        self.tabs.setCurrentIndex(1)
+        self.preprocessing_status.setText(
+            "Edit both channel parameters or ROIs, then choose ‘Preprocess selected specimen’. "
+            "Detection will rerun automatically and existing corrections will be discarded."
+        )
+
+    def _review_edit_detection(self) -> None:
+        if self.review_specimen.currentData() is None:
+            return
+        specimen_index = int(self.review_specimen.currentData())
+        self._prepare_detection_tab()
+        row = self.detection_specimen.findData(specimen_index)
+        if row >= 0:
+            self.detection_specimen.setCurrentIndex(row)
+        self.tabs.setCurrentIndex(2)
+        self.detection_status.setText(
+            "Edit specimen-specific settings, then choose ‘Redo detection for selected specimen’. "
+            "Existing corrections will be permanently discarded."
+        )
 
     def _review_brush_changed(self, value: int) -> None:
         self.review_view.set_brush_diameter(value)
@@ -5556,7 +6580,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No specimen", str(exc))
             return
         worker = ReviewWorker(
-            self.manifest, self.project_path, specimen_index, action
+            self.manifest,
+            self.project_path,
+            specimen_index,
+            action,
+            diagnostic=self._diagnostic_callback(),
         )
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -5570,6 +6598,7 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
         self._review_thread = thread
         self._review_worker = worker
+        self._diagnostic_review_phase = None
         self._set_review_busy(True)
         thread.start()
 
@@ -5581,6 +6610,16 @@ class MainWindow(QMainWindow):
         self.review_progress.setRange(0, max(1, total))
         self.review_progress.setValue(current)
         self.review_status.setText(f"{phase}: {detail}")
+        if phase != self._diagnostic_review_phase or current >= total:
+            self._record_diagnostic(
+                "correction_progress",
+                scope="correction",
+                phase=phase,
+                current=current,
+                total=total,
+                detail=detail,
+            )
+            self._diagnostic_review_phase = phase
 
     @Slot(object)
     def _review_action_completed(self, result) -> None:  # type: ignore[no-untyped-def]
@@ -5964,6 +7003,17 @@ class MainWindow(QMainWindow):
         self._context_thread = thread
         self._context_worker = worker
         self._context_request = request
+        self._diagnostic_context_started_at = time.monotonic()
+        self._diagnostic_context_phase = None
+        self._record_diagnostic(
+            "context_generation_started",
+            scope="correction" if bool(corrected) else "full",
+            specimen_index=int(specimen_index),
+            corrected=bool(corrected),
+            include_3d=bool(include_3d),
+            roi_xy=list(roi_xy) if roi_xy is not None else None,
+            request_view=str(request[4]),
+        )
         self.context_status_label.setText("Preparing projections and 3D objects…")
         self.context_status_progress.setRange(0, 1)
         self.context_status_progress.setValue(0)
@@ -5978,6 +7028,17 @@ class MainWindow(QMainWindow):
         self.context_status_progress.setRange(0, max(1, total))
         self.context_status_progress.setValue(current)
         self.context_status_label.setText(f"{phase}: {detail}")
+        if phase != self._diagnostic_context_phase or current >= total:
+            corrected = bool(self._context_request[3]) if self._context_request else False
+            self._record_diagnostic(
+                "context_generation_progress",
+                scope="correction" if corrected else "full",
+                phase=phase,
+                current=current,
+                total=total,
+                detail=detail,
+            )
+            self._diagnostic_context_phase = phase
 
     def _cancel_context_generation(self) -> None:
         if self._context_worker is None:
@@ -5993,6 +7054,16 @@ class MainWindow(QMainWindow):
         if self._context_request is None:
             return
         cache_key = self._context_request[0]
+        self._record_diagnostic(
+            "context_generation_completed",
+            scope="correction" if bool(self._context_request[3]) else "full",
+            duration_seconds=round(
+                time.monotonic() - self._diagnostic_context_started_at, 6
+            ),
+            corrected=bool(self._context_request[3]),
+            include_3d=bool(self._context_request[6]),
+            request_view=str(self._context_request[4]),
+        )
         self._context_cache[cache_key] = volume
         while len(self._context_cache) > 2:
             oldest = next(iter(self._context_cache))
@@ -6135,6 +7206,15 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _context_failed(self, message: str) -> None:
+        corrected = bool(self._context_request[3]) if self._context_request else False
+        self._record_diagnostic(
+            "context_generation_failed",
+            scope="correction" if corrected else "full",
+            duration_seconds=round(
+                time.monotonic() - self._diagnostic_context_started_at, 6
+            ),
+            error_message=message,
+        )
         QMessageBox.warning(self, "Cannot generate 3D context", message)
 
     @Slot(str)
@@ -6268,6 +7348,7 @@ class MainWindow(QMainWindow):
         self._progress_last_current = 0
         self._progress_last_total = 0
         self._progress_rate_ema = None
+        self._diagnostic_job_phase = None
         batch_widgets = self._batch_progress_widgets(kind)
         if batch_widgets is not None:
             batch_bar, batch_label = batch_widgets
@@ -6276,6 +7357,7 @@ class MainWindow(QMainWindow):
             batch_bar.setFormat("Starting…")
             batch_label.setText("Batch progress: starting; estimating remaining time…")
         self._set_job_running(True)
+        self._record_diagnostic("operation_started", kind=kind)
         thread.start()
 
     @Slot(str, int, int, str)
@@ -6329,10 +7411,30 @@ class MainWindow(QMainWindow):
             batch_bar.setValue(current)
             batch_bar.setFormat("%p% — %v/%m")
             batch_label.setText(progress_text)
+        if phase != self._diagnostic_job_phase or current >= total:
+            self._record_diagnostic(
+                "operation_progress",
+                kind=self._job_kind,
+                phase=phase,
+                current=current,
+                total=total,
+                detail=detail,
+            )
+            self._diagnostic_job_phase = phase
 
     @Slot(str)
     def _job_failed(self, message: str) -> None:
+        self._record_diagnostic(
+            "operation_failed",
+            kind=self._job_kind,
+            duration_seconds=round(
+                max(0.0, time.monotonic() - self._progress_started_at), 6
+            ),
+            error_message=message,
+        )
         if self._job_kind == "preprocess" and self.manifest is not None:
+            self._pending_detection_after_preprocess = None
+            self._pending_detection_ready = None
             self.preprocessing_status.setText(
                 "Preprocessing stopped with an error. Completed cache slices remain resumable."
             )
@@ -6353,6 +7455,13 @@ class MainWindow(QMainWindow):
     @Slot()
     def _worker_finished(self) -> None:
         finished_kind = self._job_kind
+        self._record_diagnostic(
+            "operation_finished",
+            kind=finished_kind,
+            duration_seconds=round(
+                max(0.0, time.monotonic() - self._progress_started_at), 6
+            ),
+        )
         finished_widgets = self._batch_progress_widgets(finished_kind)
         if finished_widgets is not None:
             finished_bar, finished_label = finished_widgets
@@ -6380,6 +7489,27 @@ class MainWindow(QMainWindow):
         elif finished_kind == "centerline_hint" and self._centerline_hint_pending_reload:
             self._centerline_hint_pending_reload = False
             QTimer.singleShot(0, self._distribution_spine_changed)
+        elif finished_kind == "preprocess":
+            pending = getattr(self, "_pending_detection_ready", None)
+            self._pending_detection_after_preprocess = None
+            self._pending_detection_ready = None
+            if pending is not None:
+                QTimer.singleShot(
+                    0, lambda index=pending: self._run_selected_detection(index, force=True)
+                )
+        elif finished_kind == "transfer_import" and self._pending_transfer_recovery:
+            request = self._pending_transfer_recovery
+            self._pending_transfer_recovery = None
+            QTimer.singleShot(
+                0,
+                lambda saved=request: self._start_transfer_import(
+                    saved[0],
+                    saved[1],
+                    saved[2],
+                    saved[3],
+                    recover_as_settings_only=True,
+                ),
+            )
 
     @Slot(object)
     def _scan_completed(self, report: ScanReport) -> None:
@@ -6538,6 +7668,10 @@ class MainWindow(QMainWindow):
             if self.project_path is None:
                 raise ValueError("No project filename was selected.")
             self.project_path = save_project(self.project_path, self.manifest)
+            self._record_diagnostic_project_context()
+            self._record_diagnostic(
+                "project_saved", project_path=self.project_path
+            )
             self._prepare_preprocessing_tab()
             self._prepare_detection_tab()
             self._prepare_review_tab()
@@ -6555,12 +7689,20 @@ class MainWindow(QMainWindow):
             return
         selected, _ = QFileDialog.getOpenFileName(
             self,
-            "Open Synpo project",
+            "Open Synpo project or transfer ZIP",
             "",
-            "Synpo project (*.synpo.json);;JSON files (*.json)",
+            "Synpo projects and transfers (*.synpo.json *.synpo-transfer.zip);;"
+            "Synpo project (*.synpo.json);;Synpo transfer (*.synpo-transfer.zip);;"
+            "JSON files (*.json)",
         )
         if not selected:
             return
+        if selected.casefold().endswith(TRANSFER_SUFFIX):
+            self._open_transfer_archive(Path(selected))
+            return
+        self._activate_project(Path(selected))
+
+    def _activate_project(self, selected: Path) -> None:
         try:
             manifest = load_project(selected)
             quick_results = verify_project_sources(manifest, full_checksums=False)
@@ -6574,7 +7716,11 @@ class MainWindow(QMainWindow):
             dialog.close()
         self._context_cache.clear()
         self.manifest = manifest
-        self.project_path = Path(selected).resolve()
+        self.project_path = selected.resolve()
+        self._record_diagnostic_project_context()
+        self._record_diagnostic(
+            "project_opened", project_path=self.project_path
+        )
         self._populate_manifest(manifest)
         self._prepare_preprocessing_tab()
         self._prepare_detection_tab()
@@ -6592,6 +7738,192 @@ class MainWindow(QMainWindow):
                 "for full SHA-256 verification."
             )
         self.setWindowTitle(f"Synpo Microscopy Processor — {self.project_path.name}")
+
+    def _create_transfer_zip(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            QMessageBox.information(
+                self, "No saved project", "Open or save a project before creating a transfer ZIP."
+            )
+            return
+        try:
+            self._sync_manifest_edits()
+            self.project_path = save_project(self.project_path, self.manifest)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot create transfer", str(exc))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Create transfer ZIP")
+        layout = QVBoxLayout(dialog)
+        explanation = QLabel(
+            "Full project state includes cached preprocessing, detection, manual corrections, "
+            "and measurements. Settings only keeps parameters, labels, exclusions, ROIs, and "
+            "specimen comments, but starts analysis from the beginning."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        form = QFormLayout()
+        mode_combo = QComboBox()
+        mode_combo.addItem("Full project state", "full")
+        mode_combo.addItem("Settings only", "settings_only")
+        form.addRow("Transfer contents:", mode_combo)
+        include_raw = QCheckBox("Include raw TIFF files")
+        include_raw.setChecked(False)
+        form.addRow(include_raw)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        base = self.project_path.name[: -len(".synpo.json")]
+        suggested = self.project_path.parent / f"{base}{TRANSFER_SUFFIX}"
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Synpo transfer ZIP",
+            str(suggested),
+            "Synpo transfer (*.synpo-transfer.zip)",
+        )
+        if not selected:
+            return
+        worker = TransferCreateWorker(
+            self.manifest,
+            self.project_path,
+            Path(selected),
+            str(mode_combo.currentData()),
+            include_raw.isChecked(),
+        )
+        worker.completed.connect(self._transfer_created)
+        self._start_worker(worker, "transfer_create")
+
+    @Slot(object)
+    def _transfer_created(self, archive_path: Path) -> None:
+        self.statusBar().showMessage(f"Created transfer ZIP: {archive_path}", 12000)
+        QMessageBox.information(
+            self,
+            "Transfer created",
+            f"The verified transfer ZIP was created successfully:\n\n{archive_path}",
+        )
+
+    def _open_transfer_archive(self, archive_path: Path) -> None:
+        try:
+            info = inspect_transfer_archive(archive_path)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Cannot open transfer", str(exc))
+            return
+        destination = QFileDialog.getExistingDirectory(
+            self,
+            "Choose where to create the transferred project folder",
+            str(archive_path.parent),
+        )
+        if not destination:
+            return
+        raw_directory: Path | None = None
+        if not info.include_raw:
+            selected_raw = QFileDialog.getExistingDirectory(
+                self,
+                "Select the folder containing the raw TIFF files",
+                str(archive_path.parent),
+            )
+            if not selected_raw:
+                return
+            raw_directory = Path(selected_raw)
+
+        folder_name = re.sub(
+            r"[^A-Za-z0-9._-]+", "-", info.project_name[: -len(".synpo.json")]
+        ).strip(".-") or "Synpo-project"
+        existing = Path(destination).resolve() / folder_name
+        conflict_policy = "copy"
+        if existing.exists():
+            answer = QMessageBox.question(
+                self,
+                "Project folder already exists",
+                f"{existing} already exists.\n\n"
+                "Choose Yes to replace it, No to create another numbered copy, "
+                "or Cancel to stop. Replacing removes the old folder only after the "
+                "transfer has passed validation.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return
+            conflict_policy = (
+                "replace" if answer == QMessageBox.StandardButton.Yes else "copy"
+            )
+        self._start_transfer_import(
+            archive_path,
+            Path(destination),
+            raw_directory,
+            conflict_policy,
+            recover_as_settings_only=False,
+        )
+
+    def _start_transfer_import(
+        self,
+        archive_path: Path,
+        destination: Path,
+        raw_directory: Path | None,
+        conflict_policy: str,
+        *,
+        recover_as_settings_only: bool,
+    ) -> None:
+        worker = TransferImportWorker(
+            archive_path,
+            destination,
+            raw_directory,
+            conflict_policy,
+            recover_as_settings_only,
+        )
+        request = (archive_path, destination, raw_directory, conflict_policy)
+        worker.completed.connect(
+            lambda result, saved_request=request: self._transfer_import_completed(
+                result, saved_request
+            )
+        )
+        self._start_worker(worker, "transfer_import")
+
+    def _transfer_import_completed(
+        self,
+        result: TransferImportResult | TransferCacheError,
+        request: tuple[Path, Path, Path | None, str],
+    ) -> None:
+        if isinstance(result, TransferCacheError):
+            answer = QMessageBox.question(
+                self,
+                "Cached results cannot be restored",
+                f"{result}\n\nRecover this archive as a settings-only project instead? "
+                "Parameters, labels, exclusions, ROIs, and specimen comments will be kept, "
+                "but processing and correction state will be reset.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._pending_transfer_recovery = request
+            return
+        self._activate_project(result.project_path)
+        match_note = (
+            f" {result.renamed_source_matches} renamed TIFF file(s) were recovered by "
+            "size and SHA-256 checksum."
+            if result.renamed_source_matches
+            else ""
+        )
+        recovery_note = (
+            " The damaged cache was discarded and the project was recovered as settings-only."
+            if result.recovered_as_settings_only
+            else ""
+        )
+        QMessageBox.information(
+            self,
+            "Transfer imported",
+            f"The transferred project is ready:\n\n{result.project_path}\n\n"
+            f"The original ZIP was not changed.{match_note}{recovery_note}",
+        )
 
     def _populate_manifest(self, manifest: dict[str, object]) -> None:
         self.source_edit.setText(str(manifest["source_directory"]))
@@ -6686,10 +8018,21 @@ class MainWindow(QMainWindow):
                 self.source_edit.setText(str(self.manifest["source_directory"]))
                 if self.project_path is not None:
                     save_project(self.project_path, self.manifest)
+                renamed = sum(
+                    item.get("matched_by") == "size_and_sha256" for item in results
+                )
+                duplicates = sum(int(item.get("duplicate_matches", 0)) for item in results)
                 message = (
                     "All checksums match. Each source file path was relinked and saved; "
                     "subfolders were searched when necessary."
                 )
+                if renamed:
+                    message += f" {renamed} renamed file(s) were identified by size and SHA-256."
+                if duplicates:
+                    message += (
+                        f" {duplicates} additional identical copy/copies were found; "
+                        "the first sorted match was used."
+                    )
             else:
                 message = "All source files passed full SHA-256 verification."
             QMessageBox.information(self, "Source verification", message)
@@ -6733,11 +8076,15 @@ class MainWindow(QMainWindow):
             self.save_action,
             self.verify_action,
             self.relink_action,
+            self.create_transfer_action,
         ):
             action.setEnabled(not running)
         if hasattr(self, "run_preprocessing_button"):
             self.run_preprocessing_button.setEnabled(not running and self.manifest is not None)
             self.apply_preprocessing_button.setEnabled(not running and self.manifest is not None)
+            self.run_selected_preprocessing_button.setEnabled(
+                not running and self.manifest is not None
+            )
             self.cancel_preprocessing_button.setEnabled(
                 running and self._job_kind == "preprocess"
             )
@@ -6754,6 +8101,10 @@ class MainWindow(QMainWindow):
             self.apply_detection_button.setEnabled(
                 not running and self.manifest is not None
             )
+            self.apply_detection_defaults_button.setEnabled(
+                not running and self.manifest is not None
+            )
+            self.run_selected_detection_button.setEnabled(not running and eligible)
             self.cancel_detection_button.setEnabled(
                 running and self._job_kind == "detection"
             )
@@ -6821,6 +8172,8 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        if self._diagnostics is not None:
+            self._finish_diagnostics(package=False, reason="application_closed")
         self._save_window_preferences()
         super().closeEvent(event)
 

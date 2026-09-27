@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synpo Performance Diagnostic Protocol</title>
+<style>
+  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 10pt; line-height: 1.35; color: #202124; }
+  h1 { color: #17365d; font-size: 22pt; margin-bottom: 4pt; }
+  h2 { color: #234f7d; font-size: 15pt; margin-top: 16pt; page-break-after: avoid; }
+  h3 { color: #315f8d; font-size: 12pt; margin-top: 12pt; page-break-after: avoid; }
+  p, li { margin-top: 3pt; margin-bottom: 3pt; }
+  table { border-collapse: collapse; width: 100%; margin: 8pt 0; }
+  th, td { border: 1px solid #8a949f; padding: 5pt; vertical-align: top; }
+  th { background: #dce6f1; }
+  code { font-family: Consolas, monospace; background: #f2f3f5; }
+  .notice { background: #fff4cc; border: 1px solid #d6ac24; padding: 8pt; }
+  .safe { background: #e7f4ea; border: 1px solid #549462; padding: 8pt; }
+  .pagebreak { page-break-before: always; }
+  .small { font-size: 8.5pt; color: #4c535a; }
+</style>
+</head>
+<body>
+<h1>Synpo Performance Diagnostic Protocol</h1>
+<p><b>Purpose:</b> identify why manual corrections can take 10–15 minutes on one computer while the same data and software run normally elsewhere.</p>
+<p class="small">Protocol for Synpo 0.8.x. Use a duplicate project or a test specimen so the prescribed corrections do not alter the production review record.</p>
+
+<div class="notice"><b>Workplace safety:</b> Do not disable antivirus, endpoint protection, disk encryption, synchronization, or corporate monitoring. If evidence implicates one of these systems, give the diagnostic bundle to IT and request a narrowly scoped, temporary test approved by your organization.</div>
+
+<h2>1. What Synpo records</h2>
+<p>Open <b>Advanced → Diagnostic level → Full-session diagnostics</b>, then enable <b>Advanced → Diagnostic mode</b>. Synpo creates a timestamped folder below:</p>
+<p><code>&lt;project output&gt;\Synpo diagnostics\&lt;timestamp&gt;\</code></p>
+<ul>
+  <li><b>events.jsonl</b> — operation and correction phase timings.</li>
+  <li><b>system-samples.csv</b> — two-second CPU, memory, and disk-I/O samples.</li>
+  <li><b>environment.json</b> — operating system, hardware, package versions, and process names.</li>
+  <li><b>session-summary.json</b> — elapsed time and aggregated phase durations.</li>
+  <li><b>README.txt</b> — privacy and sharing notes.</li>
+</ul>
+<p class="safe">No microscopy pixels, project comments, command lines, or window titles are collected. Home-directory prefixes are replaced with <code>%USERPROFILE%</code>. Review the JSON and CSV files before sharing them.</p>
+
+<h2>2. Prepare a controlled comparison</h2>
+<ol>
+  <li>Use the same Synpo version, Conda environment, source TIFF pair, project settings, and correction sequence on the work PC and one normally performing PC.</li>
+  <li>Use a duplicate project/output directory for the experiment.</li>
+  <li>Connect laptop power. Record Windows power mode and whether an external monitor or Remote Desktop is in use.</li>
+  <li>Wait for automatic detection to finish. Close unrelated CPU-, memory-, or disk-heavy applications.</li>
+  <li>Confirm correction memory strategy is <b>Automatic</b>.</li>
+  <li>Start Full-session diagnostics before opening the test project.</li>
+</ol>
+
+<h2>3. Run the correction sequence</h2>
+<p>Use one detected specimen. Note the wall-clock duration and the exact status message after every step.</p>
+<table>
+<tr><th>Step</th><th>Action</th><th>What it isolates</th><th>Duration / notes</th></tr>
+<tr><td>1</td><td>Individual Z-slice mode: accept a small object.</td><td>First editable-mask initialization plus metadata checkpoint.</td><td></td></tr>
+<tr><td>2</td><td>Accept a second small object.</td><td>Recurring metadata/checkpoint cost without initialization.</td><td></td></tr>
+<tr><td>3</td><td>Add one small missed object.</td><td>Bounded local segmentation and undo write.</td><td></td></tr>
+<tr><td>4</td><td>Exclude one small spine.</td><td>Full-volume object lookup plus a small object patch.</td><td></td></tr>
+<tr><td>5</td><td>Exclude or split one large dendrite.</td><td>Full-volume lookup, large patch computation, compression, and write.</td><td></td></tr>
+<tr><td>6</td><td>Switch to drawable XY maximum projection and repeat a small status or mask action.</td><td>Full projection selection and post-correction projection regeneration.</td><td></td></tr>
+<tr><td>7</td><td>If scientifically safe in the duplicate, perform one projection transfer.</td><td>Full-Z reads, two undo volumes, and full-Z writes.</td><td></td></tr>
+</table>
+<p>For every correction, record whether Synpo reports <b>Slow low-memory correction was used</b>. Also record whether <b>Preparing editable masks</b> appears after the first correction; it normally should not.</p>
+
+<h2>4. Observe Windows while a correction is slow</h2>
+<h3>Task Manager</h3>
+<p>Open Task Manager → Details or Performance. During the correction, record:</p>
+<ul>
+  <li>Python/Synpo CPU percentage and whether one logical CPU is saturated.</li>
+  <li>Current CPU speed compared with the base speed.</li>
+  <li>Total memory use, Synpo working set, and committed memory.</li>
+  <li>Disk active time, transfer rate, and response time.</li>
+  <li>Activity from <code>MsMpEng.exe</code>, OneDrive, backup, DLP, indexing, or other security software.</li>
+</ul>
+
+<h3>Resource Monitor</h3>
+<p>Open Resource Monitor → Disk. Select the Python/Synpo process and any active security or synchronization processes. Record:</p>
+<ul>
+  <li>Which process accesses <code>.synpo-cache</code>, <code>review.zarr</code>, <code>undo</code>, or <code>.synpo-review-*</code>.</li>
+  <li>Disk response time and queue length.</li>
+  <li>Whether active time is near 100% despite low throughput.</li>
+</ul>
+
+<h3>Optional: Process Monitor with IT approval</h3>
+<p>Capture only the slow operation. Filter to the Python process and paths containing <code>.synpo-cache</code>. Do not collect unrelated activity longer than necessary. Look for repeated access by antivirus/security filters, long file-operation durations, sharing violations, and repeated retries.</p>
+
+<div class="pagebreak"></div>
+<h2>5. Test the cache location</h2>
+<p>The source TIFF being local is not sufficient: corrections primarily use the project output cache. Create one duplicate test whose output is a plain local SSD folder such as <code>C:\SynpoBench</code>. Keep the original data and settings unchanged.</p>
+<p>Check whether the original output path is under Documents, Desktop, OneDrive, Dropbox, SharePoint, a mapped drive, or a corporate redirected folder. On Windows, IT can inspect a suspected path with:</p>
+<p><code>fsutil reparsepoint query "C:\path\to\output"</code></p>
+<p>Record drive type, free space, BitLocker status if known, and whether the folder is synchronized or backed up. Do not change security settings merely to complete this comparison.</p>
+
+<h2>6. Repeatability matrix</h2>
+<table>
+<tr><th>Computer</th><th>Output/cache location</th><th>Detection running?</th><th>View mode</th><th>Operation</th><th>Processing mode</th><th>Seconds</th></tr>
+<tr><td>Work PC</td><td></td><td></td><td>Z slice</td><td>First accept</td><td></td><td></td></tr>
+<tr><td>Work PC</td><td></td><td></td><td>Z slice</td><td>Second accept</td><td></td><td></td></tr>
+<tr><td>Work PC</td><td></td><td></td><td>Z slice</td><td>Small add</td><td></td><td></td></tr>
+<tr><td>Work PC</td><td></td><td></td><td>Z slice</td><td>Small exclude</td><td></td><td></td></tr>
+<tr><td>Work PC</td><td></td><td></td><td>XY maximum</td><td>Small correction</td><td></td><td></td></tr>
+<tr><td>Reference PC</td><td></td><td></td><td>Z slice</td><td>Same sequence</td><td></td><td></td></tr>
+</table>
+
+<h2>7. Interpret the evidence</h2>
+<table>
+<tr><th>Finding</th><th>Likely cause</th></tr>
+<tr><td><code>editable_masks_initialization_finished</code> dominates only the first correction.</td><td>Normal one-time editable-mask creation; optimize initialization only if excessive.</td></tr>
+<tr><td>Editable-mask initialization occurs repeatedly for the same specimen.</td><td>Review cache is incomplete, rejected, deleted, or mismatched to the detection signature.</td></tr>
+<tr><td><code>full_volume_object_bbox_search_finished</code> dominates.</td><td>Repeated whole-volume scanning; object extent metadata/indexing should be optimized.</td></tr>
+<tr><td><code>undo_checkpoint_write_finished</code> or <code>corrected_mask_write_finished</code> dominates.</td><td>Compression, storage latency, synchronization, or endpoint scanning.</td></tr>
+<tr><td><code>context_generation_completed</code> dominates after each edit.</td><td>Projection regeneration; compare Z-slice mode and avoid unnecessary invalidation.</td></tr>
+<tr><td>Low CPU, 100% disk active time, low throughput, high response time.</td><td>Small-file latency, security scanning, synchronization, or paging.</td></tr>
+<tr><td>High CPU on one logical processor with normal disk response.</td><td>CPU-bound single-threaded correction or compression.</td></tr>
+<tr><td><code>.synpo-review-*</code> receives heavy traffic.</td><td>Disk-backed low-memory correction.</td></tr>
+<tr><td>The same action alternates between fast and slow with different competing processes.</td><td>External contention, scheduled scanning, power/thermal state, or storage filtering.</td></tr>
+<tr><td>A plain <code>C:\SynpoBench</code> output is fast while the normal output is slow.</td><td>Folder redirection, synchronization, security policy, or storage-path characteristics.</td></tr>
+</table>
+
+<h2>8. Finish and share safely</h2>
+<ol>
+  <li>Select <b>Advanced → Finish and package diagnostic session</b>.</li>
+  <li>Open the ZIP and review <code>environment.json</code>, <code>events.jsonl</code>, and <code>session-summary.json</code>.</li>
+  <li>Attach the work-PC and reference-PC ZIPs together, labeled by machine.</li>
+  <li>Include the completed repeatability matrix and any Task Manager/Resource Monitor observations.</li>
+  <li>If endpoint software appears involved, provide the bundle to IT. Request investigation or an approved narrow test—not blanket disabling of protection.</li>
+</ol>
+
+<p class="small">End of protocol.</p>
+</body>
+</html>

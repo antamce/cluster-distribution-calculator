@@ -18,6 +18,7 @@ dependencies = [
     "psutil>=6,<8",
     "openpyxl>=3.1,<4",
     "matplotlib>=3.9,<4",
+    "Pillow>=10,<13",
 ]
 
 [project.scripts]
@@ -31,8 +32,9 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-synpo = ["assets/*.png", "assets/*.ico"]
+synpo = ["assets/*.png", "assets/*.ico", "assets/*.pdf"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
+pythonpath = ["src"]

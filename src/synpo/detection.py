@@ -96,6 +96,16 @@ class DetectionSettings:
         return result
 
 
+def effective_detection_settings(
+    manifest: dict[str, object], specimen_index: int
+) -> DetectionSettings:
+    saved = manifest["detection"].get("settings_by_specimen", {}).get(
+        str(specimen_index)
+    )
+    value = saved if isinstance(saved, dict) else manifest["detection"]["settings"]
+    return DetectionSettings.from_dict(value)
+
+
 @dataclass(frozen=True)
 class DetectionSummary:
     specimen_index: int
@@ -779,6 +789,7 @@ def detect_specimen(
     *,
     progress: ProgressCallback | None = None,
     cancel_event: Event | None = None,
+    force: bool = False,
 ) -> DetectionSummary:
     started = time.monotonic()
     settings.validate()
@@ -803,7 +814,8 @@ def detect_specimen(
     if group_key in root:
         existing = root[group_key]
         if (
-            bool(existing.attrs.get("complete", False))
+            not force
+            and bool(existing.attrs.get("complete", False))
             and existing.attrs.get("settings_signature") == signature
         ):
             saved = existing.attrs["summary"]
@@ -980,12 +992,20 @@ def detect_project(
     progress: ProgressCallback | None = None,
     pair_completed: Callable[[int, dict[str, object]], None] | None = None,
     cancel_event: Event | None = None,
+    specimen_indices: list[int] | None = None,
+    force: bool = False,
 ) -> dict[str, object]:
-    settings = DetectionSettings.from_dict(manifest["detection"]["settings"])
     specimens = manifest["specimens"]
+    selected = (
+        set(range(len(specimens)))
+        if specimen_indices is None
+        else {int(value) for value in specimen_indices}
+    )
     eligible = [
         index
         for index, specimen in enumerate(specimens)
+        if index in selected
+        and not bool(specimen.get("analysis", {}).get("excluded", False))
         if specimen["checkpoints"]["preprocessing"].get("state") == "complete"
     ]
     if not eligible:
@@ -1008,6 +1028,7 @@ def detect_project(
     for specimen_index in eligible:
         _cancel_if_requested(cancel_event)
         specimen = specimens[specimen_index]
+        settings = effective_detection_settings(manifest, specimen_index)
         checkpoint = specimen["checkpoints"]["detection"]
         checkpoint["state"] = "in_progress"
 
@@ -1028,6 +1049,7 @@ def detect_project(
                 settings,
                 progress=specimen_progress,
                 cancel_event=cancel_event,
+                force=force,
             )
         except ProcessingCancelled:
             checkpoint.update(

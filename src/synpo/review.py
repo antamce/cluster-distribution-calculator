@@ -19,6 +19,7 @@ from skimage.filters import threshold_otsu
 from skimage.segmentation import watershed
 
 from .detection import detection_cache_path
+from .diagnostics import DiagnosticCallback, diagnostic_span, emit_diagnostic
 from .models import ProgressCallback
 from .preprocessing import ProcessingCancelled, project_cache_path
 from .project import channel_source_path, save_project
@@ -37,6 +38,7 @@ Operation = Literal[
     "trim",
     "accept",
     "needs_attention",
+    "erase",
 ]
 
 AUTOMATIC_REVIEW_MEMORY_MODE = "automatic"
@@ -76,6 +78,7 @@ class ReviewAction:
             "trim",
             "accept",
             "needs_attention",
+            "erase",
         }:
             raise ValueError("Unknown review operation.")
         strokes = self.hint_strokes()
@@ -138,6 +141,35 @@ def review_cache_path(manifest: dict[str, object]) -> Path:
     return project_cache_path(manifest).parent / "review.zarr"
 
 
+def discard_specimen_review(
+    manifest: dict[str, object], project_path: str | Path, specimen_index: int
+) -> None:
+    """Permanently discard corrected masks and all review history for one specimen."""
+    path = review_cache_path(manifest)
+    key = _review_group_key(specimen_index)
+    if path.exists():
+        root = zarr.open_group(str(path), mode="a")
+        if key in root:
+            del root[key]
+    specimen = manifest["specimens"][specimen_index]
+    specimen["review"] = {
+        "state": "needs_attention",
+        "comment": "",
+        "history": [],
+        "object_status": {"dendrite": {}, "spine": {}},
+    }
+    specimen["checkpoints"]["review"] = {
+        "state": "not_started",
+        "updated_at": time.time(),
+        "edit_count": 0,
+    }
+    specimen["distribution_review"] = {"spines": {}, "updated_at": None}
+    specimen["checkpoints"].setdefault("measurements", {}).update(
+        {"state": "not_started", "updated_at": time.time()}
+    )
+    save_project(project_path, manifest)
+
+
 def _compressor() -> Blosc:
     return Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
 
@@ -159,6 +191,7 @@ def _ensure_review_group(
     *,
     progress: ProgressCallback | None = None,
     cancel_event: Event | None = None,
+    diagnostic: DiagnosticCallback | None = None,
 ) -> zarr.Group:
     detection_root = zarr.open_group(str(detection_cache_path(manifest)), mode="r")
     key = _review_group_key(specimen_index)
@@ -175,7 +208,22 @@ def _ensure_review_group(
             bool(existing.attrs.get("initialized", False))
             and existing.attrs.get("detection_signature") == source_signature
         ):
+            emit_diagnostic(
+                diagnostic,
+                "editable_masks_reused",
+                specimen_index=specimen_index,
+                shape=list(existing["dendrite_labels"].shape),
+            )
             return existing
+        emit_diagnostic(
+            diagnostic,
+            "editable_masks_rejected",
+            specimen_index=specimen_index,
+            initialized=bool(existing.attrs.get("initialized", False)),
+            signature_matches=(
+                existing.attrs.get("detection_signature") == source_signature
+            ),
+        )
         del review_root[key]
     group = review_root.require_group(key)
     group.attrs.update(
@@ -190,27 +238,34 @@ def _ensure_review_group(
     names = ("dendrite_labels", "spine_labels")
     total = sum(int(detection_group[name].shape[0]) for name in names)
     current = 0
-    for name in names:
-        source = detection_group[name]
-        output = group.create_dataset(
-            name,
-            shape=source.shape,
-            chunks=source.chunks,
-            dtype="uint32",
-            compressor=_compressor(),
-            overwrite=True,
-        )
-        for z_index in range(source.shape[0]):
-            _cancel_if_requested(cancel_event)
-            output[z_index] = source[z_index]
-            current += 1
-            if progress:
-                progress(
-                    "Preparing editable masks",
-                    current,
-                    total,
-                    f"{name}: Z {z_index + 1}/{source.shape[0]}",
-                )
+    with diagnostic_span(
+        diagnostic,
+        "editable_masks_initialization",
+        specimen_index=specimen_index,
+        shape=list(detection_group[names[0]].shape),
+        total_planes=total,
+    ):
+        for name in names:
+            source = detection_group[name]
+            output = group.create_dataset(
+                name,
+                shape=source.shape,
+                chunks=source.chunks,
+                dtype="uint32",
+                compressor=_compressor(),
+                overwrite=True,
+            )
+            for z_index in range(source.shape[0]):
+                _cancel_if_requested(cancel_event)
+                output[z_index] = source[z_index]
+                current += 1
+                if progress:
+                    progress(
+                        "Preparing editable masks",
+                        current,
+                        total,
+                        f"{name}: Z {z_index + 1}/{source.shape[0]}",
+                    )
     summary = detection_group.attrs.get("summary", {})
     group.attrs.update(
         {
@@ -452,10 +507,20 @@ def _editable_review_patch(
     *,
     low_memory: bool,
     cancel_event: Event | None,
+    diagnostic: DiagnosticCallback | None = None,
 ):
     slices = _bbox_slices(bbox)
+    started = time.monotonic()
     if not low_memory:
         before = np.asarray(target[slices])
+        emit_diagnostic(
+            diagnostic,
+            "correction_patch_loaded",
+            duration_seconds=round(time.monotonic() - started, 6),
+            processing_mode="standard",
+            shape=list(before.shape),
+            voxels=int(np.prod(before.shape)),
+        )
         yield before, before.copy(), None
         return
     directory = _preflight_low_memory_review(manifest, bbox)
@@ -473,6 +538,14 @@ def _editable_review_patch(
             patch[local_z] = plane
         before.flush()
         patch.flush()
+        emit_diagnostic(
+            diagnostic,
+            "correction_patch_loaded",
+            duration_seconds=round(time.monotonic() - started, 6),
+            processing_mode="low_memory",
+            shape=list(shape),
+            voxels=int(np.prod(shape)),
+        )
         yield before, patch, workspace
         patch.flush()
     finally:
@@ -940,6 +1013,7 @@ def _apply_add_hints(
     *,
     progress: ProgressCallback | None = None,
     cancel_event: Event | None = None,
+    diagnostic: DiagnosticCallback | None = None,
 ) -> ReviewResult:
     specimen = manifest["specimens"][specimen_index]
     strokes = action.hint_strokes()
@@ -990,52 +1064,60 @@ def _apply_add_hints(
     ] = []
     hint_results: list[dict[str, object]] = []
     processing_mode = "standard"
-    for group_index, hint_group in enumerate(grouped, start=1):
-        _cancel_if_requested(cancel_event)
-        bbox = tuple(int(value) for value in hint_group["bbox"])
-        if _use_low_memory_review(manifest, bbox):
-            # Add hints are intrinsically bounded by the local margin and Z radius;
-            # processing them independently is the low-memory path.
-            processing_mode = "low_memory"
-        slices = _bbox_slices(bbox)
-        before = np.asarray(target[slices])
-        border_bbox = _expand_bbox(bbox, tuple(target.shape), 1, z=1)
-        border_slices = _bbox_slices(border_bbox)
-        target_border = np.asarray(target[border_slices])
-        border_offset = (
-            bbox[0] - border_bbox[0],
-            bbox[2] - border_bbox[2],
-            bbox[4] - border_bbox[4],
-        )
-        dendrite_patch = (
-            np.asarray(group["dendrite_labels"][slices])
-            if action.object_type == "spine"
-            else None
-        )
-        output, next_id, results = _segment_add_hint_group(
-            np.asarray(processed[slices]),
-            before,
-            dendrite_patch,
-            bbox,
-            list(hint_group["hints"]),
-            object_type=action.object_type,
-            brush_radius=action.brush_radius_pixels,
-            sensitivity=sensitivity,
-            preprocessing_threshold=preprocessing_threshold,
-            next_id=next_id,
-            target_border_patch=target_border,
-            target_border_offset=border_offset,
-        )
-        hint_results.extend(results)
-        if np.any(output != before):
-            updates.append((bbox, before, output))
-        if progress:
-            progress(
-                "Resegmenting independent hints",
-                group_index,
-                len(grouped),
-                f"local region {group_index}/{len(grouped)}",
+    with diagnostic_span(
+        diagnostic,
+        "add_hint_segmentation",
+        specimen_index=specimen_index,
+        object_type=action.object_type,
+        hint_count=len(hints),
+        region_count=len(grouped),
+    ):
+        for group_index, hint_group in enumerate(grouped, start=1):
+            _cancel_if_requested(cancel_event)
+            bbox = tuple(int(value) for value in hint_group["bbox"])
+            if _use_low_memory_review(manifest, bbox):
+                # Add hints are intrinsically bounded by the local margin and Z radius;
+                # processing them independently is the low-memory path.
+                processing_mode = "low_memory"
+            slices = _bbox_slices(bbox)
+            before = np.asarray(target[slices])
+            border_bbox = _expand_bbox(bbox, tuple(target.shape), 1, z=1)
+            border_slices = _bbox_slices(border_bbox)
+            target_border = np.asarray(target[border_slices])
+            border_offset = (
+                bbox[0] - border_bbox[0],
+                bbox[2] - border_bbox[2],
+                bbox[4] - border_bbox[4],
             )
+            dendrite_patch = (
+                np.asarray(group["dendrite_labels"][slices])
+                if action.object_type == "spine"
+                else None
+            )
+            output, next_id, results = _segment_add_hint_group(
+                np.asarray(processed[slices]),
+                before,
+                dendrite_patch,
+                bbox,
+                list(hint_group["hints"]),
+                object_type=action.object_type,
+                brush_radius=action.brush_radius_pixels,
+                sensitivity=sensitivity,
+                preprocessing_threshold=preprocessing_threshold,
+                next_id=next_id,
+                target_border_patch=target_border,
+                target_border_offset=border_offset,
+            )
+            hint_results.extend(results)
+            if np.any(output != before):
+                updates.append((bbox, before, output))
+            if progress:
+                progress(
+                    "Resegmenting independent hints",
+                    group_index,
+                    len(grouped),
+                    f"local region {group_index}/{len(grouped)}",
+                )
     hint_results.sort(key=lambda item: int(item["hint_index"]))
     created_ids = tuple(
         dict.fromkeys(
@@ -1076,12 +1158,26 @@ def _apply_add_hints(
 
     action_id = uuid.uuid4().hex
     undo_patches = [(bbox, before) for bbox, before, _output in updates]
-    _store_undo_patches(group, action_id, f"{action.object_type}_labels", undo_patches)
+    with diagnostic_span(
+        diagnostic,
+        "undo_checkpoint_write",
+        patch_count=len(undo_patches),
+        voxels=sum(int(np.prod(before.shape)) for _bbox, before in undo_patches),
+    ):
+        _store_undo_patches(
+            group, action_id, f"{action.object_type}_labels", undo_patches
+        )
     written: list[tuple[tuple[int, int, int, int, int, int], np.ndarray]] = []
     try:
-        for bbox, before, output in updates:
-            target[_bbox_slices(bbox)] = output
-            written.append((bbox, before))
+        with diagnostic_span(
+            diagnostic,
+            "corrected_mask_write",
+            patch_count=len(updates),
+            voxels=sum(int(np.prod(output.shape)) for _bbox, _before, output in updates),
+        ):
+            for bbox, before, output in updates:
+                target[_bbox_slices(bbox)] = output
+                written.append((bbox, before))
         group.attrs[next_key] = next_id
         group.attrs[count_key] = original_count + len(created_ids)
     except Exception:
@@ -1146,7 +1242,8 @@ def _apply_add_hints(
     specimen["checkpoints"].setdefault("measurements", {}).update(
         {"state": "not_started", "updated_at": time.time()}
     )
-    save_project(project_path, manifest)
+    with diagnostic_span(diagnostic, "project_checkpoint_save"):
+        save_project(project_path, manifest)
     return ReviewResult(
         specimen_index=specimen_index,
         action_id=action_id,
@@ -1175,6 +1272,7 @@ def _apply_projection_mask_transfer(
     operation: str,
     progress: ProgressCallback | None = None,
     cancel_event: Event | None = None,
+    diagnostic: DiagnosticCallback | None = None,
 ) -> ReviewResult:
     """Transfer painted full-Z columns between label volumes."""
     specimen = manifest["specimens"][specimen_index]
@@ -1184,9 +1282,15 @@ def _apply_projection_mask_transfer(
     destination = group[destination_name]
     if not 0 <= action.z_index < destination.shape[0]:
         raise ValueError("The selected reference Z slice is outside the stack.")
-    selected_destinations = _sample_ids_projection(
-        destination, action.points, action.brush_radius_pixels
-    )
+    with diagnostic_span(
+        diagnostic,
+        "projection_object_selection",
+        z_count=int(destination.shape[0]),
+        brush_radius_pixels=action.brush_radius_pixels,
+    ):
+        selected_destinations = _sample_ids_projection(
+            destination, action.points, action.brush_radius_pixels
+        )
     if not selected_destinations:
         raise ValueError(
             f"{source_type.capitalize()} transfer needs the painted area to touch "
@@ -1214,14 +1318,22 @@ def _apply_projection_mask_transfer(
     processing_mode = (
         "low_memory" if _use_low_memory_review(manifest, bbox) else "standard"
     )
-    action_id = uuid.uuid4().hex
-    undo = group.require_group("undo").require_group(action_id)
-    datasets = undo.require_group("datasets")
     shape = (
         int(destination.shape[0]),
         int(y_slice.stop - y_slice.start),
         int(x_slice.stop - x_slice.start),
     )
+    emit_diagnostic(
+        diagnostic,
+        "correction_region_selected",
+        operation=operation,
+        processing_mode=processing_mode,
+        bbox=list(bbox),
+        voxels=int(np.prod(shape)),
+    )
+    action_id = uuid.uuid4().hex
+    undo = group.require_group("undo").require_group(action_id)
+    datasets = undo.require_group("datasets")
     chunks = (1, min(256, shape[1]), min(256, shape[2]))
     before_source = datasets.create_dataset(
         source_name,
@@ -1244,39 +1356,45 @@ def _apply_projection_mask_transfer(
     transferred_voxels = 0
     transferred_counts: dict[int, int] = {}
     total_counts: dict[int, int] = {}
-    for z_index in range(destination.shape[0]):
-        if cancel_event is not None and cancel_event.is_set():
-            del group[f"undo/{action_id}"]
-        _cancel_if_requested(cancel_event)
-        full_source_plane = np.asarray(source[z_index])
-        source_patch = full_source_plane[y_slice, x_slice]
-        destination_patch = np.asarray(destination[z_index, y_slice, x_slice])
-        before_source[z_index] = source_patch
-        before_destination[z_index] = destination_patch
-        values, counts = np.unique(full_source_plane, return_counts=True)
-        for value, count in zip(values, counts):
-            object_id = int(value)
-            if object_id <= 0:
-                continue
-            total_counts[object_id] = total_counts.get(object_id, 0) + int(count)
-        transfer_values, transfer_counts = np.unique(
-            source_patch[hint], return_counts=True
-        )
-        for value, count in zip(transfer_values, transfer_counts):
-            object_id = int(value)
-            if object_id <= 0:
-                continue
-            transferred_counts[object_id] = (
-                transferred_counts.get(object_id, 0) + int(count)
+    with diagnostic_span(
+        diagnostic,
+        "projection_transfer_read_and_undo",
+        z_count=int(destination.shape[0]),
+        patch_shape=list(shape),
+    ):
+        for z_index in range(destination.shape[0]):
+            if cancel_event is not None and cancel_event.is_set():
+                del group[f"undo/{action_id}"]
+            _cancel_if_requested(cancel_event)
+            full_source_plane = np.asarray(source[z_index])
+            source_patch = full_source_plane[y_slice, x_slice]
+            destination_patch = np.asarray(destination[z_index, y_slice, x_slice])
+            before_source[z_index] = source_patch
+            before_destination[z_index] = destination_patch
+            values, counts = np.unique(full_source_plane, return_counts=True)
+            for value, count in zip(values, counts):
+                object_id = int(value)
+                if object_id <= 0:
+                    continue
+                total_counts[object_id] = total_counts.get(object_id, 0) + int(count)
+            transfer_values, transfer_counts = np.unique(
+                source_patch[hint], return_counts=True
             )
-            transferred_voxels += int(count)
-        if progress:
-            progress(
-                f"Preparing {source_type}-to-{destination_type} transfer",
-                z_index + 1,
-                int(destination.shape[0]) * 2,
-                f"Reading Z {z_index + 1}/{destination.shape[0]}",
-            )
+            for value, count in zip(transfer_values, transfer_counts):
+                object_id = int(value)
+                if object_id <= 0:
+                    continue
+                transferred_counts[object_id] = (
+                    transferred_counts.get(object_id, 0) + int(count)
+                )
+                transferred_voxels += int(count)
+            if progress:
+                progress(
+                    f"Preparing {source_type}-to-{destination_type} transfer",
+                    z_index + 1,
+                    int(destination.shape[0]) * 2,
+                    f"Reading Z {z_index + 1}/{destination.shape[0]}",
+                )
     if not transferred_voxels:
         del group[f"undo/{action_id}"]
         raise ValueError(
@@ -1285,22 +1403,28 @@ def _apply_projection_mask_transfer(
         )
 
     try:
-        for z_index in range(destination.shape[0]):
-            _cancel_if_requested(cancel_event)
-            source_patch = np.asarray(before_source[z_index])
-            destination_patch = np.asarray(before_destination[z_index])
-            transfer = hint & (source_patch > 0)
-            source_patch[transfer] = 0
-            destination_patch[transfer] = destination_id
-            source[z_index, y_slice, x_slice] = source_patch
-            destination[z_index, y_slice, x_slice] = destination_patch
-            if progress:
-                progress(
-                    f"Applying {source_type}-to-{destination_type} transfer",
-                    int(destination.shape[0]) + z_index + 1,
-                    int(destination.shape[0]) * 2,
-                    f"Writing Z {z_index + 1}/{destination.shape[0]}",
-                )
+        with diagnostic_span(
+            diagnostic,
+            "projection_transfer_mask_write",
+            z_count=int(destination.shape[0]),
+            patch_shape=list(shape),
+        ):
+            for z_index in range(destination.shape[0]):
+                _cancel_if_requested(cancel_event)
+                source_patch = np.asarray(before_source[z_index])
+                destination_patch = np.asarray(before_destination[z_index])
+                transfer = hint & (source_patch > 0)
+                source_patch[transfer] = 0
+                destination_patch[transfer] = destination_id
+                source[z_index, y_slice, x_slice] = source_patch
+                destination[z_index, y_slice, x_slice] = destination_patch
+                if progress:
+                    progress(
+                        f"Applying {source_type}-to-{destination_type} transfer",
+                        int(destination.shape[0]) + z_index + 1,
+                        int(destination.shape[0]) * 2,
+                        f"Writing Z {z_index + 1}/{destination.shape[0]}",
+                    )
     except Exception:
         for z_index in range(destination.shape[0]):
             source[z_index, y_slice, x_slice] = np.asarray(before_source[z_index])
@@ -1375,7 +1499,8 @@ def _apply_projection_mask_transfer(
     specimen["checkpoints"].setdefault("measurements", {}).update(
         {"state": "not_started", "updated_at": time.time()}
     )
-    save_project(project_path, manifest)
+    with diagnostic_span(diagnostic, "project_checkpoint_save"):
+        save_project(project_path, manifest)
     return ReviewResult(
         specimen_index=specimen_index,
         action_id=action_id,
@@ -1392,6 +1517,161 @@ def _apply_projection_mask_transfer(
     )
 
 
+def _apply_eraser(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    action: ReviewAction,
+    group: zarr.Group,
+    *,
+    cancel_event: Event | None = None,
+    diagnostic: DiagnosticCallback | None = None,
+) -> ReviewResult:
+    """Literally clear painted voxels from both editable label volumes."""
+    specimen = manifest["specimens"][specimen_index]
+    reference = group["dendrite_labels"]
+    y_slice, x_slice, hint = _hint_crop(
+        tuple(reference.shape[1:]), action.points, action.brush_radius_pixels
+    )
+    z0, z1 = (
+        (0, int(reference.shape[0]))
+        if action.projection_hint
+        else (int(action.z_index), int(action.z_index) + 1)
+    )
+    if not 0 <= z0 < z1 <= int(reference.shape[0]):
+        raise ValueError("The selected Z slice is outside the stack.")
+    bbox = (z0, z1, int(y_slice.start), int(y_slice.stop), int(x_slice.start), int(x_slice.stop))
+    shape = (z1 - z0, int(y_slice.stop - y_slice.start), int(x_slice.stop - x_slice.start))
+    action_id = uuid.uuid4().hex
+    undo = group.require_group("undo").require_group(action_id)
+    datasets = undo.require_group("datasets")
+    undo.attrs.update({"multi_dataset": True, "bbox": list(bbox)})
+    chunks = (1, min(256, shape[1]), min(256, shape[2]))
+    removed_by_type: dict[str, set[int]] = {"dendrite": set(), "spine": set()}
+    removed_voxels = 0
+    try:
+        for object_type in ("dendrite", "spine"):
+            dataset_name = f"{object_type}_labels"
+            target = group[dataset_name]
+            before = datasets.create_dataset(
+                dataset_name,
+                shape=shape,
+                dtype="uint32",
+                chunks=chunks,
+                compressor=_compressor(),
+                overwrite=True,
+            )
+            for local_z, z_index in enumerate(range(z0, z1)):
+                _cancel_if_requested(cancel_event)
+                patch = np.asarray(target[z_index, y_slice, x_slice])
+                before[local_z] = patch
+                selected = hint & (patch > 0)
+                if np.any(selected):
+                    removed_by_type[object_type].update(
+                        int(value) for value in np.unique(patch[selected]) if int(value) > 0
+                    )
+                    removed_voxels += int(np.count_nonzero(selected))
+                    patch[selected] = 0
+                    target[z_index, y_slice, x_slice] = patch
+    except Exception:
+        for object_type in ("dendrite", "spine"):
+            dataset_name = f"{object_type}_labels"
+            if dataset_name in datasets:
+                _write_review_patch(group[dataset_name], bbox, datasets[dataset_name])
+        del group[f"undo/{action_id}"]
+        raise
+    if not removed_voxels:
+        del group[f"undo/{action_id}"]
+        raise ValueError("The eraser did not cover any dendrite or spine voxels.")
+
+    fully_removed: dict[str, list[int]] = {"dendrite": [], "spine": []}
+    for object_type in ("dendrite", "spine"):
+        target = group[f"{object_type}_labels"]
+        remaining = set(removed_by_type[object_type])
+        for z_index in range(target.shape[0]):
+            if not remaining:
+                break
+            present = {int(value) for value in np.unique(np.asarray(target[z_index]))}
+            remaining.difference_update(present)
+        fully_removed[object_type] = sorted(remaining)
+        group.attrs[f"{object_type}_count"] = max(
+            0, int(group.attrs[f"{object_type}_count"]) - len(remaining)
+        )
+
+    history_entry = {
+        "action_id": action_id,
+        "timestamp": time.time(),
+        "operation": "erase",
+        "object_type": "dendrite",
+        "z_index": action.z_index,
+        "projection_hint": action.projection_hint,
+        "hint_point_count": len(action.points),
+        "brush_radius_pixels": action.brush_radius_pixels,
+        "affected_ids": sorted(
+            removed_by_type["dendrite"] | removed_by_type["spine"]
+        ),
+        "affected_ids_by_type": {
+            key: sorted(value) for key, value in removed_by_type.items()
+        },
+        "removed_ids_by_type": fully_removed,
+        "new_ids": [],
+        "bbox": list(bbox),
+        "count_delta": 0,
+        "dendrite_count_delta": -len(fully_removed["dendrite"]),
+        "spine_count_delta": -len(fully_removed["spine"]),
+        "previous_status": {},
+        "processing_mode": "literal_projection" if action.projection_hint else "literal_slice",
+        "undone": False,
+        "undo_available": True,
+        "undo_datasets": ["dendrite_labels", "spine_labels"],
+        "erased_voxel_count": removed_voxels,
+    }
+    specimen["review"]["history"].append(history_entry)
+    maximum_undo = int(manifest["review_settings"].get("maximum_undo_actions", 100))
+    mask_undo_entries = [
+        item
+        for item in specimen["review"]["history"]
+        if (item.get("bbox") is not None or item.get("bboxes"))
+        and not item.get("undone")
+        and item.get("undo_available", True)
+    ]
+    while len(mask_undo_entries) > maximum_undo:
+        expired = mask_undo_entries.pop(0)
+        undo_key = f"undo/{expired['action_id']}"
+        if undo_key in group:
+            del group[undo_key]
+        expired["undo_available"] = False
+    specimen["review"]["state"] = "in_progress"
+    checkpoint = specimen["checkpoints"]["review"]
+    checkpoint.update(
+        {
+            "state": "in_progress",
+            "updated_at": time.time(),
+            "edit_count": int(checkpoint.get("edit_count", 0)) + 1,
+            "cache_path": str(review_cache_path(manifest)),
+            "detection_signature": group.attrs["detection_signature"],
+        }
+    )
+    specimen["checkpoints"].setdefault("measurements", {}).update(
+        {"state": "not_started", "updated_at": time.time()}
+    )
+    with diagnostic_span(diagnostic, "project_checkpoint_save"):
+        save_project(project_path, manifest)
+    return ReviewResult(
+        specimen_index=specimen_index,
+        action_id=action_id,
+        operation="erase",
+        object_type="all",
+        affected_ids=tuple(sorted(removed_by_type["dendrite"] | removed_by_type["spine"])),
+        new_ids=(),
+        edit_count=int(checkpoint["edit_count"]),
+        dendrite_count=int(group.attrs["dendrite_count"]),
+        spine_count=int(group.attrs["spine_count"]),
+        processing_mode=str(history_entry["processing_mode"]),
+        transferred_voxel_count=removed_voxels,
+    )
+
+
 def apply_review_action(
     manifest: dict[str, object],
     project_path: str | Path,
@@ -1400,17 +1680,25 @@ def apply_review_action(
     *,
     progress: ProgressCallback | None = None,
     cancel_event: Event | None = None,
+    diagnostic: DiagnosticCallback | None = None,
 ) -> ReviewResult:
     action.validate()
     specimen = manifest["specimens"][specimen_index]
     if specimen["checkpoints"]["detection"].get("state") != "complete":
         raise ValueError("Automatic detection must finish before review.")
-    group = _ensure_review_group(
-        manifest,
-        specimen_index,
-        progress=progress,
-        cancel_event=cancel_event,
-    )
+    with diagnostic_span(
+        diagnostic,
+        "review_cache_validation",
+        specimen_index=specimen_index,
+        operation=action.operation,
+    ):
+        group = _ensure_review_group(
+            manifest,
+            specimen_index,
+            progress=progress,
+            cancel_event=cancel_event,
+            diagnostic=diagnostic,
+        )
     if action.operation in {"dendrite_to_spine", "spine_to_dendrite"}:
         source_type: ObjectType = (
             "dendrite" if action.operation == "dendrite_to_spine" else "spine"
@@ -1429,6 +1717,17 @@ def apply_review_action(
             operation=action.operation,
             progress=progress,
             cancel_event=cancel_event,
+            diagnostic=diagnostic,
+        )
+    if action.operation == "erase":
+        return _apply_eraser(
+            manifest,
+            project_path,
+            specimen_index,
+            action,
+            group,
+            cancel_event=cancel_event,
+            diagnostic=diagnostic,
         )
     dataset_name = f"{action.object_type}_labels"
     target = group[dataset_name]
@@ -1444,23 +1743,36 @@ def apply_review_action(
             target,
             progress=progress,
             cancel_event=cancel_event,
+            diagnostic=diagnostic,
         )
     if action.projection_hint:
-        selected_ids = _sample_ids_projection(
-            target, action.points, action.brush_radius_pixels
-        )
-        if selected_ids:
-            effective_z = _best_projection_z(
-                target, selected_ids, action.points, action.brush_radius_pixels
+        with diagnostic_span(
+            diagnostic,
+            "projection_object_selection",
+            z_count=int(target.shape[0]),
+            brush_radius_pixels=action.brush_radius_pixels,
+        ):
+            selected_ids = _sample_ids_projection(
+                target, action.points, action.brush_radius_pixels
             )
-        else:
-            effective_z = action.z_index
+            if selected_ids:
+                effective_z = _best_projection_z(
+                    target, selected_ids, action.points, action.brush_radius_pixels
+                )
+            else:
+                effective_z = action.z_index
     else:
-        selected_ids = _sample_ids(
-            np.asarray(target[action.z_index]),
-            action.points,
-            action.brush_radius_pixels,
-        )
+        with diagnostic_span(
+            diagnostic,
+            "slice_object_selection",
+            z_index=action.z_index,
+            brush_radius_pixels=action.brush_radius_pixels,
+        ):
+            selected_ids = _sample_ids(
+                np.asarray(target[action.z_index]),
+                action.points,
+                action.brush_radius_pixels,
+            )
         effective_z = action.z_index
     action_id = uuid.uuid4().hex
     bbox: tuple[int, int, int, int, int, int] | None = None
@@ -1485,15 +1797,37 @@ def apply_review_action(
                 "This action needs the hint to touch "
                 + ("at least two objects." if required == 2 else "an existing object.")
             )
-        bbox = _expand_bbox(_bbox_for_ids(target, selected_ids), tuple(target.shape), 2)
+        with diagnostic_span(
+            diagnostic,
+            "full_volume_object_bbox_search",
+            z_count=int(target.shape[0]),
+            selected_id_count=len(selected_ids),
+        ):
+            bbox = _expand_bbox(
+                _bbox_for_ids(target, selected_ids), tuple(target.shape), 2
+            )
         low_memory = _use_low_memory_review(manifest, bbox)
         processing_mode = "low_memory" if low_memory else "standard"
+        emit_diagnostic(
+            diagnostic,
+            "correction_region_selected",
+            operation=action.operation,
+            processing_mode=processing_mode,
+            bbox=list(bbox),
+            voxels=int(
+                (bbox[1] - bbox[0])
+                * (bbox[3] - bbox[2])
+                * (bbox[5] - bbox[4])
+            ),
+        )
+        patch_started = time.monotonic()
         with _editable_review_patch(
             manifest,
             target,
             bbox,
             low_memory=low_memory,
             cancel_event=cancel_event,
+            diagnostic=diagnostic,
         ) as (before, patch, temporary):
             if action.operation in {"exclude", "filopodium", "merge"}:
                 replacement = 0 if action.operation != "merge" else min(selected_ids)
@@ -1539,34 +1873,81 @@ def apply_review_action(
                         object_mask, structure=np.ones((3, 3, 3), dtype=bool)
                     )
                     sizes = np.bincount(components.ravel())
-                component_ids = [
-                    value
-                    for value in range(1, component_count + 1)
-                    if sizes[value] >= 5
-                ]
-                if len(component_ids) < 2:
+                meaningful = sorted(
+                    (
+                        value
+                        for value in range(1, component_count + 1)
+                        if sizes[value] >= 5
+                    ),
+                    key=lambda value: int(sizes[value]),
+                    reverse=True,
+                )
+                if len(meaningful) < 2:
                     raise ValueError(
                         "The hint did not separate this object. Draw across the full neck/contact."
                     )
-                assigned = [object_id]
+                seed_ids = meaningful[:2]
+                component_array = np.asarray(components)
+                centers = ndimage.center_of_mass(
+                    component_array,
+                    component_array,
+                    list(range(1, component_count + 1)),
+                )
+                sampling = np.asarray(
+                    (
+                        float(manifest["calibration"]["z_step_um"]),
+                        float(manifest["calibration"]["xy_um_per_pixel"]),
+                        float(manifest["calibration"]["xy_um_per_pixel"]),
+                    )
+                )
+                seed_centers = [np.asarray(centers[value - 1]) * sampling for value in seed_ids]
                 next_key = f"next_{action.object_type}_id"
                 next_id = int(group.attrs[next_key])
-                for component_id in component_ids[1:]:
-                    assigned.append(next_id)
-                    next_id += 1
+                assigned_ids = (object_id, next_id)
+                next_id += 1
+                component_assignment: dict[int, int] = {}
+                for component_id in range(1, component_count + 1):
+                    if component_id == seed_ids[0]:
+                        side = 0
+                    elif component_id == seed_ids[1]:
+                        side = 1
+                    else:
+                        center = np.asarray(centers[component_id - 1]) * sampling
+                        side = int(
+                            np.argmin(
+                                [float(np.linalg.norm(center - seed)) for seed in seed_centers]
+                            )
+                        )
+                    component_assignment[component_id] = assigned_ids[side]
                 for z_index in range(patch.shape[0]):
                     plane = np.asarray(patch[z_index])
                     plane[plane == object_id] = 0
                     component_plane = np.asarray(components[z_index])
-                    for component_id, assigned_id in zip(component_ids, assigned):
+                    for component_id, assigned_id in component_assignment.items():
                         plane[component_plane == component_id] = assigned_id
                     patch[z_index] = plane
                 group.attrs[next_key] = next_id
-                new_ids = tuple(assigned)
-                count_delta = len(assigned) - 1
-            _store_undo_patch(group, action_id, dataset_name, bbox, before)
+                new_ids = assigned_ids
+                count_delta = 1
+            with diagnostic_span(
+                diagnostic,
+                "undo_checkpoint_write",
+                voxels=int(np.prod(before.shape)),
+            ):
+                _store_undo_patch(group, action_id, dataset_name, bbox, before)
             _cancel_if_requested(cancel_event)
-            _write_review_patch(target, bbox, patch)
+            with diagnostic_span(
+                diagnostic,
+                "corrected_mask_write",
+                voxels=int(np.prod(patch.shape)),
+            ):
+                _write_review_patch(target, bbox, patch)
+        emit_diagnostic(
+            diagnostic,
+            "correction_patch_pipeline_finished",
+            duration_seconds=round(time.monotonic() - patch_started, 6),
+            processing_mode=processing_mode,
+        )
     else:
         xy = float(manifest["calibration"]["xy_um_per_pixel"])
         margin = max(
@@ -1587,12 +1968,26 @@ def apply_review_action(
         slices = _bbox_slices(bbox)
         low_memory = _use_low_memory_review(manifest, bbox)
         processing_mode = "low_memory" if low_memory else "standard"
+        emit_diagnostic(
+            diagnostic,
+            "correction_region_selected",
+            operation=action.operation,
+            processing_mode=processing_mode,
+            bbox=list(bbox),
+            voxels=int(
+                (bbox[1] - bbox[0])
+                * (bbox[3] - bbox[2])
+                * (bbox[5] - bbox[4])
+            ),
+        )
+        patch_started = time.monotonic()
         with _editable_review_patch(
             manifest,
             target,
             bbox,
             low_memory=low_memory,
             cancel_event=cancel_event,
+            diagnostic=diagnostic,
         ) as (before, patch, temporary):
             local_points = _local_points(action.points, bbox)
             hint_2d = _disk_mask(
@@ -1727,9 +2122,25 @@ def apply_review_action(
                     )
                     region &= (patch == 0) | (patch == object_id)
                     patch[region] = object_id
-            _store_undo_patch(group, action_id, dataset_name, bbox, before)
+            with diagnostic_span(
+                diagnostic,
+                "undo_checkpoint_write",
+                voxels=int(np.prod(before.shape)),
+            ):
+                _store_undo_patch(group, action_id, dataset_name, bbox, before)
             _cancel_if_requested(cancel_event)
-            _write_review_patch(target, bbox, patch)
+            with diagnostic_span(
+                diagnostic,
+                "corrected_mask_write",
+                voxels=int(np.prod(patch.shape)),
+            ):
+                _write_review_patch(target, bbox, patch)
+        emit_diagnostic(
+            diagnostic,
+            "correction_patch_pipeline_finished",
+            duration_seconds=round(time.monotonic() - patch_started, 6),
+            processing_mode=processing_mode,
+        )
 
     count_key = f"{action.object_type}_count"
     group.attrs[count_key] = max(0, int(group.attrs[count_key]) + count_delta)
@@ -1789,7 +2200,8 @@ def apply_review_action(
     specimen["checkpoints"].setdefault("measurements", {}).update(
         {"state": "not_started", "updated_at": time.time()}
     )
-    save_project(project_path, manifest)
+    with diagnostic_span(diagnostic, "project_checkpoint_save"):
+        save_project(project_path, manifest)
     return ReviewResult(
         specimen_index=specimen_index,
         action_id=action_id,
@@ -1805,7 +2217,11 @@ def apply_review_action(
 
 
 def undo_last_review_action(
-    manifest: dict[str, object], project_path: str | Path, specimen_index: int
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    *,
+    diagnostic: DiagnosticCallback | None = None,
 ) -> ReviewResult:
     specimen = manifest["specimens"][specimen_index]
     history = specimen["review"]["history"]
@@ -1823,24 +2239,29 @@ def undo_last_review_action(
     group = root[_review_group_key(specimen_index)]
     action_id = str(entry["action_id"])
     undo = group[f"undo/{action_id}"] if (entry.get("bbox") is not None or entry.get("bboxes")) else None
-    if entry.get("undo_datasets") and undo is not None:
-        bbox = tuple(int(value) for value in undo.attrs["bbox"])
-        for dataset_name in entry["undo_datasets"]:
-            saved = undo[f"datasets/{dataset_name}"]
-            _write_review_patch(group[str(dataset_name)], bbox, saved)
-    elif entry.get("bboxes") and undo is not None:
-        patch_group = undo["patches"]
-        for name in sorted(patch_group.keys()):
-            saved = patch_group[name]
-            bbox = tuple(int(value) for value in saved.attrs["bbox"])
+    with diagnostic_span(
+        diagnostic,
+        "undo_mask_restore",
+        original_operation=str(entry.get("operation", "unknown")),
+    ):
+        if entry.get("undo_datasets") and undo is not None:
+            bbox = tuple(int(value) for value in undo.attrs["bbox"])
+            for dataset_name in entry["undo_datasets"]:
+                saved = undo[f"datasets/{dataset_name}"]
+                _write_review_patch(group[str(dataset_name)], bbox, saved)
+        elif entry.get("bboxes") and undo is not None:
+            patch_group = undo["patches"]
+            for name in sorted(patch_group.keys()):
+                saved = patch_group[name]
+                bbox = tuple(int(value) for value in saved.attrs["bbox"])
+                group[str(undo.attrs["dataset_name"])][
+                    _bbox_slices(bbox)
+                ] = np.asarray(saved)
+        elif entry.get("bbox") is not None and undo is not None:
+            bbox = tuple(int(value) for value in undo.attrs["bbox"])
             group[str(undo.attrs["dataset_name"])][_bbox_slices(bbox)] = np.asarray(
-                saved
+                undo["before"]
             )
-    elif entry.get("bbox") is not None and undo is not None:
-        bbox = tuple(int(value) for value in undo.attrs["bbox"])
-        group[str(undo.attrs["dataset_name"])][_bbox_slices(bbox)] = np.asarray(
-            undo["before"]
-        )
     statuses = specimen["review"]["object_status"].setdefault(
         str(entry["object_type"]), {}
     )
@@ -1870,7 +2291,8 @@ def undo_last_review_action(
         {"state": "not_started", "updated_at": time.time()}
     )
     specimen["review"]["state"] = "in_progress"
-    save_project(project_path, manifest)
+    with diagnostic_span(diagnostic, "project_checkpoint_save"):
+        save_project(project_path, manifest)
     return ReviewResult(
         specimen_index=specimen_index,
         action_id=action_id,
