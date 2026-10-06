@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import time
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Event
@@ -26,7 +27,7 @@ from .regions import normalize_rectangles, roi_id_for_mask
 
 
 ClusterEndMethod = Literal["untrimmed", "fixed", "adaptive"]
-ALGORITHM_VERSION = 3
+ALGORITHM_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,21 @@ class SpineReviewPreview:
     protein_projection: np.ndarray
     spine_projection: np.ndarray
     cluster_projection: np.ndarray
+    crop_origin_yx: tuple[int, int]
+    spine_z_range: tuple[int, int]
+    row: dict[str, object]
+
+
+@dataclass(frozen=True)
+class MorphologyPreview:
+    dendrite_stack: np.ndarray
+    protein_stack: np.ndarray
+    spine_mask_stack: np.ndarray
+    head_mask_stack: np.ndarray
+    cluster_mask_stack: np.ndarray
+    axis_points_local_zyx: tuple[tuple[int, int, int], ...]
+    base_point_local_zyx: tuple[int, int, int] | None
+    tip_point_local_zyx: tuple[int, int, int] | None
     crop_origin_yx: tuple[int, int]
     spine_z_range: tuple[int, int]
     row: dict[str, object]
@@ -345,6 +361,113 @@ def load_measurement_result(
         return json.load(stream)
 
 
+def spine_volume_filter_settings(
+    manifest: dict[str, object],
+) -> tuple[bool, float]:
+    """Return the saved post-measurement spine-volume filter settings."""
+    settings = manifest.get("measurements", {}).get("settings", {})
+    enabled = bool(settings.get("spine_volume_filter_enabled", False))
+    cutoff = float(settings.get("spine_volume_filter_cutoff_um3", 0.0) or 0.0)
+    return enabled, max(0.0, cutoff)
+
+
+def specimen_volume_filter_overrides(
+    manifest: dict[str, object], specimen_index: int
+) -> set[int]:
+    decisions = (
+        manifest["specimens"][specimen_index]
+        .get("distribution_review", {})
+        .get("spines", {})
+    )
+    return {
+        int(spine_id)
+        for spine_id, decision in decisions.items()
+        if isinstance(decision, dict)
+        and bool(decision.get("volume_filter_force_keep", False))
+    }
+
+
+def apply_spine_volume_filter(
+    result: dict[str, object],
+    *,
+    enabled: bool,
+    cutoff_um3: float,
+    force_keep_ids: set[int] | None = None,
+    refresh_summaries: bool = True,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Apply a reversible inclusion rule to a copy of a measurement result.
+
+    The measured result on disk is never changed.  Strictly smaller volumes are
+    excluded; a force-keep decision only overrides this volume rule and can
+    never restore a manually invalid spine.
+    """
+    filtered = deepcopy(result)
+    cutoff = max(0.0, float(cutoff_um3))
+    force_keep = {int(value) for value in (force_keep_ids or set())}
+    state: dict[int, tuple[bool, bool, bool]] = {}
+    audit: list[dict[str, object]] = []
+    for row in filtered.get("spine_rows", []):
+        spine_id = int(row.get("spine_id") or 0)
+        manual_valid = bool(row.get("manual_spine_valid", row.get("spine_valid", True)))
+        keep = spine_id in force_keep
+        below = float(row.get("volume_um3") or 0.0) < cutoff
+        excluded = bool(enabled and manual_valid and below and not keep)
+        row.update(
+            {
+                "manual_spine_valid": manual_valid,
+                "volume_filter_enabled": bool(enabled),
+                "volume_filter_cutoff_um3": cutoff,
+                "volume_filter_below_cutoff": below,
+                "volume_filter_force_keep": keep,
+                "volume_filter_override_reason": (
+                    "User selected Keep despite volume cutoff" if keep else ""
+                ),
+                "volume_filter_excluded": excluded,
+                "spine_valid": manual_valid and not excluded,
+            }
+        )
+        state[spine_id] = (manual_valid, keep, excluded)
+        if excluded:
+            audit.append(
+                {
+                    **row,
+                    "exclusion_reason": "volume strictly below cutoff",
+                    "volume_filter_override_applied": False,
+                    "override_reason": "No Keep override selected",
+                }
+            )
+    for collection_name in ("cluster_rows", "distribution_rows"):
+        for row in filtered.get(collection_name, []):
+            spine_id = int(row.get("spine_id") or 0)
+            manual_valid, keep, excluded = state.get(
+                spine_id,
+                (bool(row.get("spine_valid", True)), False, False),
+            )
+            row.update(
+                {
+                    "manual_spine_valid": manual_valid,
+                    "volume_filter_force_keep": keep,
+                    "volume_filter_excluded": excluded,
+                    "spine_valid": manual_valid and not excluded,
+                }
+            )
+    if refresh_summaries:
+        _refresh_result_summaries(filtered)
+    return filtered, audit
+
+
+def filtered_measurement_result(
+    manifest: dict[str, object], specimen_index: int
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    enabled, cutoff = spine_volume_filter_settings(manifest)
+    return apply_spine_volume_filter(
+        load_measurement_result(manifest, specimen_index),
+        enabled=enabled,
+        cutoff_um3=cutoff,
+        force_keep_ids=specimen_volume_filter_overrides(manifest, specimen_index),
+    )
+
+
 def _profile(values: list[dict[str, object]]) -> list[float | None]:
     return [
         _mean(
@@ -369,6 +492,14 @@ def _refresh_result_summaries(result: dict[str, object]) -> None:
     for row in cluster_rows:
         row["spine_valid"] = validity.get(int(row.get("spine_id") or 0), True)
     valid_spines = [row for row in spine_rows if bool(row.get("spine_valid", True))]
+    manually_invalid = [
+        row
+        for row in spine_rows
+        if not bool(row.get("manual_spine_valid", row.get("spine_valid", True)))
+    ]
+    volume_filtered = [
+        row for row in spine_rows if bool(row.get("volume_filter_excluded", False))
+    ]
     valid_clusters = [
         row
         for row in cluster_rows
@@ -450,7 +581,8 @@ def _refresh_result_summaries(result: dict[str, object]) -> None:
                 [float(row["volume_inside_spine_um3"]) for row in valid_clusters]
             ),
             "average_protein_distribution": _profile(included_distribution),
-            "invalid_spine_count": len(spine_rows) - len(valid_spines),
+            "invalid_spine_count": len(manually_invalid),
+            "volume_filtered_spine_count": len(volume_filtered),
             "distribution_included_spine_count": len(included_distribution),
         }
     )
@@ -866,6 +998,123 @@ def distribution_summary_rows(
     return specimen_rows, group_rows
 
 
+def spine_volume_distribution_rows(
+    results: list[dict[str, object]],
+    *,
+    filter_enabled: bool,
+    cutoff_um3: float,
+) -> list[dict[str, object]]:
+    """Build pooled and specimen-weighted spine-volume distributions."""
+    spines = [
+        row
+        for result in results
+        for row in result.get("spine_rows", [])
+        if bool(row.get("spine_valid", True))
+    ]
+    values = np.asarray([float(row.get("volume_um3") or 0.0) for row in spines])
+    method = "no valid spines"
+    if values.size == 0:
+        edges = np.asarray([0.0, 1.0], dtype=np.float64)
+    elif float(np.min(values)) == float(np.max(values)):
+        center = float(values[0])
+        padding = max(abs(center) * 0.01, 1e-9)
+        edges = np.asarray([center - padding, center + padding], dtype=np.float64)
+        method = "single bin (constant data)"
+    else:
+        q1, q3 = np.percentile(values, [25.0, 75.0])
+        width = 2.0 * float(q3 - q1) * float(values.size) ** (-1.0 / 3.0)
+        if values.size >= 4 and np.isfinite(width) and width > 0:
+            bin_count = int(np.ceil((float(np.max(values)) - float(np.min(values))) / width))
+            bin_count = min(100, max(1, bin_count))
+            method = "Freedman-Diaconis (shared edges; capped at 100 bins)"
+        else:
+            bin_count = min(100, max(1, int(np.ceil(np.log2(values.size) + 1.0))))
+            method = "Sturges fallback (small sample or zero IQR)"
+        edges = np.linspace(float(np.min(values)), float(np.max(values)), bin_count + 1)
+
+    output: list[dict[str, object]] = [
+        {
+            "row_type": "metadata",
+            "filter_enabled": bool(filter_enabled),
+            "cutoff_um3": float(cutoff_um3),
+            "cutoff_rule": "exclude volume_um3 < cutoff_um3; equality is retained",
+            "binning_method": method,
+            "bin_edges_um3": [float(value) for value in edges],
+            "valid_spine_count": len(spines),
+        }
+    ]
+    if not spines:
+        return output
+
+    groups = sorted({str(row.get("experimental_group", "")) for row in spines})
+    scopes = [("overall", "All", spines)] + [
+        (
+            "group",
+            group,
+            [row for row in spines if str(row.get("experimental_group", "")) == group],
+        )
+        for group in groups
+    ]
+    for scope_type, scope_name, members in scopes:
+        scope_values = np.asarray([float(row.get("volume_um3") or 0.0) for row in members])
+        output.append(
+            {
+                "row_type": "descriptive",
+                "scope_type": scope_type,
+                "scope": scope_name,
+                "n_spines": len(members),
+                "mean_um3": float(np.mean(scope_values)),
+                "sd_um3": float(np.std(scope_values, ddof=1)) if len(members) > 1 else 0.0,
+                "median_um3": float(np.median(scope_values)),
+                "minimum_um3": float(np.min(scope_values)),
+                "q1_um3": float(np.percentile(scope_values, 25.0)),
+                "q3_um3": float(np.percentile(scope_values, 75.0)),
+                "maximum_um3": float(np.max(scope_values)),
+            }
+        )
+        specimen_keys = sorted(
+            {
+                (str(row.get("experimental_group", "")), str(row.get("specimen_id", "")))
+                for row in members
+            }
+        )
+        counts, _ = np.histogram(scope_values, bins=edges)
+        specimen_percentages: list[np.ndarray] = []
+        for group, specimen in specimen_keys:
+            specimen_values = np.asarray(
+                [
+                    float(row.get("volume_um3") or 0.0)
+                    for row in members
+                    if str(row.get("experimental_group", "")) == group
+                    and str(row.get("specimen_id", "")) == specimen
+                ]
+            )
+            specimen_counts, _ = np.histogram(specimen_values, bins=edges)
+            specimen_percentages.append(100.0 * specimen_counts / len(specimen_values))
+        matrix = np.asarray(specimen_percentages, dtype=np.float64)
+        for bin_index, count in enumerate(counts):
+            percentages = matrix[:, bin_index]
+            sd = float(np.std(percentages, ddof=1)) if len(percentages) > 1 else 0.0
+            output.append(
+                {
+                    "row_type": "histogram_bin",
+                    "scope_type": scope_type,
+                    "scope": scope_name,
+                    "bin_index": bin_index + 1,
+                    "bin_left_um3": float(edges[bin_index]),
+                    "bin_right_um3": float(edges[bin_index + 1]),
+                    "right_edge_inclusive": bin_index == len(counts) - 1,
+                    "pooled_spine_count": int(count),
+                    "pooled_percent": 100.0 * float(count) / len(members),
+                    "specimen_percentage_mean": float(np.mean(percentages)),
+                    "specimen_percentage_sd": sd,
+                    "specimen_percentage_sem": sd / np.sqrt(len(percentages)),
+                    "n_specimens": len(percentages),
+                }
+            )
+    return output
+
+
 def cluster_end_comparison_rows(
     result: dict[str, object]
 ) -> list[dict[str, object]]:
@@ -1218,6 +1467,576 @@ def load_spine_review_preview(
     )
 
 
+def _binary_surface_area_um2(
+    mask: np.ndarray, sampling_zyx_um: tuple[float, float, float]
+) -> float:
+    padded = np.pad(np.asarray(mask, dtype=np.uint8), 1)
+    z_step, y_step, x_step = sampling_zyx_um
+    return float(
+        np.count_nonzero(np.diff(padded, axis=0)) * y_step * x_step
+        + np.count_nonzero(np.diff(padded, axis=1)) * z_step * x_step
+        + np.count_nonzero(np.diff(padded, axis=2)) * z_step * y_step
+    )
+
+
+def _symmetric_eigenvalues_3x3(matrix: np.ndarray) -> tuple[float, float, float]:
+    """Eigenvalues of a real symmetric 3x3 matrix without a LAPACK dependency."""
+    value = np.asarray(matrix, dtype=np.float64)
+    q = float(np.trace(value) / 3.0)
+    centered = value - np.eye(3) * q
+    p2 = float(
+        centered[0, 0] ** 2
+        + centered[1, 1] ** 2
+        + centered[2, 2] ** 2
+        + 2.0 * (centered[0, 1] ** 2 + centered[0, 2] ** 2 + centered[1, 2] ** 2)
+    )
+    if p2 <= 0:
+        return q, q, q
+    p = float(np.sqrt(p2 / 6.0))
+    b = centered / p
+    determinant = float(
+        b[0, 0] * (b[1, 1] * b[2, 2] - b[1, 2] * b[2, 1])
+        - b[0, 1] * (b[1, 0] * b[2, 2] - b[1, 2] * b[2, 0])
+        + b[0, 2] * (b[1, 0] * b[2, 1] - b[1, 1] * b[2, 0])
+    )
+    angle = float(np.arccos(np.clip(determinant / 2.0, -1.0, 1.0)) / 3.0)
+    largest = q + 2.0 * p * float(np.cos(angle))
+    smallest = q + 2.0 * p * float(np.cos(angle + 2.0 * np.pi / 3.0))
+    middle = 3.0 * q - largest - smallest
+    return tuple(sorted((smallest, middle, largest)))
+
+
+def _spine_morphology_metrics(
+    calculated,
+    spine: np.ndarray,
+    *,
+    sampling_zyx_um: tuple[float, float, float],
+    global_offset_zyx: tuple[int, int, int],
+    voxel_volume_um3: float,
+    decision: dict[str, object],
+) -> tuple[dict[str, object], np.ndarray]:
+    """Measure reproducible morphology without changing the segmentation mask."""
+    mask = np.asarray(spine, dtype=bool)
+    empty_head = np.zeros(mask.shape, dtype=bool)
+    axis = np.asarray(calculated.axis_points_zyx, dtype=np.int64)
+    if len(axis) < 2:
+        return (
+            {
+                "spine_curvilinear_length_um": None,
+                "spine_base_to_tip_distance_um": None,
+                "centerline_tortuosity": None,
+                "maximum_width_um": None,
+                "head_maximum_width_um": None,
+                "neck_minimum_width_um": None,
+                "neck_median_width_um": None,
+                "head_to_neck_width_ratio": None,
+                "head_volume_um3": None,
+                "neck_volume_um3": None,
+                "surface_area_um2": _binary_surface_area_um2(mask, sampling_zyx_um),
+                "sphericity": None,
+                "principal_axis_elongation": None,
+                "head_neck_border_path_fraction": None,
+                "head_neck_split_status": "no_usable_path",
+                "spine_length_status": str(calculated.axis_status),
+                "spine_length_uses_virtual_bridge": bool(calculated.bridge_used),
+                "centerline_bridge_length_um": float(calculated.bridge_length_um),
+                "centerline_base_zyx": None,
+                "centerline_tip_zyx": None,
+                "centerline_base_source": str(calculated.base_source),
+                "centerline_tip_source": str(calculated.endpoint_source),
+                "geometry_reviewed": bool(decision.get("reviewed", False)),
+                "geometry_review_note": str(decision.get("note", "")),
+            },
+            empty_head,
+        )
+
+    sampling = np.asarray(sampling_zyx_um, dtype=np.float64)
+    offset = np.asarray(global_offset_zyx, dtype=np.int64)
+    local_axis = axis - offset
+    physical_axis = axis.astype(np.float64) * sampling
+    steps = np.linalg.norm(np.diff(physical_axis, axis=0), axis=1)
+    cumulative = np.r_[0.0, np.cumsum(steps)]
+    length = float(cumulative[-1])
+    straight = float(np.linalg.norm(physical_axis[-1] - physical_axis[0]))
+    distance = ndimage.distance_transform_edt(mask, sampling=sampling_zyx_um)
+    axis_radii = distance[tuple(local_axis.T)]
+    maximum_width = 2.0 * float(np.max(distance[mask])) if np.any(mask) else None
+
+    border_index = max(1, min(len(axis_radii) - 1, int(round(len(axis_radii) * 0.65))))
+    split_status = "automatic_low_contrast"
+    neck_radius: float | None = None
+    head_radius: float | None = None
+    if len(axis_radii) >= 4:
+        distal_start = min(len(axis_radii) - 2, max(1, int(len(axis_radii) * 0.35)))
+        head_peak = distal_start + int(np.argmax(axis_radii[distal_start:]))
+        neck_start = max(1, int(len(axis_radii) * 0.05))
+        if head_peak > neck_start:
+            neck_index = neck_start + int(np.argmin(axis_radii[neck_start:head_peak]))
+            neck_radius = float(axis_radii[neck_index])
+            head_radius = float(axis_radii[head_peak])
+            threshold = neck_radius + (head_radius - neck_radius) * 0.5
+            crossings = np.flatnonzero(axis_radii[neck_index : head_peak + 1] >= threshold)
+            if len(crossings):
+                border_index = neck_index + int(crossings[0])
+            split_status = (
+                "automatic" if head_radius >= max(1e-12, neck_radius) * 1.10
+                else "automatic_no_distinct_neck"
+            )
+
+    path_volume = np.zeros(mask.shape, dtype=bool)
+    path_volume[tuple(local_axis.T)] = True
+    _distance_to_path, nearest = ndimage.distance_transform_edt(
+        ~path_volume, sampling=sampling_zyx_um, return_indices=True
+    )
+    path_indices = np.full(mask.shape, -1, dtype=np.int32)
+    path_indices[tuple(local_axis.T)] = np.arange(len(local_axis), dtype=np.int32)
+    nearest_index = path_indices[tuple(nearest)]
+    head_mask = mask & (nearest_index >= border_index)
+
+    for key, value in (("head_override_voxels_zyx", True), ("neck_override_voxels_zyx", False)):
+        for point in decision.get(key, []):
+            if not isinstance(point, (list, tuple)) or len(point) != 3:
+                continue
+            local = tuple(int(point[axis_index]) - int(offset[axis_index]) for axis_index in range(3))
+            if all(0 <= local[axis_index] < mask.shape[axis_index] for axis_index in range(3)) and mask[local]:
+                head_mask[local] = value
+    if decision.get("head_override_voxels_zyx") or decision.get("neck_override_voxels_zyx"):
+        split_status = "manual"
+    neck_mask = mask & ~head_mask
+    surface_area = _binary_surface_area_um2(mask, sampling_zyx_um)
+    volume = float(np.count_nonzero(mask)) * voxel_volume_um3
+    sphericity = (
+        float(np.pi ** (1.0 / 3.0) * (6.0 * volume) ** (2.0 / 3.0) / surface_area)
+        if volume > 0 and surface_area > 0
+        else None
+    )
+    coordinates = np.argwhere(mask).astype(np.float64) * sampling
+    elongation = None
+    if len(coordinates) >= 3:
+        centered_coordinates = coordinates - np.mean(coordinates, axis=0)
+        covariance = np.asarray(
+            [
+                [
+                    float(np.sum(centered_coordinates[:, row] * centered_coordinates[:, column]))
+                    / max(1, len(coordinates) - 1)
+                    for column in range(3)
+                ]
+                for row in range(3)
+            ]
+        )
+        eigenvalues = _symmetric_eigenvalues_3x3(covariance)
+        if eigenvalues[-1] > 0:
+            elongation = float(np.sqrt(eigenvalues[-1] / max(eigenvalues[0], 1e-12)))
+    head_width = 2.0 * float(np.max(distance[head_mask])) if np.any(head_mask) else None
+    neck_axis_radii = axis_radii[: max(1, border_index)]
+    neck_minimum = 2.0 * float(np.min(neck_axis_radii)) if len(neck_axis_radii) else None
+    neck_median = 2.0 * float(np.median(neck_axis_radii)) if len(neck_axis_radii) else None
+    return (
+        {
+            "spine_curvilinear_length_um": length,
+            "spine_base_to_tip_distance_um": straight,
+            "centerline_tortuosity": length / straight if straight > 0 else None,
+            "maximum_width_um": maximum_width,
+            "head_maximum_width_um": head_width,
+            "neck_minimum_width_um": neck_minimum,
+            "neck_median_width_um": neck_median,
+            "head_to_neck_width_ratio": (
+                head_width / neck_median
+                if head_width is not None and neck_median not in (None, 0.0)
+                else None
+            ),
+            "head_volume_um3": float(np.count_nonzero(head_mask)) * voxel_volume_um3,
+            "neck_volume_um3": float(np.count_nonzero(neck_mask)) * voxel_volume_um3,
+            "surface_area_um2": surface_area,
+            "sphericity": sphericity,
+            "principal_axis_elongation": elongation,
+            "head_neck_border_path_fraction": float(cumulative[border_index] / length),
+            "head_neck_split_status": split_status,
+            "spine_length_status": str(calculated.axis_status),
+            "spine_length_uses_virtual_bridge": bool(calculated.bridge_used),
+            "centerline_bridge_length_um": float(calculated.bridge_length_um),
+            "centerline_base_zyx": list(calculated.base_point_zyx) if calculated.base_point_zyx else None,
+            "centerline_tip_zyx": list(calculated.endpoint_zyx) if calculated.endpoint_zyx else None,
+            "centerline_base_source": str(calculated.base_source),
+            "centerline_tip_source": str(calculated.endpoint_source),
+            "geometry_reviewed": bool(decision.get("reviewed", False)),
+            "geometry_review_note": str(decision.get("note", "")),
+        },
+        head_mask,
+    )
+
+
+def _calculate_morphology_spine(
+    manifest: dict[str, object],
+    specimen_index: int,
+    spine_id: int,
+    result: dict[str, object],
+):  # type: ignore[no-untyped-def]
+    geometry = result.get("morphology_geometry", result.get("distribution_geometry", {})).get(
+        str(spine_id)
+    )
+    if geometry is None:
+        raise ValueError("Saved all-spine morphology geometry is unavailable; recalculate measurements.")
+    bounds = geometry["bounds_zyx"]
+    y_slice = slice(int(bounds[1][0]), int(bounds[1][1]))
+    x_slice = slice(int(bounds[2][0]), int(bounds[2][1]))
+    editable, detection, _corrected, _signature = _mask_sources(manifest, specimen_index)
+    spine_labels = np.asarray(editable["spine_labels"][:, y_slice, x_slice], dtype=np.uint32)
+    spine = spine_labels == spine_id
+    if not np.any(spine):
+        raise ValueError("The selected spine is no longer present in its saved region.")
+    spine_row = next(
+        (row for row in result.get("spine_rows", []) if int(row["spine_id"]) == spine_id),
+        None,
+    )
+    if spine_row is None:
+        raise ValueError("The selected spine has no saved measurement row.")
+    parent_id = int(spine_row.get("dendrite_id") or 0)
+    dendrites = np.asarray(editable["dendrite_labels"][:, y_slice, x_slice], dtype=np.uint32)
+    parent = dendrites == parent_id if parent_id else dendrites > 0
+    cluster_labels = np.asarray(detection["cluster_labels"][:, y_slice, x_slice], dtype=np.uint32)
+    clusters = np.zeros(spine.shape, dtype=bool)
+    included_ids = {
+        int(row["cluster_id"])
+        for row in result.get("cluster_rows", [])
+        if row.get("row_type") == "individual_cluster"
+        and int(row.get("spine_id") or 0) == spine_id
+    }
+    trim_details = result.get("cluster_trim_details", {})
+    for cluster_id in included_ids:
+        discarded = {
+            int(value)
+            for value in trim_details.get(str(cluster_id), {}).get("discarded_z_slices", [])
+        }
+        for z_index in range(spine.shape[0]):
+            if z_index not in discarded:
+                clusters[z_index] |= (cluster_labels[z_index] == cluster_id) & spine[z_index]
+    specimen = manifest["specimens"][specimen_index]
+    decision = specimen.setdefault(
+        "morphology_review", {"spines": {}, "updated_at": None}
+    ).setdefault("spines", {}).setdefault(str(spine_id), {})
+    base_value = decision.get("centerline_base_hint_zyx")
+    tip_value = decision.get("centerline_endpoint_hint_zyx")
+    base_hint = tuple(int(value) for value in base_value) if isinstance(base_value, (list, tuple)) and len(base_value) == 3 else None
+    tip_hint = tuple(int(value) for value in tip_value) if isinstance(tip_value, (list, tuple)) and len(tip_value) == 3 else None
+    xy = float(manifest["calibration"]["xy_um_per_pixel"])
+    z_step = float(manifest["calibration"]["z_step_um"])
+    calculated = calculate_spine_distribution(
+        spine,
+        parent,
+        clusters,
+        sampling_zyx_um=(z_step, xy, xy),
+        global_offset_zyx=(0, y_slice.start, x_slice.start),
+        endpoint_hint_zyx=tip_hint,
+        base_hint_zyx=base_hint,
+        guidance_image=_distribution_guidance(manifest, specimen_index, y_slice, x_slice),
+        maximum_gap_um=float(
+            manifest["measurements"]["settings"].get("maximum_centerline_gap_um", 1.0)
+        ),
+    )
+    morphology, head_mask = _spine_morphology_metrics(
+        calculated,
+        spine,
+        sampling_zyx_um=(z_step, xy, xy),
+        global_offset_zyx=(0, y_slice.start, x_slice.start),
+        voxel_volume_um3=float(result["voxel_volume_um3"]),
+        decision=decision,
+    )
+    return calculated, morphology, head_mask, spine, clusters, y_slice, x_slice, parent_id
+
+
+def _checkpoint_morphology_spine(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    spine_id: int,
+) -> dict[str, object]:
+    result = load_measurement_result(manifest, specimen_index)
+    calculated, morphology, _head, _spine, _clusters, y_slice, x_slice, parent_id = (
+        _calculate_morphology_spine(manifest, specimen_index, spine_id, result)
+    )
+    identity = {
+        "experimental_group": manifest["specimens"][specimen_index]["experimental_group"],
+        "specimen_id": manifest["specimens"][specimen_index]["specimen_id"],
+        "roi_id": next(
+            int(row.get("roi_id") or 0)
+            for row in result.get("spine_rows", [])
+            if int(row["spine_id"]) == spine_id
+        ),
+        "dendrite_id": parent_id,
+        "spine_id": spine_id,
+    }
+    morphology_row = {**identity, **morphology}
+    rows = result.setdefault("morphology_rows", [])
+    existing = next((row for row in rows if int(row["spine_id"]) == spine_id), None)
+    if existing is None:
+        rows.append(morphology_row)
+    else:
+        existing.clear()
+        existing.update(morphology_row)
+    spine_row = next(row for row in result["spine_rows"] if int(row["spine_id"]) == spine_id)
+    for key in (
+        "spine_curvilinear_length_um", "spine_base_to_tip_distance_um",
+        "spine_length_status", "spine_length_uses_virtual_bridge",
+        "centerline_bridge_length_um", "centerline_base_zyx", "centerline_tip_zyx",
+        "centerline_base_source", "centerline_tip_source", "geometry_reviewed",
+    ):
+        spine_row[key] = morphology.get(key)
+    validity_decision = manifest["specimens"][specimen_index].setdefault(
+        "distribution_review", {"spines": {}, "updated_at": None}
+    ).setdefault("spines", {}).get(str(spine_id), {})
+    spine_row["spine_valid"] = not bool(validity_decision.get("invalid_spine", False))
+    spine_row["validity_reviewed"] = bool(
+        validity_decision.get("validity_reviewed", validity_decision.get("reviewed", False))
+    )
+    spine_row["validity_note"] = str(validity_decision.get("note", ""))
+    distribution = next(
+        (row for row in result.get("distribution_rows", []) if int(row["spine_id"]) == spine_id),
+        None,
+    )
+    if distribution is not None:
+        refreshed = distribution_row(
+            calculated,
+            experimental_group=str(identity["experimental_group"]),
+            specimen_id=str(identity["specimen_id"]),
+            dendrite_id=parent_id,
+            spine_id=spine_id,
+            voxel_volume_um3=float(result["voxel_volume_um3"]),
+        )
+        preserved = {
+            key: value
+            for key, value in distribution.items()
+            if key in {
+                "distribution_reviewed", "distribution_included",
+                "distribution_review_required", "roi_id", "spine_valid",
+                "review_note", "centerline_endpoint_hint_valid",
+                "centerline_endpoint_hint_present", "centerline_hint_history",
+            }
+        }
+        distribution.clear()
+        distribution.update(refreshed)
+        distribution.update(preserved)
+        distribution["spine_valid"] = bool(spine_row["spine_valid"])
+    geometry = {
+        "bounds_zyx": [[0, int(_spine.shape[0])], [y_slice.start, y_slice.stop], [x_slice.start, x_slice.stop]],
+        "axis_points_zyx": [list(point) for point in calculated.axis_points_zyx],
+        "base_point_zyx": list(calculated.base_point_zyx) if calculated.base_point_zyx else None,
+        "endpoint_zyx": list(calculated.endpoint_zyx) if calculated.endpoint_zyx else None,
+        "bridge_points_zyx": [list(point) for point in calculated.bridge_points_zyx],
+        "bridge_length_um": calculated.bridge_length_um,
+    }
+    result.setdefault("morphology_geometry", {})[str(spine_id)] = geometry
+    result.setdefault("distribution_geometry", {})[str(spine_id)] = geometry
+    _refresh_result_summaries(result)
+    _write_result(measurement_result_path(manifest, specimen_index), result)
+    checkpoint = manifest["specimens"][specimen_index]["checkpoints"].setdefault("measurements", {})
+    checkpoint["morphology_review_updated_at"] = time.time()
+    for run in manifest.get("morphology_analysis", {}).get("runs", []):
+        run["stale"] = True
+    save_project(project_path, manifest)
+    return result
+
+
+def apply_morphology_review_edit(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    spine_id: int,
+    *,
+    operation: str,
+    point_zyx: tuple[int, int, int] | None = None,
+    strokes_xy: tuple[tuple[tuple[int, int], ...], ...] = (),
+    maximum_projection: bool = True,
+    z_index: int = 0,
+    z_radius: int = 0,
+    brush_radius: int = 2,
+    reviewed: bool | None = None,
+    note: str | None = None,
+    invalid_spine: bool | None = None,
+) -> dict[str, object]:
+    specimen = manifest["specimens"][specimen_index]
+    review = specimen.setdefault("morphology_review", {"spines": {}, "updated_at": None})
+    decision = review.setdefault("spines", {}).setdefault(str(spine_id), {})
+    history = decision.setdefault("history", [])
+    history.append({
+        "snapshot": {
+            key: value
+            for key, value in decision.items()
+            if key not in {"history", "redo_history"}
+        },
+        "updated_at": time.time(),
+    })
+    decision.pop("redo_history", None)
+    if operation in {"set_base", "set_tip"}:
+        if point_zyx is None:
+            raise ValueError("Select a spine voxel for the centerline anchor.")
+        key = "centerline_base_hint_zyx" if operation == "set_base" else "centerline_endpoint_hint_zyx"
+        decision[key] = [int(value) for value in point_zyx]
+    elif operation in {"paint_head", "paint_neck"}:
+        result = load_measurement_result(manifest, specimen_index)
+        geometry = result.get("morphology_geometry", {}).get(str(spine_id))
+        if geometry is None:
+            raise ValueError("Recalculate measurements before editing morphology.")
+        bounds = geometry["bounds_zyx"]
+        y0, x0 = int(bounds[1][0]), int(bounds[2][0])
+        y1, x1 = int(bounds[1][1]), int(bounds[2][1])
+        editable, _detection, _corrected, _signature = _mask_sources(manifest, specimen_index)
+        labels = editable["spine_labels"]
+        local_spine = np.asarray(labels[:, y0:y1, x0:x1], dtype=np.uint32) == spine_id
+        paint = np.zeros(local_spine.shape[1:], dtype=bool)
+        for stroke in strokes_xy:
+            for x, y in stroke:
+                if 0 <= y < paint.shape[0] and 0 <= x < paint.shape[1]:
+                    paint[y, x] = True
+        if brush_radius > 0 and np.any(paint):
+            coordinates = np.arange(-brush_radius, brush_radius + 1)
+            yy, xx = np.meshgrid(coordinates, coordinates, indexing="ij")
+            disk = xx * xx + yy * yy <= brush_radius * brush_radius
+            paint = ndimage.binary_dilation(paint, structure=disk)
+        selected_mask = local_spine & paint[None, :, :]
+        if not maximum_projection:
+            allowed_z = np.zeros(local_spine.shape[0], dtype=bool)
+            allowed_z[
+                max(0, z_index - z_radius) : min(local_spine.shape[0], z_index + z_radius + 1)
+            ] = True
+            selected_mask &= allowed_z[:, None, None]
+        selected = {
+            (int(z), int(y0 + y), int(x0 + x))
+            for z, y, x in np.argwhere(selected_mask)
+        }
+        target = "head_override_voxels_zyx" if operation == "paint_head" else "neck_override_voxels_zyx"
+        opposite = "neck_override_voxels_zyx" if operation == "paint_head" else "head_override_voxels_zyx"
+        target_values = {tuple(int(value) for value in point) for point in decision.get(target, [])}
+        opposite_values = {tuple(int(value) for value in point) for point in decision.get(opposite, [])}
+        target_values |= selected
+        opposite_values -= selected
+        decision[target] = [list(point) for point in sorted(target_values)]
+        decision[opposite] = [list(point) for point in sorted(opposite_values)]
+    elif operation == "reset_border":
+        decision.pop("head_override_voxels_zyx", None)
+        decision.pop("neck_override_voxels_zyx", None)
+    elif operation == "reset_anchors":
+        decision.pop("centerline_base_hint_zyx", None)
+        decision.pop("centerline_endpoint_hint_zyx", None)
+    elif operation == "checkpoint":
+        pass
+    else:
+        raise ValueError("Unknown morphology review operation.")
+    if reviewed is not None:
+        decision["reviewed"] = bool(reviewed)
+    if note is not None:
+        decision["note"] = str(note).strip()
+    if invalid_spine is not None:
+        validity_review = specimen.setdefault(
+            "distribution_review", {"spines": {}, "updated_at": None}
+        )
+        validity = validity_review.setdefault("spines", {}).setdefault(str(spine_id), {})
+        validity.update(
+            {
+                "invalid_spine": bool(invalid_spine),
+                "validity_reviewed": True,
+                "reviewed": True,
+                "note": str(note).strip() if note is not None else str(validity.get("note", "")),
+                "review_kind": "morphology_geometry",
+                "updated_at": time.time(),
+            }
+        )
+        validity_review["updated_at"] = validity["updated_at"]
+    decision["updated_at"] = time.time()
+    review["updated_at"] = decision["updated_at"]
+    return _checkpoint_morphology_spine(manifest, project_path, specimen_index, spine_id)
+
+
+def undo_morphology_review(
+    manifest: dict[str, object], project_path: str | Path, specimen_index: int, spine_id: int
+) -> dict[str, object]:
+    decision = manifest["specimens"][specimen_index].setdefault(
+        "morphology_review", {"spines": {}, "updated_at": None}
+    ).setdefault("spines", {}).setdefault(str(spine_id), {})
+    history = decision.get("history", [])
+    if not history:
+        raise ValueError("There is no morphology edit to undo.")
+    current = {
+        key: value
+        for key, value in decision.items()
+        if key not in {"history", "redo_history"}
+    }
+    redo_history = list(decision.get("redo_history", []))
+    redo_history.append({"snapshot": current, "updated_at": time.time()})
+    snapshot = history.pop().get("snapshot", {})
+    decision.clear()
+    decision.update(snapshot)
+    decision["history"] = history
+    decision["redo_history"] = redo_history
+    return _checkpoint_morphology_spine(manifest, project_path, specimen_index, spine_id)
+
+
+def redo_morphology_review(
+    manifest: dict[str, object], project_path: str | Path, specimen_index: int, spine_id: int
+) -> dict[str, object]:
+    decision = manifest["specimens"][specimen_index].setdefault(
+        "morphology_review", {"spines": {}, "updated_at": None}
+    ).setdefault("spines", {}).setdefault(str(spine_id), {})
+    redo_history = decision.get("redo_history", [])
+    if not redo_history:
+        raise ValueError("There is no morphology edit to redo.")
+    current = {
+        key: value
+        for key, value in decision.items()
+        if key not in {"history", "redo_history"}
+    }
+    history = list(decision.get("history", []))
+    history.append({"snapshot": current, "updated_at": time.time()})
+    snapshot = redo_history.pop().get("snapshot", {})
+    decision.clear()
+    decision.update(snapshot)
+    decision["history"] = history
+    decision["redo_history"] = redo_history
+    return _checkpoint_morphology_spine(manifest, project_path, specimen_index, spine_id)
+
+
+def load_morphology_preview(
+    manifest: dict[str, object], specimen_index: int, spine_id: int
+) -> MorphologyPreview:
+    result = load_measurement_result(manifest, specimen_index)
+    calculated, morphology, head, spine, clusters, y_slice, x_slice, _parent = (
+        _calculate_morphology_spine(manifest, specimen_index, spine_id, result)
+    )
+    role_channels = {role: channel for channel, role in manifest["channel_roles"].items()}
+    specimen = manifest["specimens"][specimen_index]
+    stacks: dict[str, np.ndarray] = {}
+    for role in ("dendrite_spines", "protein_clusters"):
+        source = channel_source_path(manifest, specimen["channels"][role_channels[role]])
+        try:
+            stack = np.squeeze(tifffile.memmap(source))
+        except ValueError:
+            stack = np.squeeze(tifffile.imread(source, out="memmap"))
+        stacks[role] = (
+            np.array(stack[y_slice, x_slice], dtype=np.uint16, copy=True)[None]
+            if stack.ndim == 2
+            else np.array(stack[:, y_slice, x_slice], dtype=np.uint16, copy=True)
+        )
+        del stack
+    axis = tuple((int(point[0]), int(point[1]) - y_slice.start, int(point[2]) - x_slice.start) for point in calculated.axis_points_zyx)
+    base = axis[0] if axis else None
+    tip = axis[-1] if axis else None
+    occupied = np.flatnonzero(np.any(spine, axis=(1, 2)))
+    row = next(item for item in result.get("morphology_rows", []) if int(item["spine_id"]) == spine_id)
+    return MorphologyPreview(
+        dendrite_stack=stacks["dendrite_spines"],
+        protein_stack=stacks["protein_clusters"],
+        spine_mask_stack=spine,
+        head_mask_stack=head,
+        cluster_mask_stack=clusters,
+        axis_points_local_zyx=axis,
+        base_point_local_zyx=base,
+        tip_point_local_zyx=tip,
+        crop_origin_yx=(y_slice.start, x_slice.start),
+        spine_z_range=(int(occupied[0]), int(occupied[-1])),
+        row={**dict(row), **morphology},
+    )
+
+
 def measure_specimen(
     manifest: dict[str, object],
     specimen_index: int,
@@ -1394,11 +2213,16 @@ def measure_specimen(
 
     distribution_rows: list[dict[str, object]] = []
     distribution_geometry: dict[str, dict[str, object]] = {}
+    morphology_rows: list[dict[str, object]] = []
     spine_bounds = ndimage.find_objects(spine_projection)
     saved_reviews = specimen.setdefault(
         "distribution_review", {"spines": {}, "updated_at": None}
     ).setdefault("spines", {})
-    for spine_id, included_clusters in sorted(included_by_spine.items()):
+    saved_morphology_reviews = specimen.setdefault(
+        "morphology_review", {"spines": {}, "updated_at": None}
+    ).setdefault("spines", {})
+    for spine_id in sorted(spine_volume_by_id):
+        included_clusters = included_by_spine.get(spine_id, [])
         bounds_2d = (
             spine_bounds[spine_id - 1]
             if spine_id - 1 < len(spine_bounds)
@@ -1430,7 +2254,11 @@ def measure_specimen(
                     & local_spine[z_index]
                 )
         decision = saved_reviews.get(str(spine_id), {})
-        hint_value = decision.get("centerline_endpoint_hint_zyx")
+        morphology_decision = saved_morphology_reviews.get(str(spine_id), {})
+        hint_value = morphology_decision.get(
+            "centerline_endpoint_hint_zyx",
+            decision.get("centerline_endpoint_hint_zyx"),
+        )
         hint = (
             tuple(int(value) for value in hint_value)
             if isinstance(hint_value, (list, tuple)) and len(hint_value) == 3
@@ -1458,6 +2286,12 @@ def measure_specimen(
                 decision["reviewed"] = False
                 decision["distribution_reviewed"] = False
         decision["centerline_endpoint_hint_valid"] = hint_valid
+        base_hint_value = morphology_decision.get("centerline_base_hint_zyx")
+        base_hint = (
+            tuple(int(value) for value in base_hint_value)
+            if isinstance(base_hint_value, (list, tuple)) and len(base_hint_value) == 3
+            else None
+        )
         calculated = calculate_spine_distribution(
             local_spine,
             local_parent,
@@ -1465,6 +2299,7 @@ def measure_specimen(
             sampling_zyx_um=(z_step, xy_size, xy_size),
             global_offset_zyx=(0, y_slice.start, x_slice.start),
             endpoint_hint_zyx=hint if hint_valid else None,
+            base_hint_zyx=base_hint,
             guidance_image=_distribution_guidance(
                 manifest, specimen_index, y_slice, x_slice
             ),
@@ -1500,7 +2335,26 @@ def measure_specimen(
                 ),
             }
         )
-        distribution_rows.append(row)
+        if included_clusters:
+            distribution_rows.append(row)
+        morphology_values, _head_mask = _spine_morphology_metrics(
+            calculated,
+            local_spine,
+            sampling_zyx_um=(z_step, xy_size, xy_size),
+            global_offset_zyx=(0, y_slice.start, x_slice.start),
+            voxel_volume_um3=voxel_volume,
+            decision=morphology_decision,
+        )
+        morphology_rows.append(
+            {
+                "experimental_group": specimen["experimental_group"],
+                "specimen_id": specimen["specimen_id"],
+                "roi_id": spine_roi.get(spine_id, 0),
+                "dendrite_id": parent_id,
+                "spine_id": spine_id,
+                **morphology_values,
+            }
+        )
         distribution_geometry[str(spine_id)] = {
             "bounds_zyx": [
                 [0, z_count],
@@ -1515,6 +2369,9 @@ def measure_specimen(
         }
 
     spine_rows: list[dict[str, object]] = []
+    morphology_by_spine = {
+        int(row["spine_id"]): row for row in morphology_rows
+    }
     for spine_id in range(1, maximum_spine + 1):
         voxel_count = int(spine_voxels[spine_id])
         if not voxel_count:
@@ -1522,6 +2379,7 @@ def measure_specimen(
         volume = voxel_count * voxel_volume
         included = included_by_spine.get(spine_id, [])
         cluster_sum = sum(float(row["volume_inside_spine_um3"]) for row in included)
+        morphology = morphology_by_spine.get(spine_id, {})
         spine_rows.append(
             {
                 "experimental_group": specimen["experimental_group"],
@@ -1535,6 +2393,24 @@ def measure_specimen(
                 "included_cluster_count": len(included),
                 "inside_cluster_volume_sum_um3": cluster_sum,
                 "cluster_to_spine_volume_ratio": cluster_sum / volume if volume else None,
+                "spine_curvilinear_length_um": morphology.get(
+                    "spine_curvilinear_length_um"
+                ),
+                "spine_base_to_tip_distance_um": morphology.get(
+                    "spine_base_to_tip_distance_um"
+                ),
+                "spine_length_status": morphology.get("spine_length_status"),
+                "spine_length_uses_virtual_bridge": morphology.get(
+                    "spine_length_uses_virtual_bridge", False
+                ),
+                "centerline_bridge_length_um": morphology.get(
+                    "centerline_bridge_length_um", 0.0
+                ),
+                "centerline_base_zyx": morphology.get("centerline_base_zyx"),
+                "centerline_tip_zyx": morphology.get("centerline_tip_zyx"),
+                "centerline_base_source": morphology.get("centerline_base_source"),
+                "centerline_tip_source": morphology.get("centerline_tip_source"),
+                "geometry_reviewed": morphology.get("geometry_reviewed", False),
                 "protein_distribution_in_spine": next(
                     (
                         [row.get(f"bin_{index:02d}_ratio") for index in range(1, 11)]
@@ -1694,6 +2570,8 @@ def measure_specimen(
         "cluster_rows": cluster_rows,
         "distribution_rows": distribution_rows,
         "distribution_geometry": distribution_geometry,
+        "morphology_rows": morphology_rows,
+        "morphology_geometry": distribution_geometry,
         "cluster_trim_details": {str(key): value for key, value in trim_details.items()},
     }
     _refresh_result_summaries(result)
@@ -1769,6 +2647,9 @@ def measure_project(
                 "summary": asdict(summary),
             }
         )
+        if not summary.skipped:
+            for run in manifest.get("morphology_analysis", {}).get("runs", []):
+                run["stale"] = True
         save_project(project_path, manifest)
         summaries.append(asdict(summary))
         completed_work += work_units[specimen_index]

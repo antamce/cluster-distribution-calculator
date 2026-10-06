@@ -164,10 +164,19 @@ def discard_specimen_review(
         "edit_count": 0,
     }
     specimen["distribution_review"] = {"spines": {}, "updated_at": None}
+    _invalidate_morphology_after_mask_change(manifest, specimen)
+    save_project(project_path, manifest)
+
+
+def _invalidate_morphology_after_mask_change(
+    manifest: dict[str, object], specimen: dict[str, object]
+) -> None:
+    specimen["morphology_review"] = {"spines": {}, "updated_at": None}
     specimen["checkpoints"].setdefault("measurements", {}).update(
         {"state": "not_started", "updated_at": time.time()}
     )
-    save_project(project_path, manifest)
+    for run in manifest.get("morphology_analysis", {}).get("runs", []):
+        run["stale"] = True
 
 
 def _compressor() -> Blosc:
@@ -1239,9 +1248,7 @@ def _apply_add_hints(
             "detection_signature": group.attrs["detection_signature"],
         }
     )
-    specimen["checkpoints"].setdefault("measurements", {}).update(
-        {"state": "not_started", "updated_at": time.time()}
-    )
+    _invalidate_morphology_after_mask_change(manifest, specimen)
     with diagnostic_span(diagnostic, "project_checkpoint_save"):
         save_project(project_path, manifest)
     return ReviewResult(
@@ -1496,9 +1503,7 @@ def _apply_projection_mask_transfer(
             "detection_signature": group.attrs["detection_signature"],
         }
     )
-    specimen["checkpoints"].setdefault("measurements", {}).update(
-        {"state": "not_started", "updated_at": time.time()}
-    )
+    _invalidate_morphology_after_mask_change(manifest, specimen)
     with diagnostic_span(diagnostic, "project_checkpoint_save"):
         save_project(project_path, manifest)
     return ReviewResult(
@@ -1652,9 +1657,7 @@ def _apply_eraser(
             "detection_signature": group.attrs["detection_signature"],
         }
     )
-    specimen["checkpoints"].setdefault("measurements", {}).update(
-        {"state": "not_started", "updated_at": time.time()}
-    )
+    _invalidate_morphology_after_mask_change(manifest, specimen)
     with diagnostic_span(diagnostic, "project_checkpoint_save"):
         save_project(project_path, manifest)
     return ReviewResult(
@@ -2197,9 +2200,7 @@ def apply_review_action(
             "detection_signature": group.attrs["detection_signature"],
         }
     )
-    specimen["checkpoints"].setdefault("measurements", {}).update(
-        {"state": "not_started", "updated_at": time.time()}
-    )
+    _invalidate_morphology_after_mask_change(manifest, specimen)
     with diagnostic_span(diagnostic, "project_checkpoint_save"):
         save_project(project_path, manifest)
     return ReviewResult(
@@ -2287,9 +2288,7 @@ def undo_last_review_action(
     checkpoint = specimen["checkpoints"]["review"]
     checkpoint["updated_at"] = time.time()
     checkpoint["edit_count"] = max(0, int(checkpoint.get("edit_count", 1)) - 1)
-    specimen["checkpoints"].setdefault("measurements", {}).update(
-        {"state": "not_started", "updated_at": time.time()}
-    )
+    _invalidate_morphology_after_mask_change(manifest, specimen)
     specimen["review"]["state"] = "in_progress"
     with diagnostic_span(diagnostic, "project_checkpoint_save"):
         save_project(project_path, manifest)

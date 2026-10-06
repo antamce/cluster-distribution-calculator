@@ -9,9 +9,11 @@ copied only when the user explicitly includes them in a transfer ZIP.
 ## Current project status
 
 The current version is `0.8.0 Beta`. The end-to-end workflow through flexible
-import, preprocessing, detection, correction, measurement, spine review, and
-tabular/PDF export is user-approved. See [HANDOFF.md](HANDOFF.md) for architecture,
-scientific constraints, and development history.
+import, preprocessing, detection, correction, measurement, spine review,
+reversible volume filtering, all-spine morphology review, PCA/UMAP/PCUMAP
+clustering, and tabular/PDF/figure export is user-approved. See
+[HANDOFF.md](HANDOFF.md) for architecture, scientific constraints, and development
+history.
 
 This repository intentionally excludes microscopy TIFFs, project manifests, and
 generated Zarr caches. They are user data or runtime artifacts, not source files.
@@ -412,6 +414,153 @@ same fixed shaft-to-tip palette, its curved axis and ten-bin profile. The crop
 margin is adjustable; excluded-distribution and invalid-spine audit PDFs are
 separate options. Segmentation-mask/ImageJ ROI export remains part of the later
 final-export stage.
+
+The measurement panel also has a reversible **spine-volume export filter**. It
+excludes spines with `volume_um3` strictly below one project-wide cutoff; a spine
+exactly equal to the cutoff is retained. A preview shows the volume histogram,
+removed counts by group/specimen, cluster-positive removals, zero-result warnings,
+and a sortable per-spine **Keep** override table. Keep overrides only the volume
+rule and never restores a manually invalid spine. The filter changes neither masks
+nor cached measurements, so changing it immediately rebuilds the displayed and
+exported summaries without remeasurement.
+
+Filtered project exports remove those spines and their linked cluster/distribution
+rows from scientific tables and optional PDFs, recalculate all supported ROI,
+dendrite, specimen and group statistics, and write a separate
+`Volume_Filtered_Spines` audit. `Spine_Volume_Distribution` contains numeric shared
+Freedman-Diaconis bins (documented Sturges/constant-data fallbacks), pooled counts
+and percentages, specimen-weighted mean/SD/SEM, and descriptive statistics for
+only effectively valid spines.
+
+Use **File -> Filter exported measurement workbook...** when only a Synpo `.xlsx`
+file is available. Synpo writes a new `_volume-filtered.xlsx` plus a complete CSV
+directory, preserves unrecognized user-added sheets, and never overwrites the
+source workbook. `Compatibility_Report` identifies every exactly recalculated or
+unavailable legacy table; unsupported summaries are explicitly marked rather than
+left stale. Standalone filtering cannot regenerate image PDFs because the workbook
+does not contain source pixels or project cache data.
+
+## Stage 7: all-spine morphology review and clustering
+
+Open **6. Morphology clustering** after measurements. Synpo measures every valid
+spine, including cluster-less spines, and adds calibrated curvilinear
+shaft-contact-to-tip length plus straight base-to-tip distance to the ordinary
+spine export. Length rows retain centerline status, virtual-bridge use, anchor
+coordinates, automatic/manual anchor sources, and geometry-review state.
+
+The geometry viewer overlays the centerline, base, tip, automatic head/neck split,
+and protein puncta. Base and tip can be reset with point tools. Head and neck can
+be painted on an individual Z slice or on the XY maximum projection; a projection
+stroke applies only to selected-spine voxels below it through Z. Geometry edits
+support undo/redo, notes, explicit review checkpoints, and immediately mark saved
+cluster runs stale without changing the segmentation mask.
+
+Brush strokes are rasterized once against a cropped in-memory spine mask, and the
+geometry recalculation/checkpoint runs in a background worker so drawing and saving
+do not block the interface. **Checkpoint review and advance** retains the current
+queue position and opens the following spine. A spine can also be marked invalid
+here; it is excluded from all downstream measurements and clustering while its
+review decision remains auditable.
+
+Named analysis runs support Gaussian mixtures, Ward hierarchical clustering, and
+k-means. Users choose morphology features, robust/z-score/no scaling, automatic or
+fixed cluster counts from 1-10, and 2D or 3D PCA. The conservative default features
+are log volume, curvilinear length, straight base-to-tip distance, tortuosity,
+maximum width, and principal-axis elongation; linear and square-root volume are
+available alternatives. Protein-puncta measurements are never PCA or clustering
+inputs. They appear only in per-cluster plots and descriptive summaries, including
+all-spine and protein-positive-only subsets.
+
+When the cluster count is automatic, users can choose the information criterion
+(GMM BIC or the existing penalized-SSE heuristic), maximum silhouette score, or
+the elbow of the within-cluster SSE curve. The elbow is the accepted intermediate
+candidate with the greatest normalized departure from the straight line joining
+the first and last candidate SSE values; it therefore requires at least three
+accepted cluster counts. Minimum cluster-size rules are applied before any method
+selects a winner. The candidate-model export records BIC/penalized SSE, silhouette,
+raw within-cluster SSE, elbow distance, acceptance, and the selected candidate.
+A nonzero fixed cluster count overrides the automatic selection method.
+Both clustering tabs include a **Cluster-count scores** panel. It plots the chosen
+score against the candidate cluster count, prints each exact score beside its point,
+marks rejected candidates and the selected solution, and provides an exact-value
+table. The panel can switch among information criterion, silhouette, and the raw
+within-cluster-SSE elbow curve without rerunning the analysis.
+
+**Cluster geometry-reviewed spines only** switches a named run between every
+otherwise valid spine and only spines explicitly marked **Geometry checked**.
+Unreviewed spines excluded by this option remain unchanged in the project and are
+listed as `geometry review not completed` in the run's exclusion audit. The choice
+is saved with the named run and included in its settings export.
+
+The clustering controls include a multi-select experimental-group list, allowing a
+run to use one, two, or more chosen groups. Scatter plots retain cluster colors and
+use different marker shapes for experimental groups, with combined legend labels.
+Axes and background colors and their alpha values are saved with each named run and
+applied to interactive and exported plots. Legends can be hidden, kept inside, or
+moved outside to the right or below so they do not cover observations. The
+**Selected morphology features** plot accepts any two features included in the run
+and displays the exact transformed values used by clustering. Protein-puncta volume
+plots show both box plots and the underlying observations: point color identifies
+the morphology cluster, marker shape identifies the experimental group, and the
+legend explains that hollow black points are box-plot outliers duplicated from the
+colored individual-spine observations.
+
+The **PCA interpretation** plot combines spine scores with numbered loading
+vectors, a PC-by-feature loading heatmap, explained-variance bars, and explicit
+component equations. It automatically becomes a rotatable PC1/PC2/PC3 plot for a
+three-component run; two-component runs remain 2D. Axis labels report explained
+variance. The separate
+analysis export adds `PCA_Equations` and `PCA_Feature_Preparation` sheets containing
+full-precision formulas, feature transformations, scaling centers/scales, and the
+additional PCA-centering values required to reproduce every score. A matching
+high-resolution `pca_interpretation` figure is included in all plot formats.
+Three-component runs also provide a separate full-size **3D PCA with feature axes**
+view and `pca_3d_feature_axes` export, without the other interpretation panels.
+Both feature-vector views have saved **Show spine points** and **Point opacity**
+controls, so the observations can be faded or hidden while keeping the loading
+arrows fully visible. The same choice is applied to exported interpretation plots.
+
+### Advanced nonlinear clustering
+
+The separate **7. Advanced clustering** tab keeps PCA as the default,
+interpretable workflow while adding real UMAP and PCC/PCUMAP analysis. The
+selected reducer is fit in 2-20 dimensions, and that complete embedding—not the
+original measurements or a separate display-only projection—is passed to the
+selected Gaussian-mixture, Ward, or k-means algorithm. The interactive view uses
+the first two or three coordinates from that same fitted space. Point color still
+identifies the resulting cluster and marker shape identifies the experimental
+group.
+
+Advanced controls include embedding dimensionality, 2D/3D display, neighbor
+count, minimum distance, Euclidean/Manhattan distance, optimization iterations,
+random seed, and repeated-seed diagnostics. PCC/PCUMAP additionally exposes its
+reference-point count, beta, correlation-loss weight/start epoch, and CPU/automatic/
+CUDA device choice. CPU is the reproducible default. Protein-puncta measurements
+remain descriptive-only and never enter UMAP, PCUMAP, PCA, or clustering.
+
+Every advanced run records the requested and effective reducer parameters,
+implementation version, trustworthiness, input-versus-embedding distance-rank
+correlation, and across-seed embedding/cluster stability. Exports add full
+`embedding_1` through `embedding_N` coordinates, `Embedding_Diagnostics`, and
+`Embedding_Stability` sheets/CSVs, plus high-resolution 2D or 3D nonlinear plots.
+Named UMAP/PCUMAP runs are stored separately from the PCA run selector. The
+standalone workbook action uses the controls from tab 7 when that tab is active.
+
+The current environment uses TorchDR's UMAP implementation so UMAP and PCUMAP
+share the same numerical foundation; PCUMAP is still substantially heavier than
+PCA. Both run in a background worker. The standard `environment.yml` installs both
+reducers. The Catalina/macOS 11 legacy environment uses the `umap-learn` fallback
+and omits PCC/PCUMAP because the current PyTorch/TorchDR stack does not support that
+legacy target reliably. Its first UMAP run can spend time compiling Numba kernels.
+
+Each run has editable cluster colors and a separate analysis package: Excel,
+matching CSV sheets, a PDF report, vector PDF/SVG plots, and 600-DPI PNG plots.
+Exports include assignments, PCA scores/loadings, candidate-model diagnostics,
+specimen-level bootstrap stability, cluster definitions, specimen-weighted group
+proportions, protein summaries, excluded-row audit, settings, and plot data.
+**File -> Cluster exported morphology
+workbook...** can refit and export a new analysis using only a prior Synpo workbook;
+the project and raw images are not required.
 
 ## Beta workflow additions
 

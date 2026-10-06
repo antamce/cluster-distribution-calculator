@@ -23,6 +23,7 @@ class SpineDistribution:
     base_point_zyx: tuple[int, int, int] | None
     endpoint_zyx: tuple[int, int, int] | None
     endpoint_source: str
+    base_source: str = "automatic"
     bridge_used: bool = False
     bridge_length_um: float = 0.0
     bridge_points_zyx: tuple[tuple[int, int, int], ...] = ()
@@ -193,6 +194,7 @@ def calculate_spine_distribution(
     sampling_zyx_um: tuple[float, float, float],
     global_offset_zyx: tuple[int, int, int] = (0, 0, 0),
     endpoint_hint_zyx: tuple[int, int, int] | None = None,
+    base_hint_zyx: tuple[int, int, int] | None = None,
     guidance_image: np.ndarray | None = None,
     maximum_gap_um: float = 1.0,
 ) -> SpineDistribution:
@@ -218,6 +220,7 @@ def calculate_spine_distribution(
     minimum_substantial_size = max(5, int(np.ceil(largest_size * 0.02)))
 
     requested_hint: tuple[int, int, int] | None = None
+    requested_base_hint: tuple[int, int, int] | None = None
     hinted_component = 0
     if endpoint_hint_zyx is not None:
         candidate = tuple(
@@ -228,6 +231,16 @@ def calculate_spine_distribution(
             hinted_component = int(components[candidate])
             if hinted_component > 0:
                 requested_hint = candidate
+    if base_hint_zyx is not None:
+        candidate = tuple(
+            int(base_hint_zyx[axis]) - int(global_offset_zyx[axis])
+            for axis in range(3)
+        )
+        if (
+            all(0 <= value < spine.shape[axis] for axis, value in enumerate(candidate))
+            and bool(spine[candidate])
+        ):
+            requested_base_hint = candidate
 
     # The base is selected before any bridging. Direct shaft contact is strongest;
     # otherwise use the nearest substantial component rather than a tiny satellite.
@@ -452,7 +465,13 @@ def calculate_spine_distribution(
             dtype=np.int64,
         )
 
-    start = _nearest_index(coordinates, targets, sampling_zyx_um)
+    start = _nearest_index(
+        coordinates,
+        np.asarray([requested_base_hint], dtype=np.int64)
+        if requested_base_hint is not None
+        else targets,
+        sampling_zyx_um,
+    )
     local_hint = (
         requested_hint
         if requested_hint is not None and hinted_component in axis_components
@@ -535,6 +554,8 @@ def calculate_spine_distribution(
         notes.append("Multiple similarly long distal skeleton paths were found.")
     if local_hint is not None:
         notes.append("Manual distal endpoint hint was used.")
+    if requested_base_hint is not None:
+        notes.append("Manual shaft-contact/base hint was used.")
     zero_bins = np.flatnonzero(spine_counts == 0)
     if len(zero_bins):
         notes.append(
@@ -567,6 +588,7 @@ def calculate_spine_distribution(
         base_point_zyx=global_points[0],
         endpoint_zyx=global_points[-1],
         endpoint_source="manual" if local_hint is not None else "automatic",
+        base_source="manual" if requested_base_hint is not None else "automatic",
         bridge_used=bool(bridge_points),
         bridge_length_um=bridge_length,
         bridge_points_zyx=tuple(
@@ -595,6 +617,7 @@ def distribution_row(
         "centerline_base_zyx": list(distribution.base_point_zyx) if distribution.base_point_zyx else None,
         "centerline_endpoint_zyx": list(distribution.endpoint_zyx) if distribution.endpoint_zyx else None,
         "centerline_endpoint_source": distribution.endpoint_source,
+        "centerline_base_source": distribution.base_source,
         "centerline_bridge_used": distribution.bridge_used,
         "centerline_bridge_length_um": distribution.bridge_length_um,
         "centerline_bridge_points_zyx": [list(point) for point in distribution.bridge_points_zyx],

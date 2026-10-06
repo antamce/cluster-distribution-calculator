@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSettings, Q
 from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -42,6 +44,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
 
 from . import __version__
 from .calibration import CalibrationStore
@@ -113,19 +117,46 @@ from .measurements import (
     DistributionPreview,
     SpineReviewPreview,
     MeasurementSettings,
+    MorphologyPreview,
+    apply_morphology_review_edit,
     cluster_end_comparison_rows,
     clear_centerline_endpoint_hint,
     distribution_summary_rows,
+    filtered_measurement_result,
     load_cluster_trim_preview,
     load_distribution_preview,
     load_spine_review_preview,
     load_measurement_result,
+    load_morphology_preview,
     measure_project,
     set_centerline_endpoint_hint,
     set_distribution_review,
     set_spine_quality_review,
+    spine_volume_filter_settings,
+    redo_morphology_review,
+    undo_morphology_review,
 )
-from .exporting import export_measurements
+from .exporting import (
+    export_measurements,
+    filter_exported_measurement_workbook,
+    inspect_exported_measurement_workbook,
+)
+from .morphology import (
+    DEFAULT_FEATURES,
+    DEFAULT_PLOT_STYLE,
+    MORPHOLOGY_FEATURES,
+    MorphologyClusteringSettings,
+    draw_pca_3d_feature_axes,
+    draw_pca_interpretation,
+    draw_protein_puncta_volume,
+    export_morphology_analysis,
+    load_morphology_run,
+    morphology_feature_value,
+    run_morphology_clustering_from_workbook,
+    save_named_morphology_run,
+    update_run_colors,
+    update_run_plot_style,
+)
 
 
 ROLE_LABELS = {
@@ -1040,6 +1071,7 @@ class ReviewCanvas(SliceView):
         self._brush_radius = 4
         self._brush_diameter = 9
         self._hint_color = QColor(REVIEW_BRUSH_COLORS["add"])
+        self._last_hint_render = 0.0
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     def set_brush_radius(self, radius: int) -> None:
@@ -1109,6 +1141,7 @@ class ReviewCanvas(SliceView):
                 self._append_to_stroke(point)
                 self._drawing = True
                 self._draw_hints()
+                self._last_hint_render = time.monotonic()
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -1118,7 +1151,10 @@ class ReviewCanvas(SliceView):
             point = self._image_position(event.position())
             if point is not None:
                 self._append_to_stroke(point)
-                self._draw_hints()
+                now = time.monotonic()
+                if now - self._last_hint_render >= 1.0 / 30.0:
+                    self._draw_hints()
+                    self._last_hint_render = now
                 event.accept()
                 return
         super().mouseMoveEvent(event)
@@ -1156,6 +1192,512 @@ class ReviewCanvas(SliceView):
         painter.end()
         self._image = image
         self._render()
+
+
+class MorphologyReviewCanvas(ReviewCanvas):
+    """All-spine geometry overlay with paintable head/neck annotations."""
+
+    def show_morphology(self, preview: MorphologyPreview, z_index: int, maximum: bool) -> None:
+        raw_stack = preview.dendrite_stack
+        raw = np.max(raw_stack, axis=0) if maximum else raw_stack[z_index]
+        low, high = np.percentile(raw, (0.5, 99.8))
+        scale = max(1.0, float(high) - float(low))
+        gray = np.clip((raw.astype(np.float32) - low) * 255.0 / scale, 0, 255).astype(np.uint8)
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        spine = np.any(preview.spine_mask_stack, axis=0) if maximum else preview.spine_mask_stack[z_index]
+        head = np.any(preview.head_mask_stack, axis=0) if maximum else preview.head_mask_stack[z_index]
+        clusters = np.any(preview.cluster_mask_stack, axis=0) if maximum else preview.cluster_mask_stack[z_index]
+        neck = spine & ~head
+        for mask, color in (
+            (neck, np.asarray([25, 190, 240])),
+            (head, np.asarray([255, 145, 35])),
+            (clusters, np.asarray([245, 40, 205])),
+        ):
+            rgb[mask] = np.clip(rgb[mask].astype(np.float32) * 0.25 + color * 0.75, 0, 255).astype(np.uint8)
+        self.show_rgb(rgb)
+        image = self._image.copy() if self._image is not None else None
+        if image is not None:
+            painter = QPainter(image)
+            visible_axis = [point for point in preview.axis_points_local_zyx if maximum or point[0] == z_index]
+            painter.setPen(QPen(QColor("#ffffff"), 1))
+            for first, second in zip(visible_axis, visible_axis[1:]):
+                painter.drawLine(QPoint(first[2], first[1]), QPoint(second[2], second[1]))
+            for point, color in ((preview.base_point_local_zyx, QColor("#2cff60")), (preview.tip_point_local_zyx, QColor("#fff000"))):
+                if point is not None and (maximum or point[0] == z_index):
+                    painter.setPen(QPen(color, 2))
+                    painter.drawEllipse(QPoint(point[2], point[1]), 4, 4)
+            painter.end()
+            self._image = image
+        self._base_image = self._image.copy() if self._image is not None else None
+        self.clear_hint()
+
+
+class MorphologyPlotCanvas(FigureCanvasQTAgg):
+    def __init__(self) -> None:
+        self.figure = Figure(figsize=(7.5, 5.5), tight_layout=True)
+        super().__init__(self.figure)
+        self.setMinimumSize(480, 360)
+
+    def show_run(self, result: dict[str, object], mode: str) -> None:
+        from matplotlib.colors import to_rgba
+
+        self.figure.clear()
+        if mode == "pca_interpretation":
+            draw_pca_interpretation(self.figure, result)
+            self.draw_idle()
+            return
+        if mode == "pca_3d_features":
+            draw_pca_3d_feature_axes(self.figure, result)
+            self.draw_idle()
+            return
+        assignments = list(result.get("assignments", []))
+        definitions = list(result.get("cluster_definitions", []))
+        colors = {int(row["morphology_cluster_id"]): str(row.get("color", "#457b9d")) for row in definitions}
+        dimensions = (
+            3
+            if int(result.get("settings", {}).get("pca_dimensions", 2)) == 3
+            and assignments
+            and "pca_3" in assignments[0]
+            else 2
+        )
+        embedding_dimensions = int(
+            result.get("settings", {}).get("embedding_plot_dimensions", 2)
+        )
+        is_3d = (mode == "pca" and dimensions == 3) or (
+            mode == "embedding" and embedding_dimensions == 3
+        )
+        axis = self.figure.add_subplot(111, projection="3d" if is_3d else None)
+        style = {**DEFAULT_PLOT_STYLE, **dict(result.get("plot_style", {}))}
+        axes_rgba = to_rgba(
+            str(style["axes_color"]), alpha=float(style["axes_alpha"])
+        )
+        background_rgba = to_rgba(
+            str(style["background_color"]), alpha=float(style["background_alpha"])
+        )
+        self.figure.patch.set_facecolor(background_rgba)
+        axis.set_facecolor(background_rgba)
+        group_markers = ("o", "^", "s", "D", "P", "X", "v", "<", ">", "*")
+        groups = sorted({str(row.get("experimental_group", "")) for row in assignments})
+        marker_by_group = {
+            group: group_markers[index % len(group_markers)]
+            for index, group in enumerate(groups)
+        }
+        if mode in {"volume_length", "volume_straight", "pca", "embedding"}:
+            for cluster in sorted(colors):
+                for group in groups:
+                    members = [row for row in assignments if int(row["morphology_cluster_id"]) == cluster and str(row.get("experimental_group", "")) == group]
+                    if not members:
+                        continue
+                    label = f"Cluster {cluster} · {group}"
+                    marker = marker_by_group[group]
+                    if mode in {"volume_length", "volume_straight"}:
+                        length_key = "spine_base_to_tip_distance_um" if mode == "volume_straight" else "spine_curvilinear_length_um"
+                        members = [row for row in members if row.get("volume_um3") is not None and row.get(length_key) is not None]
+                        axis.scatter([row.get("volume_um3") for row in members], [row.get(length_key) for row in members], color=colors[cluster], marker=marker, alpha=0.72, label=label)
+                    elif mode == "embedding" and embedding_dimensions == 3:
+                        axis.scatter([row.get("embedding_1") for row in members], [row.get("embedding_2") for row in members], [row.get("embedding_3") for row in members], color=colors[cluster], marker=marker, alpha=0.72, label=label)
+                    elif mode == "embedding":
+                        axis.scatter([row.get("embedding_1") for row in members], [row.get("embedding_2") for row in members], color=colors[cluster], marker=marker, alpha=0.72, label=label)
+                    elif dimensions == 3:
+                        axis.scatter([row.get("pca_1") for row in members], [row.get("pca_2") for row in members], [row.get("pca_3") for row in members], color=colors[cluster], marker=marker, alpha=0.72, label=label)
+                    else:
+                        axis.scatter([row.get("pca_1") for row in members], [row.get("pca_2") for row in members], color=colors[cluster], marker=marker, alpha=0.72, label=label)
+            if mode in {"volume_length", "volume_straight"}:
+                axis.set_xscale("log")
+                length_label = "Base-to-tip distance (µm)" if mode == "volume_straight" else "Curvilinear length (µm)"
+                axis.set(xlabel="Spine volume (µm³)", ylabel=length_label, title=f"Volume versus {length_label.removesuffix(' (µm)').lower()}")
+            elif mode == "pca":
+                axis.set(xlabel="PCA 1", ylabel="PCA 2", title=f"{dimensions}D PCA morphology plot")
+                if dimensions == 3:
+                    axis.set_zlabel("PCA 3")
+            else:
+                method = str(result.get("settings", {}).get("reduction_method", "umap"))
+                method_label = "PCC/PCUMAP" if method == "pcumap" else "UMAP"
+                clustering_dimensions = int(
+                    result.get("settings", {}).get("embedding_dimensions", embedding_dimensions)
+                )
+                axis.set(
+                    xlabel=f"{method_label} 1",
+                    ylabel=f"{method_label} 2",
+                    title=(
+                        f"{embedding_dimensions}D view of the {clustering_dimensions}D "
+                        f"{method_label} clustering space"
+                    ),
+                )
+                if embedding_dimensions == 3:
+                    axis.set_zlabel(f"{method_label} 3")
+            axis.legend()
+        elif mode == "custom_features":
+            features = list(result.get("settings", {}).get("features", []))
+            x_feature = str(style.get("custom_x_feature", ""))
+            y_feature = str(style.get("custom_y_feature", ""))
+            if x_feature not in features:
+                x_feature = features[0] if features else ""
+            if y_feature not in features:
+                y_feature = features[1] if len(features) > 1 else x_feature
+            plotted = False
+            if x_feature and y_feature:
+                for cluster in sorted(colors):
+                    for group in groups:
+                        points = []
+                        for row in assignments:
+                            if (
+                                int(row["morphology_cluster_id"]) != cluster
+                                or str(row.get("experimental_group", "")) != group
+                            ):
+                                continue
+                            x_value = morphology_feature_value(row, x_feature)
+                            y_value = morphology_feature_value(row, y_feature)
+                            if x_value is not None and y_value is not None:
+                                points.append((x_value, y_value))
+                        if points:
+                            axis.scatter(
+                                [point[0] for point in points],
+                                [point[1] for point in points],
+                                color=colors[cluster],
+                                marker=marker_by_group[group],
+                                alpha=0.72,
+                                label=f"Cluster {cluster} · {group}",
+                            )
+                            plotted = True
+                axis.set(
+                    xlabel=MORPHOLOGY_FEATURES[x_feature][0],
+                    ylabel=MORPHOLOGY_FEATURES[y_feature][0],
+                    title=(
+                        f"{MORPHOLOGY_FEATURES[y_feature][0]} versus "
+                        f"{MORPHOLOGY_FEATURES[x_feature][0]}"
+                    ),
+                )
+            if not plotted:
+                axis.text(
+                    0.5,
+                    0.5,
+                    "No complete values are available for this feature pair.",
+                    ha="center",
+                    va="center",
+                    transform=axis.transAxes,
+                )
+        elif mode == "protein_positive":
+            clusters = sorted(colors)
+            values = []
+            for cluster in clusters:
+                members = [row for row in assignments if int(row["morphology_cluster_id"]) == cluster]
+                values.append(100.0 * sum(bool(row.get("has_protein_cluster")) for row in members) / len(members) if members else 0.0)
+            axis.bar([str(value) for value in clusters], values, color=[colors[value] for value in clusters])
+            axis.set(xlabel="Morphology cluster", ylabel="Protein-positive spines (%)", title="Protein-positive fraction")
+        elif mode == "protein_volume":
+            draw_protein_puncta_volume(axis, result)
+        elif mode == "protein_position":
+            summary = list(result.get("protein_summary", []))
+            for cluster in sorted(colors):
+                row = next((value for value in summary if int(value.get("morphology_cluster_id", 0)) == cluster and value.get("subset") == "protein_positive"), None)
+                if row:
+                    values = [row.get(f"bin_{index:02d}_mean") for index in range(1, 11)]
+                    axis.plot(range(1, 11), [np.nan if value is None else float(value) for value in values], marker="o", color=colors[cluster], label=f"Cluster {cluster}")
+            axis.set(xlabel="Normalized shaft-to-tip bin", ylabel="Mean protein distribution", title="Protein position profiles")
+            axis.legend()
+        elif mode == "group_proportions":
+            rows = list(result.get("group_summary", []))
+            groups = sorted({str(row.get("experimental_group", "")) for row in rows})
+            clusters = sorted(colors)
+            positions = np.arange(len(groups), dtype=float)
+            width = 0.8 / max(1, len(clusters))
+            for offset, cluster in enumerate(clusters):
+                values = [next((float(row.get("specimen_percentage_mean") or 0.0) for row in rows if str(row.get("experimental_group", "")) == group and int(row.get("morphology_cluster_id", 0)) == cluster), 0.0) for group in groups]
+                axis.bar(positions + (offset - (len(clusters) - 1) / 2.0) * width, values, width=width, color=colors[cluster], label=f"Cluster {cluster}")
+            axis.set_xticks(positions, groups, rotation=25, ha="right")
+            axis.set(xlabel="Experimental group", ylabel="Mean specimen proportion (%)", title="Cluster proportions by group")
+            axis.legend()
+        else:
+            features = list(result.get("settings", {}).get("features", []))
+            matrix = np.asarray([[float(row.get(f"{feature}_median") or 0.0) for feature in features] for row in definitions], dtype=np.float64)
+            center = np.mean(matrix, axis=0)
+            spread = np.std(matrix, axis=0)
+            image = axis.imshow((matrix - center) / np.where(spread > 1e-12, spread, 1.0), aspect="auto", cmap="coolwarm", vmin=-2.5, vmax=2.5)
+            axis.set_xticks(np.arange(len(features)), [MORPHOLOGY_FEATURES[value][0] for value in features], rotation=35, ha="right")
+            axis.set_yticks(np.arange(len(definitions)), [f"Cluster {row['morphology_cluster_id']}" for row in definitions])
+            axis.set_title("Standardized cluster median profiles")
+            self.figure.colorbar(image, ax=axis)
+        axis.tick_params(colors=axes_rgba)
+        axis.xaxis.label.set_color(axes_rgba)
+        axis.yaxis.label.set_color(axes_rgba)
+        axis.title.set_color(axes_rgba)
+        if is_3d:
+            axis.zaxis.label.set_color(axes_rgba)
+        for spine in axis.spines.values():
+            spine.set_color(axes_rgba)
+        handles, labels = axis.get_legend_handles_labels()
+        existing_legend = axis.get_legend()
+        if existing_legend is not None:
+            existing_legend.remove()
+        legend = None
+        if bool(style.get("show_legend", True)) and handles:
+            legend_position = str(style.get("legend_position", "outside_right"))
+            if legend_position == "outside_bottom":
+                legend = axis.legend(
+                    handles,
+                    labels,
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, -0.16),
+                    ncols=min(3, len(handles)),
+                    borderaxespad=0.0,
+                )
+            elif legend_position == "inside":
+                legend = axis.legend(handles, labels, loc="upper right")
+            else:
+                legend = axis.legend(
+                    handles,
+                    labels,
+                    loc="upper left",
+                    bbox_to_anchor=(1.02, 1.0),
+                    borderaxespad=0.0,
+                )
+        if legend is not None:
+            legend.get_frame().set_facecolor(background_rgba)
+            for text_item in legend.get_texts():
+                text_item.set_color(axes_rgba)
+        axis.grid(alpha=0.2, color=axes_rgba)
+        self.draw_idle()
+
+
+class ClusterCountScorePanel(QWidget):
+    """Plot and tabulate the candidate scores used to choose a cluster count."""
+
+    _METHOD_LABELS = {
+        "information_criterion": "Information criterion",
+        "silhouette": "Silhouette score",
+        "elbow": "Within-cluster SSE (elbow)",
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._result: dict[str, object] | None = None
+        self._result_identity: int | None = None
+        layout = QVBoxLayout(self)
+        selector_row = QHBoxLayout()
+        selector_row.addWidget(QLabel("Score to display:"))
+        self.score_method = QComboBox()
+        self.score_method.addItem(
+            "Information criterion (lower is better)", "information_criterion"
+        )
+        self.score_method.addItem(
+            "Silhouette score (higher is better)", "silhouette"
+        )
+        self.score_method.addItem(
+            "Within-cluster SSE elbow", "elbow"
+        )
+        self.score_method.currentIndexChanged.connect(self._render)
+        selector_row.addWidget(self.score_method, 1)
+        layout.addLayout(selector_row)
+        self.summary = QLabel(
+            "Run or load a clustering analysis to inspect its candidate scores."
+        )
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.figure = Figure(figsize=(7.5, 4.1), tight_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setMinimumSize(480, 300)
+        layout.addWidget(self.canvas, 1)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Clusters",
+                "Displayed score",
+                "Elbow distance",
+                "Accepted",
+                "Cluster sizes",
+                "Selected",
+            ]
+        )
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table.setMaximumHeight(220)
+        layout.addWidget(self.table)
+
+    def show_run(self, result: dict[str, object]) -> None:
+        is_new_result = id(result) != self._result_identity
+        self._result = result
+        self._result_identity = id(result)
+        if is_new_result:
+            method = str(
+                dict(result.get("settings", {})).get(
+                    "cluster_count_selection", "information_criterion"
+                )
+            )
+            index = self.score_method.findData(method)
+            self.score_method.blockSignals(True)
+            self.score_method.setCurrentIndex(max(0, index))
+            self.score_method.blockSignals(False)
+        self._render()
+
+    @staticmethod
+    def _number(value: object) -> str:
+        if value is None:
+            return "—"
+        number = float(value)
+        if not np.isfinite(number):
+            return "—"
+        magnitude = abs(number)
+        if magnitude != 0.0 and (magnitude >= 100_000 or magnitude < 0.001):
+            return f"{number:.4e}"
+        return f"{number:.5g}"
+
+    def _render(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self.figure.clear()
+        self.table.setRowCount(0)
+        if self._result is None:
+            self.canvas.draw_idle()
+            return
+        diagnostics = sorted(
+            (dict(row) for row in self._result.get("candidate_diagnostics", [])),
+            key=lambda row: int(row.get("cluster_count", 0)),
+        )
+        if not diagnostics:
+            axis = self.figure.add_subplot(111)
+            axis.text(
+                0.5,
+                0.5,
+                "This saved run has no candidate-score diagnostics.",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+            axis.set_axis_off()
+            self.summary.setText(
+                "Candidate scores are unavailable for this saved run. Re-run the "
+                "analysis to generate them."
+            )
+            self.canvas.draw_idle()
+            return
+
+        method = str(self.score_method.currentData())
+        if method == "silhouette":
+            score_key = "silhouette"
+            y_label = "Mean silhouette score"
+            direction = "Higher values indicate better separated clusters."
+        elif method == "elbow":
+            score_key = "within_cluster_sse"
+            y_label = "Within-cluster SSE"
+            direction = "Choose the knee where further SSE reduction begins to level off."
+        else:
+            score_key = "criterion"
+            criterion_names = {
+                str(row.get("criterion_name", "Information criterion"))
+                for row in diagnostics
+            }
+            y_label = (
+                next(iter(criterion_names))
+                if len(criterion_names) == 1
+                else "Information criterion"
+            )
+            direction = "Lower values indicate the preferred candidate."
+
+        axis = self.figure.add_subplot(111)
+        plotted = [
+            row
+            for row in diagnostics
+            if row.get(score_key) is not None
+            and np.isfinite(float(row[score_key]))
+        ]
+        if plotted:
+            counts = [int(row["cluster_count"]) for row in plotted]
+            scores = [float(row[score_key]) for row in plotted]
+            axis.plot(counts, scores, color="#8a99a8", linewidth=1.4, zorder=1)
+            accepted = [row for row in plotted if bool(row.get("accepted", False))]
+            rejected = [row for row in plotted if not bool(row.get("accepted", False))]
+            if accepted:
+                axis.scatter(
+                    [int(row["cluster_count"]) for row in accepted],
+                    [float(row[score_key]) for row in accepted],
+                    color="#2878b5",
+                    s=48,
+                    label="Accepted candidate",
+                    zorder=3,
+                )
+            if rejected:
+                axis.scatter(
+                    [int(row["cluster_count"]) for row in rejected],
+                    [float(row[score_key]) for row in rejected],
+                    color="#7f7f7f",
+                    marker="x",
+                    s=58,
+                    label="Rejected by minimum cluster size",
+                    zorder=3,
+                )
+            selected = [row for row in plotted if bool(row.get("selected", False))]
+            if selected:
+                axis.scatter(
+                    [int(row["cluster_count"]) for row in selected],
+                    [float(row[score_key]) for row in selected],
+                    color="#d62728",
+                    edgecolor="white",
+                    marker="*",
+                    s=190,
+                    linewidth=0.8,
+                    label="Selected for this run",
+                    zorder=5,
+                )
+            for row in plotted:
+                axis.annotate(
+                    self._number(row[score_key]),
+                    (int(row["cluster_count"]), float(row[score_key])),
+                    xytext=(0, 8),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=8,
+                )
+            axis.set_xticks(counts)
+            axis.legend(loc="best")
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No score is available for this method.",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+        axis.set(
+            xlabel="Number of clusters",
+            ylabel=y_label,
+            title=f"{self._METHOD_LABELS.get(method, method)} by cluster count",
+        )
+        axis.grid(alpha=0.22)
+
+        self.table.setRowCount(len(diagnostics))
+        for row_index, row in enumerate(diagnostics):
+            values = (
+                str(row.get("cluster_count", "")),
+                self._number(row.get(score_key)),
+                self._number(row.get("elbow_distance")),
+                "Yes" if bool(row.get("accepted", False)) else "No",
+                ", ".join(str(value) for value in row.get("cluster_sizes", [])),
+                "Yes" if bool(row.get("selected", False)) else "",
+            )
+            for column_index, value in enumerate(values):
+                self.table.setItem(
+                    row_index, column_index, QTableWidgetItem(value)
+                )
+
+        saved_method = str(
+            dict(self._result.get("settings", {})).get(
+                "cluster_count_selection", "information_criterion"
+            )
+        )
+        selected_count = self._result.get("selected_cluster_count", "—")
+        self.summary.setText(
+            f"This run selected {selected_count} clusters using "
+            f"{self._METHOD_LABELS.get(saved_method, saved_method)}. {direction} "
+            "The red star always marks the count actually used by the saved run; "
+            "gray crosses failed the configured minimum cluster-size rule."
+        )
+        self.canvas.draw_idle()
 
 
 class ProjectionView(SliceView):
@@ -2206,6 +2748,135 @@ class MeasurementWorker(QObject):
         self.completed.emit(result)
 
 
+class MorphologyClusteringWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, manifest: dict[str, object], project_path: Path, name: str, settings: MorphologyClusteringSettings) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        self.name = name
+        self.settings = settings
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit("Morphology clustering", 0, 1, "Preparing all-spine feature matrix")
+            result = save_named_morphology_run(self.manifest, self.project_path, self.name, self.settings)
+            self.progress.emit("Morphology clustering", 1, 1, "Saved named analysis run")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
+class MorphologyEditWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        project_path: Path,
+        specimen_index: int,
+        spine_id: int,
+        mode: str,
+        arguments: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        self.specimen_index = specimen_index
+        self.spine_id = spine_id
+        self.mode = mode
+        self.arguments = arguments or {}
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit("Geometry review", 0, 1, f"Recalculating spine {self.spine_id}")
+            if self.mode == "undo":
+                result = undo_morphology_review(
+                    self.manifest, self.project_path, self.specimen_index, self.spine_id
+                )
+            elif self.mode == "redo":
+                result = redo_morphology_review(
+                    self.manifest, self.project_path, self.specimen_index, self.spine_id
+                )
+            else:
+                call_arguments = {
+                    key: value for key, value in self.arguments.items() if key != "advance"
+                }
+                result = apply_morphology_review_edit(
+                    self.manifest,
+                    self.project_path,
+                    self.specimen_index,
+                    self.spine_id,
+                    **call_arguments,
+                )
+            self.progress.emit("Geometry review", 1, 1, f"Spine {self.spine_id} saved")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(
+            {
+                "result": result,
+                "specimen_index": self.specimen_index,
+                "spine_id": self.spine_id,
+                "advance": bool(self.arguments.get("advance", False)),
+            }
+        )
+
+
+class MorphologyExportWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, result: dict[str, object], path: Path) -> None:
+        super().__init__()
+        self.result = result
+        self.path = path
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit("Morphology export", 0, 1, "Writing workbook, CSV, PDF, SVG, and PNG files")
+            exported = export_morphology_analysis(self.result, self.path)
+            self.progress.emit("Morphology export", 1, 1, "Export verified")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(exported)
+
+
+class StandaloneMorphologyWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, source: Path, output: Path, settings: MorphologyClusteringSettings, name: str) -> None:
+        super().__init__()
+        self.source = source
+        self.output = output
+        self.settings = settings
+        self.name = name
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit("Standalone morphology", 0, 1, "Loading workbook and fitting clusters")
+            result = run_morphology_clustering_from_workbook(self.source, self.output, self.settings, run_name=self.name)
+            self.progress.emit("Standalone morphology", 1, 1, "Analysis package verified")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
 class ClusterTrimPreviewWorker(QObject):
     progress = Signal(str, int, int, str)
     completed = Signal(object)
@@ -2310,6 +2981,267 @@ class CenterlineHintWorker(QObject):
                     self.spine_id,
                     self.point_zyx,
                 )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
+class SpineVolumeHistogram(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.values = np.asarray([], dtype=np.float64)
+        self.cutoff = 0.0
+        self.setMinimumHeight(180)
+
+    def set_data(self, values: list[float], cutoff: float) -> None:
+        self.values = np.asarray(values, dtype=np.float64)
+        self.cutoff = float(cutoff)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        del event
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#15181d"))
+        area = self.rect().adjusted(48, 14, -18, -34)
+        painter.setPen(QColor("#d7dce2"))
+        painter.drawText(8, 18, "Spine count")
+        if not self.values.size or area.width() <= 1 or area.height() <= 1:
+            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, "No manually valid spines")
+            return
+        minimum = min(float(np.min(self.values)), self.cutoff)
+        maximum = max(float(np.max(self.values)), self.cutoff)
+        if maximum <= minimum:
+            maximum = minimum + max(abs(minimum) * 0.01, 1e-9)
+        q1, q3 = np.percentile(self.values, [25.0, 75.0])
+        width = 2.0 * float(q3 - q1) * float(len(self.values)) ** (-1.0 / 3.0)
+        bins = (
+            int(np.ceil((float(np.max(self.values)) - float(np.min(self.values))) / width))
+            if len(self.values) >= 4 and width > 0 and np.isfinite(width)
+            else int(np.ceil(np.log2(len(self.values)) + 1.0))
+        )
+        bins = min(60, max(1, bins))
+        counts, edges = np.histogram(self.values, bins=bins, range=(minimum, maximum))
+        peak = max(1, int(np.max(counts)))
+        bar_width = area.width() / len(counts)
+        for index, count in enumerate(counts):
+            left, right = float(edges[index]), float(edges[index + 1])
+            height = area.height() * int(count) / peak
+            color = QColor("#e05252") if right <= self.cutoff else QColor("#4d9de0")
+            painter.fillRect(
+                QRectF(area.left() + index * bar_width, area.bottom() - height, max(1.0, bar_width - 1.0), height),
+                color,
+            )
+        x_cutoff = area.left() + area.width() * (self.cutoff - minimum) / (maximum - minimum)
+        painter.setPen(QPen(QColor("#ffd166"), 2))
+        painter.drawLine(int(x_cutoff), area.top(), int(x_cutoff), area.bottom())
+        painter.setPen(QColor("#d7dce2"))
+        painter.drawText(area.left(), area.bottom() + 20, f"{minimum:.4g}")
+        painter.drawText(area.right() - 70, area.bottom() + 20, 70, 20, Qt.AlignmentFlag.AlignRight, f"{maximum:.4g} µm³")
+
+
+class SpineVolumeFilterDialog(QDialog):
+    def __init__(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        cutoff_um3: float,
+        enabled: bool,
+        parent: QWidget | None = None,
+        allow_disable: bool = True,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Spine-volume filter preview and overrides")
+        self.resize(980, 720)
+        self.rows = [
+            dict(row)
+            for row in rows
+            if bool(row.get("manual_spine_valid", row.get("spine_valid", True)))
+        ]
+        self.force_keep = {
+            (
+                str(row.get("experimental_group", "")),
+                str(row.get("specimen_id", "")),
+                int(row.get("spine_id") or 0),
+            )
+            for row in self.rows
+            if bool(row.get("volume_filter_force_keep", False))
+        }
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.enabled = QCheckBox("Exclude spines whose volume is strictly below the cutoff")
+        self.enabled.setChecked(enabled)
+        self.enabled.setEnabled(allow_disable)
+        form.addRow(self.enabled)
+        self.cutoff = QDoubleSpinBox()
+        self.cutoff.setRange(0.0, 1_000_000.0)
+        self.cutoff.setDecimals(6)
+        self.cutoff.setValue(max(0.0, cutoff_um3))
+        self.cutoff.setSuffix(" µm³")
+        form.addRow("Volume cutoff:", self.cutoff)
+        layout.addLayout(form)
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.histogram = SpineVolumeHistogram()
+        layout.addWidget(self.histogram)
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(
+            ["Group", "Specimen", "ROI", "Dendrite", "Spine", "Volume µm³", "Clusters", "Keep"]
+        )
+        self.table.setSortingEnabled(True)
+        self.table.itemChanged.connect(self._item_changed)
+        layout.addWidget(self.table, 1)
+        note = QLabel(
+            "Keep overrides only the volume rule. It never restores a spine marked manually invalid. "
+            "Equality with the cutoff is retained."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.cutoff.valueChanged.connect(self._refresh)
+        self.enabled.toggled.connect(self._refresh)
+        self._refresh()
+
+    def _refresh(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        cutoff = self.cutoff.value()
+        active = self.enabled.isChecked()
+        below = [row for row in self.rows if float(row.get("volume_um3") or 0.0) < cutoff]
+        removed = [
+            row
+            for row in below
+            if (
+                str(row.get("experimental_group", "")),
+                str(row.get("specimen_id", "")),
+                int(row.get("spine_id") or 0),
+            )
+            not in self.force_keep
+        ] if active else []
+        cluster_positive = sum(bool(row.get("has_protein_cluster", False)) for row in removed)
+        kept_below = len(below) - len(removed) if active else 0
+        by_group: dict[str, int] = {}
+        by_specimen: dict[str, int] = {}
+        specimen_totals: dict[str, int] = {}
+        for row in self.rows:
+            label = (
+                f"{row.get('experimental_group', '')}/{row.get('specimen_id', '')}"
+            )
+            specimen_totals[label] = specimen_totals.get(label, 0) + 1
+        for row in removed:
+            group = str(row.get("experimental_group", ""))
+            specimen = str(row.get("specimen_id", ""))
+            by_group[group] = by_group.get(group, 0) + 1
+            label = f"{group}/{specimen}"
+            by_specimen[label] = by_specimen.get(label, 0) + 1
+        retained = len(self.rows) - len(removed)
+        warning = " WARNING: no valid spines would remain." if self.rows and retained == 0 else ""
+        emptied = sorted(
+            label
+            for label, total in specimen_totals.items()
+            if by_specimen.get(label, 0) == total
+        )
+        specimen_warning = (
+            " WARNING: these specimens would have zero valid spines: "
+            + ", ".join(emptied)
+            + "."
+            if emptied
+            else ""
+        )
+        groups = ", ".join(f"{key}: {value}" for key, value in sorted(by_group.items())) or "none"
+        specimens = ", ".join(f"{key}: {value}" for key, value in sorted(by_specimen.items())) or "none"
+        percent = 100.0 * len(removed) / len(self.rows) if self.rows else 0.0
+        self.summary.setText(
+            f"Would exclude {len(removed)} of {len(self.rows)} manually valid spines ({percent:.1f}%); "
+            f"{cluster_positive} are cluster-positive; {kept_below} below-cutoff spine(s) have a Keep override. "
+            f"Remaining: {retained}.{warning}{specimen_warning}\n"
+            f"By group: {groups}\nBy specimen: {specimens}"
+        )
+        self.histogram.set_data(
+            [float(row.get("volume_um3") or 0.0) for row in self.rows], cutoff
+        )
+        self.table.blockSignals(True)
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(below))
+        for row_index, row in enumerate(below):
+            key = (
+                str(row.get("experimental_group", "")),
+                str(row.get("specimen_id", "")),
+                int(row.get("spine_id") or 0),
+            )
+            values = [
+                key[0], key[1], row.get("roi_id", ""), row.get("dendrite_id", ""), key[2],
+                float(row.get("volume_um3") or 0.0),
+                row.get(
+                    "included_cluster_count",
+                    int(bool(row["has_protein_cluster"]))
+                    if "has_protein_cluster" in row
+                    else "unknown",
+                ),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column in {2, 3, 4, 5, 6}:
+                    item.setData(Qt.ItemDataRole.EditRole, value)
+                self.table.setItem(row_index, column, item)
+            keep = QTableWidgetItem()
+            keep.setFlags(keep.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            keep.setCheckState(Qt.CheckState.Checked if key in self.force_keep else Qt.CheckState.Unchecked)
+            keep.setData(Qt.ItemDataRole.UserRole, key)
+            self.table.setItem(row_index, 7, keep)
+        self.table.setSortingEnabled(True)
+        self.table.resizeColumnsToContents()
+        self.table.blockSignals(False)
+
+    def _item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 7:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(key, tuple):
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            self.force_keep.add(key)
+        else:
+            self.force_keep.discard(key)
+        self._refresh()
+
+    def values(self) -> tuple[bool, float, set[tuple[str, str, int]]]:
+        return self.enabled.isChecked(), self.cutoff.value(), set(self.force_keep)
+
+
+class WorkbookVolumeFilterWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        source: Path,
+        output: Path,
+        cutoff_um3: float,
+        force_keep: set[tuple[str, str, int]],
+    ) -> None:
+        super().__init__()
+        self.source = source
+        self.output = output
+        self.cutoff_um3 = cutoff_um3
+        self.force_keep = force_keep
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit("Filtering workbook", 0, 1, self.source.name)
+            result = filter_exported_measurement_workbook(
+                self.source,
+                self.output,
+                cutoff_um3=self.cutoff_um3,
+                force_keep_keys=self.force_keep,
+            )
+            self.progress.emit("Filtering workbook", 1, 1, self.output.name)
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -2754,6 +3686,22 @@ class MainWindow(QMainWindow):
         self.open_action.triggered.connect(self._open_project)
         file_menu.addAction(self.open_action)
 
+        self.filter_export_action = QAction(
+            "Filter exported measurement workbook…", self
+        )
+        self.filter_export_action.triggered.connect(
+            self._filter_exported_measurement_workbook
+        )
+        file_menu.addAction(self.filter_export_action)
+
+        self.cluster_export_action = QAction(
+            "Cluster exported morphology workbook…", self
+        )
+        self.cluster_export_action.triggered.connect(
+            self._cluster_exported_morphology_workbook
+        )
+        file_menu.addAction(self.cluster_export_action)
+
         self.save_action = QAction("Save project", self)
         self.save_action.triggered.connect(self._save_project)
         file_menu.addAction(self.save_action)
@@ -3194,10 +4142,14 @@ class MainWindow(QMainWindow):
         self._build_detection_tab()
         self._build_review_tab()
         self._build_measurements_tab()
+        self._build_morphology_tab()
+        self._build_advanced_clustering_tab()
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
         self.tabs.setTabEnabled(4, False)
+        self.tabs.setTabEnabled(5, False)
+        self.tabs.setTabEnabled(6, False)
         save_row = QHBoxLayout()
         save_row.addStretch(1)
         self.save_button = QPushButton("Save project…")
@@ -4147,6 +5099,32 @@ class MainWindow(QMainWindow):
         chart_form.addRow(self.distribution_fixed_scale)
         side_layout.addWidget(chart_group)
 
+        volume_filter_group = QGroupBox("Spine-volume export filter")
+        volume_filter_form = QFormLayout(volume_filter_group)
+        self.volume_filter_enabled = QCheckBox(
+            "Exclude spines below the volume cutoff"
+        )
+        self.volume_filter_enabled.toggled.connect(
+            self._save_volume_filter_controls
+        )
+        volume_filter_form.addRow(self.volume_filter_enabled)
+        self.volume_filter_cutoff = QDoubleSpinBox()
+        self.volume_filter_cutoff.setRange(0.0, 1_000_000.0)
+        self.volume_filter_cutoff.setDecimals(6)
+        self.volume_filter_cutoff.setSuffix(" µm³")
+        self.volume_filter_cutoff.editingFinished.connect(
+            self._save_volume_filter_controls
+        )
+        volume_filter_form.addRow("Cutoff:", self.volume_filter_cutoff)
+        self.volume_filter_preview_button = QPushButton(
+            "Preview distribution and set overrides…"
+        )
+        self.volume_filter_preview_button.clicked.connect(
+            self._open_volume_filter_preview
+        )
+        volume_filter_form.addRow(self.volume_filter_preview_button)
+        side_layout.addWidget(volume_filter_group)
+
         export_group = QGroupBox("Excel, CSV, and optional PDF export")
         export_form = QFormLayout(export_group)
         self.export_validation_pdf = QCheckBox("Main validation PDF")
@@ -4250,6 +5228,639 @@ class MainWindow(QMainWindow):
         splitter.setSizes([430, 950])
         self.tabs.addTab(tab, "5. Measurements")
         self._measurement_method_changed()
+
+    def _build_morphology_tab(self) -> None:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter)
+
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setMinimumWidth(390)
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+
+        geometry = QGroupBox("All-spine geometry review")
+        self.morphology_geometry_group = geometry
+        geometry_form = QFormLayout(geometry)
+        self.morphology_specimen = QComboBox()
+        self.morphology_specimen.currentIndexChanged.connect(self._morphology_specimen_changed)
+        geometry_form.addRow("Specimen:", self.morphology_specimen)
+        self.morphology_spine = QComboBox()
+        self.morphology_spine.currentIndexChanged.connect(self._morphology_spine_changed)
+        geometry_form.addRow("Spine:", self.morphology_spine)
+        self.morphology_view_mode = QComboBox()
+        self.morphology_view_mode.addItem("Maximum projection", "maximum")
+        self.morphology_view_mode.addItem("Single Z slice", "slice")
+        self.morphology_view_mode.currentIndexChanged.connect(self._render_morphology_preview)
+        geometry_form.addRow("View:", self.morphology_view_mode)
+        self.morphology_z = AbsoluteSlider(Qt.Orientation.Horizontal)
+        self.morphology_z.valueChanged.connect(self._render_morphology_preview)
+        geometry_form.addRow("Z slice:", self.morphology_z)
+        self.morphology_tool = QComboBox()
+        self.morphology_tool.addItem("Set shaft-contact base", "set_base")
+        self.morphology_tool.addItem("Set distal tip", "set_tip")
+        self.morphology_tool.addItem("Paint as head", "paint_head")
+        self.morphology_tool.addItem("Paint as neck", "paint_neck")
+        self.morphology_tool.currentIndexChanged.connect(self._morphology_tool_changed)
+        geometry_form.addRow("Tool:", self.morphology_tool)
+        self.morphology_brush = QSpinBox()
+        self.morphology_brush.setRange(1, 101)
+        self.morphology_brush.setSingleStep(2)
+        self.morphology_brush.setValue(7)
+        self.morphology_brush.valueChanged.connect(lambda value: self.morphology_canvas.set_brush_diameter(value))
+        geometry_form.addRow("Brush diameter:", self.morphology_brush)
+        self.morphology_z_radius = QSpinBox()
+        self.morphology_z_radius.setRange(0, 20)
+        geometry_form.addRow("Slice brush Z radius:", self.morphology_z_radius)
+        self.morphology_reviewed = QCheckBox("Geometry checked")
+        geometry_form.addRow(self.morphology_reviewed)
+        self.morphology_invalid = QCheckBox("Invalid spine — exclude from all metrics")
+        geometry_form.addRow(self.morphology_invalid)
+        self.morphology_note = QLineEdit()
+        geometry_form.addRow("Review note:", self.morphology_note)
+        apply_button = QPushButton("Apply geometry edit")
+        apply_button.clicked.connect(self._apply_morphology_edit)
+        geometry_form.addRow(apply_button)
+        undo_row = QHBoxLayout()
+        self.morphology_undo = QPushButton("Undo")
+        self.morphology_undo.clicked.connect(lambda: self._undo_redo_morphology(False))
+        self.morphology_redo = QPushButton("Redo")
+        self.morphology_redo.clicked.connect(lambda: self._undo_redo_morphology(True))
+        undo_row.addWidget(self.morphology_undo)
+        undo_row.addWidget(self.morphology_redo)
+        geometry_form.addRow(undo_row)
+        reset_row = QHBoxLayout()
+        reset_border = QPushButton("Reset head/neck")
+        reset_border.clicked.connect(lambda: self._reset_morphology("reset_border"))
+        reset_anchors = QPushButton("Reset anchors")
+        reset_anchors.clicked.connect(lambda: self._reset_morphology("reset_anchors"))
+        reset_row.addWidget(reset_border)
+        reset_row.addWidget(reset_anchors)
+        geometry_form.addRow(reset_row)
+        checkpoint = QPushButton("Checkpoint review and advance")
+        checkpoint.clicked.connect(self._checkpoint_morphology_review)
+        geometry_form.addRow(checkpoint)
+        controls_layout.addWidget(geometry)
+
+        clustering = QGroupBox("Named morphology clustering run")
+        clustering_form = QFormLayout(clustering)
+        self.morphology_saved_run = QComboBox()
+        self.morphology_saved_run.currentIndexChanged.connect(self._morphology_saved_run_changed)
+        clustering_form.addRow("Saved run:", self.morphology_saved_run)
+        self.morphology_run_name = QLineEdit("Default morphology analysis")
+        clustering_form.addRow("Run name:", self.morphology_run_name)
+        self.morphology_algorithm = QComboBox()
+        self.morphology_algorithm.addItem("Gaussian mixture", "gaussian_mixture")
+        self.morphology_algorithm.addItem("Ward hierarchical", "ward")
+        self.morphology_algorithm.addItem("K-means", "kmeans")
+        clustering_form.addRow("Algorithm:", self.morphology_algorithm)
+        self.morphology_features: dict[str, QCheckBox] = {}
+        feature_widget = QWidget()
+        feature_layout = QVBoxLayout(feature_widget)
+        feature_layout.setContentsMargins(0, 0, 0, 0)
+        for key, (label, _column) in MORPHOLOGY_FEATURES.items():
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(key in DEFAULT_FEATURES)
+            self.morphology_features[key] = checkbox
+            feature_layout.addWidget(checkbox)
+        clustering_form.addRow("Morphology features:", feature_widget)
+        protein_note = QLabel("Protein puncta are never clustering or PCA inputs; they appear only in plots and descriptive summaries.")
+        protein_note.setWordWrap(True)
+        clustering_form.addRow(protein_note)
+        self.morphology_groups = QListWidget()
+        self.morphology_groups.setSelectionMode(
+            QAbstractItemView.SelectionMode.MultiSelection
+        )
+        self.morphology_groups.setMaximumHeight(115)
+        self.morphology_groups.setToolTip(
+            "Select one or more experimental groups to include in this clustering run."
+        )
+        clustering_form.addRow("Experimental groups:", self.morphology_groups)
+        self.morphology_reviewed_only = QCheckBox(
+            "Cluster geometry-reviewed spines only"
+        )
+        self.morphology_reviewed_only.setToolTip(
+            "When checked, only spines marked Geometry checked are included in PCA and clustering. "
+            "Unchecked includes every otherwise valid spine."
+        )
+        clustering_form.addRow(self.morphology_reviewed_only)
+        self.morphology_pca_dimensions = QComboBox()
+        self.morphology_pca_dimensions.addItem("2D", 2)
+        self.morphology_pca_dimensions.addItem("3D", 3)
+        clustering_form.addRow("PCA plot:", self.morphology_pca_dimensions)
+        self.morphology_use_pca = QCheckBox("Cluster in PCA space")
+        self.morphology_use_pca.setChecked(True)
+        clustering_form.addRow(self.morphology_use_pca)
+        cluster_range = QHBoxLayout()
+        self.morphology_min_clusters = QSpinBox()
+        self.morphology_min_clusters.setRange(1, 10)
+        self.morphology_min_clusters.setValue(1)
+        self.morphology_max_clusters = QSpinBox()
+        self.morphology_max_clusters.setRange(1, 10)
+        self.morphology_max_clusters.setValue(6)
+        cluster_range.addWidget(QLabel("Min"))
+        cluster_range.addWidget(self.morphology_min_clusters)
+        cluster_range.addWidget(QLabel("Max"))
+        cluster_range.addWidget(self.morphology_max_clusters)
+        clustering_form.addRow("Candidate clusters:", cluster_range)
+        self.morphology_cluster_count_selection = QComboBox()
+        self.morphology_cluster_count_selection.addItem(
+            "Information criterion (BIC / penalized SSE)",
+            "information_criterion",
+        )
+        self.morphology_cluster_count_selection.addItem(
+            "Maximum silhouette score", "silhouette"
+        )
+        self.morphology_cluster_count_selection.addItem(
+            "Elbow of within-cluster SSE", "elbow"
+        )
+        self.morphology_cluster_count_selection.setToolTip(
+            "Used only when Fixed count is Automatic. Elbow requires at least "
+            "three accepted candidate cluster counts."
+        )
+        clustering_form.addRow(
+            "Automatic selection:", self.morphology_cluster_count_selection
+        )
+        self.morphology_fixed_clusters = QSpinBox()
+        self.morphology_fixed_clusters.setRange(0, 10)
+        self.morphology_fixed_clusters.setSpecialValueText("Automatic")
+        self.morphology_fixed_clusters.valueChanged.connect(
+            self._cluster_count_controls_changed
+        )
+        clustering_form.addRow("Fixed count:", self.morphology_fixed_clusters)
+        self.morphology_scaling = QComboBox()
+        self.morphology_scaling.addItem("Robust median / IQR", "robust")
+        self.morphology_scaling.addItem("Z-score", "zscore")
+        self.morphology_scaling.addItem("None", "none")
+        clustering_form.addRow("Scaling:", self.morphology_scaling)
+        self.morphology_seed = QSpinBox()
+        self.morphology_seed.setRange(0, 2_000_000_000)
+        self.morphology_seed.setValue(42)
+        clustering_form.addRow("Random seed:", self.morphology_seed)
+        self.morphology_min_cluster_spines = QSpinBox()
+        self.morphology_min_cluster_spines.setRange(2, 1_000_000)
+        self.morphology_min_cluster_spines.setValue(10)
+        clustering_form.addRow("Minimum spines/cluster:", self.morphology_min_cluster_spines)
+        self.morphology_min_cluster_fraction = QDoubleSpinBox()
+        self.morphology_min_cluster_fraction.setRange(0.0, 50.0)
+        self.morphology_min_cluster_fraction.setDecimals(1)
+        self.morphology_min_cluster_fraction.setValue(5.0)
+        self.morphology_min_cluster_fraction.setSuffix(" %")
+        clustering_form.addRow("Minimum cluster fraction:", self.morphology_min_cluster_fraction)
+        run_button = QPushButton("Run / replace named analysis")
+        run_button.clicked.connect(self._run_morphology_clustering)
+        self.run_morphology_button = run_button
+        clustering_form.addRow(run_button)
+        color_button = QPushButton("Change cluster colors…")
+        color_button.clicked.connect(self._change_morphology_colors)
+        self.morphology_color_button = color_button
+        clustering_form.addRow(color_button)
+        self.morphology_axes_color = QColor(DEFAULT_PLOT_STYLE["axes_color"])
+        axes_color_button = QPushButton("Change axes color…")
+        axes_color_button.clicked.connect(
+            lambda: self._change_morphology_plot_color("axes")
+        )
+        self.morphology_axes_color_button = axes_color_button
+        clustering_form.addRow(axes_color_button)
+        self.morphology_axes_alpha = QDoubleSpinBox()
+        self.morphology_axes_alpha.setRange(0.0, 1.0)
+        self.morphology_axes_alpha.setSingleStep(0.05)
+        self.morphology_axes_alpha.setValue(1.0)
+        self.morphology_axes_alpha.editingFinished.connect(
+            self._save_morphology_plot_style
+        )
+        clustering_form.addRow("Axes alpha:", self.morphology_axes_alpha)
+        self.morphology_background_color = QColor(DEFAULT_PLOT_STYLE["background_color"])
+        background_button = QPushButton("Change plot background…")
+        background_button.clicked.connect(
+            lambda: self._change_morphology_plot_color("background")
+        )
+        self.morphology_background_color_button = background_button
+        clustering_form.addRow(background_button)
+        self.morphology_background_alpha = QDoubleSpinBox()
+        self.morphology_background_alpha.setRange(0.0, 1.0)
+        self.morphology_background_alpha.setSingleStep(0.05)
+        self.morphology_background_alpha.setValue(1.0)
+        self.morphology_background_alpha.editingFinished.connect(
+            self._save_morphology_plot_style
+        )
+        clustering_form.addRow("Background alpha:", self.morphology_background_alpha)
+        export_button = QPushButton("Export separate analysis package…")
+        export_button.clicked.connect(self._export_morphology_run)
+        self.export_morphology_button = export_button
+        clustering_form.addRow(export_button)
+        controls_layout.addWidget(clustering)
+        controls_layout.addStretch(1)
+        controls_scroll.setWidget(controls)
+        splitter.addWidget(controls_scroll)
+
+        output = QWidget()
+        output_layout = QVBoxLayout(output)
+        self.morphology_status = QLabel("Calculate measurements before reviewing all-spine geometry.")
+        self.morphology_status.setWordWrap(True)
+        output_layout.addWidget(self.morphology_status)
+        self.morphology_display_tabs = QTabWidget()
+        geometry_page = QWidget()
+        geometry_layout = QVBoxLayout(geometry_page)
+        self.morphology_canvas = MorphologyReviewCanvas("Select a measured spine")
+        self.morphology_canvas.navigate_requested.connect(self._move_morphology_spine)
+        geometry_layout.addWidget(self.morphology_canvas, 1)
+        geometry_layout.addWidget(ZoomControls(self.morphology_canvas))
+        self.morphology_metrics = QLabel("")
+        self.morphology_metrics.setWordWrap(True)
+        geometry_layout.addWidget(self.morphology_metrics)
+        self.morphology_display_tabs.addTab(geometry_page, "Geometry review")
+        plots_page = QWidget()
+        plots_layout = QVBoxLayout(plots_page)
+        self.morphology_plot_mode = QComboBox()
+        self.morphology_plot_mode.addItem("Volume vs curvilinear length", "volume_length")
+        self.morphology_plot_mode.addItem("Volume vs base-to-tip distance", "volume_straight")
+        self.morphology_plot_mode.addItem("Selected morphology features", "custom_features")
+        self.morphology_plot_mode.addItem("PCA", "pca")
+        self.morphology_plot_mode.addItem("3D PCA with feature axes", "pca_3d_features")
+        self.morphology_plot_mode.addItem("PCA interpretation", "pca_interpretation")
+        self.morphology_plot_mode.addItem("Protein-positive fraction", "protein_positive")
+        self.morphology_plot_mode.addItem("Protein puncta volume", "protein_volume")
+        self.morphology_plot_mode.addItem("Protein position profiles", "protein_position")
+        self.morphology_plot_mode.addItem("Group cluster proportions", "group_proportions")
+        self.morphology_plot_mode.addItem("Cluster profile heatmap", "cluster_heatmap")
+        self.morphology_plot_mode.currentIndexChanged.connect(
+            self._morphology_plot_mode_changed
+        )
+        plots_layout.addWidget(self.morphology_plot_mode)
+        feature_plot_row = QHBoxLayout()
+        feature_plot_row.addWidget(QLabel("X:"))
+        self.morphology_custom_x = QComboBox()
+        feature_plot_row.addWidget(self.morphology_custom_x, 1)
+        feature_plot_row.addWidget(QLabel("Y:"))
+        self.morphology_custom_y = QComboBox()
+        feature_plot_row.addWidget(self.morphology_custom_y, 1)
+        self.morphology_custom_x.currentIndexChanged.connect(
+            self._save_morphology_plot_style
+        )
+        self.morphology_custom_y.currentIndexChanged.connect(
+            self._save_morphology_plot_style
+        )
+        self.morphology_feature_plot_row = QWidget()
+        self.morphology_feature_plot_row.setLayout(feature_plot_row)
+        plots_layout.addWidget(self.morphology_feature_plot_row)
+        pca_point_row = QHBoxLayout()
+        self.morphology_pca_show_points = QCheckBox("Show spine points")
+        self.morphology_pca_show_points.setChecked(True)
+        self.morphology_pca_show_points.setToolTip(
+            "Hide the PCA score points to view the morphology-feature vectors alone."
+        )
+        self.morphology_pca_show_points.toggled.connect(
+            self._save_morphology_plot_style
+        )
+        pca_point_row.addWidget(self.morphology_pca_show_points)
+        pca_point_row.addWidget(QLabel("Point opacity:"))
+        self.morphology_pca_point_alpha = QDoubleSpinBox()
+        self.morphology_pca_point_alpha.setRange(0.0, 1.0)
+        self.morphology_pca_point_alpha.setDecimals(2)
+        self.morphology_pca_point_alpha.setSingleStep(0.05)
+        self.morphology_pca_point_alpha.setValue(
+            float(DEFAULT_PLOT_STYLE["pca_point_alpha"])
+        )
+        self.morphology_pca_point_alpha.setToolTip(
+            "Opacity of spine points in the PCA feature-vector views. "
+            "Feature arrows remain fully opaque."
+        )
+        self.morphology_pca_point_alpha.editingFinished.connect(
+            self._save_morphology_plot_style
+        )
+        pca_point_row.addWidget(self.morphology_pca_point_alpha)
+        pca_point_row.addStretch(1)
+        self.morphology_pca_point_row = QWidget()
+        self.morphology_pca_point_row.setLayout(pca_point_row)
+        plots_layout.addWidget(self.morphology_pca_point_row)
+        legend_row = QHBoxLayout()
+        self.morphology_show_legend = QCheckBox("Show legend")
+        self.morphology_show_legend.setChecked(True)
+        self.morphology_show_legend.toggled.connect(
+            self._save_morphology_plot_style
+        )
+        legend_row.addWidget(self.morphology_show_legend)
+        legend_row.addWidget(QLabel("Position:"))
+        self.morphology_legend_position = QComboBox()
+        self.morphology_legend_position.addItem("Outside right", "outside_right")
+        self.morphology_legend_position.addItem("Below plot", "outside_bottom")
+        self.morphology_legend_position.addItem("Inside plot", "inside")
+        self.morphology_legend_position.currentIndexChanged.connect(
+            self._save_morphology_plot_style
+        )
+        legend_row.addWidget(self.morphology_legend_position)
+        legend_row.addStretch(1)
+        plots_layout.addLayout(legend_row)
+        self.morphology_plot = MorphologyPlotCanvas()
+        plots_layout.addWidget(self.morphology_plot, 1)
+        self.morphology_display_tabs.addTab(plots_page, "Interactive clustering plots")
+        self.morphology_cluster_score_panel = ClusterCountScorePanel()
+        self.morphology_display_tabs.addTab(
+            self.morphology_cluster_score_panel, "Cluster-count scores"
+        )
+        output_layout.addWidget(self.morphology_display_tabs, 1)
+        splitter.addWidget(output)
+        splitter.setSizes([420, 980])
+        self._last_morphology_preview: MorphologyPreview | None = None
+        self._active_morphology_run: dict[str, object] | None = None
+        self._morphology_plot_mode_changed()
+        self.tabs.addTab(tab, "6. Morphology clustering")
+        self._morphology_tool_changed()
+
+    def _build_advanced_clustering_tab(self) -> None:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(410)
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+
+        run_group = QGroupBox("Named nonlinear morphology analysis")
+        form = QFormLayout(run_group)
+        note = QLabel(
+            "PCA remains the interpretable default in tab 6. Here, the selected "
+            "higher-dimensional UMAP or PCC/PCUMAP embedding is the actual input "
+            "to Gaussian mixture, Ward, or K-means clustering."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+        self.advanced_saved_run = QComboBox()
+        self.advanced_saved_run.currentIndexChanged.connect(
+            self._advanced_saved_run_changed
+        )
+        form.addRow("Saved run:", self.advanced_saved_run)
+        self.advanced_run_name = QLineEdit("Advanced nonlinear analysis")
+        form.addRow("Run name:", self.advanced_run_name)
+        self.advanced_reduction = QComboBox()
+        self.advanced_reduction.addItem("UMAP", "umap")
+        self.advanced_reduction.addItem("PCC/PCUMAP (Gildenblat & Pahnke)", "pcumap")
+        self.advanced_reduction.currentIndexChanged.connect(
+            self._advanced_reduction_changed
+        )
+        form.addRow("Reduction:", self.advanced_reduction)
+
+        self.advanced_features: dict[str, QCheckBox] = {}
+        feature_widget = QWidget()
+        feature_layout = QGridLayout(feature_widget)
+        feature_layout.setContentsMargins(0, 0, 0, 0)
+        for index, (key, (label, _column)) in enumerate(MORPHOLOGY_FEATURES.items()):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(key in DEFAULT_FEATURES)
+            self.advanced_features[key] = checkbox
+            feature_layout.addWidget(checkbox, index // 2, index % 2)
+        form.addRow("Morphology features:", feature_widget)
+        protein_note = QLabel(
+            "Protein puncta remain descriptive outputs only; they never influence "
+            "the nonlinear embedding or cluster assignments."
+        )
+        protein_note.setWordWrap(True)
+        form.addRow(protein_note)
+        self.advanced_groups = QListWidget()
+        self.advanced_groups.setSelectionMode(
+            QAbstractItemView.SelectionMode.MultiSelection
+        )
+        self.advanced_groups.setMaximumHeight(110)
+        form.addRow("Experimental groups:", self.advanced_groups)
+        self.advanced_reviewed_only = QCheckBox(
+            "Cluster geometry-reviewed spines only"
+        )
+        form.addRow(self.advanced_reviewed_only)
+        self.advanced_algorithm = QComboBox()
+        self.advanced_algorithm.addItem("Gaussian mixture", "gaussian_mixture")
+        self.advanced_algorithm.addItem("Ward hierarchical", "ward")
+        self.advanced_algorithm.addItem("K-means", "kmeans")
+        form.addRow("Cluster algorithm:", self.advanced_algorithm)
+
+        cluster_range = QHBoxLayout()
+        self.advanced_min_clusters = QSpinBox()
+        self.advanced_min_clusters.setRange(1, 10)
+        self.advanced_min_clusters.setValue(1)
+        self.advanced_max_clusters = QSpinBox()
+        self.advanced_max_clusters.setRange(1, 10)
+        self.advanced_max_clusters.setValue(6)
+        cluster_range.addWidget(QLabel("Min"))
+        cluster_range.addWidget(self.advanced_min_clusters)
+        cluster_range.addWidget(QLabel("Max"))
+        cluster_range.addWidget(self.advanced_max_clusters)
+        form.addRow("Candidate clusters:", cluster_range)
+        self.advanced_cluster_count_selection = QComboBox()
+        self.advanced_cluster_count_selection.addItem(
+            "Information criterion (BIC / penalized SSE)",
+            "information_criterion",
+        )
+        self.advanced_cluster_count_selection.addItem(
+            "Maximum silhouette score", "silhouette"
+        )
+        self.advanced_cluster_count_selection.addItem(
+            "Elbow of within-cluster SSE", "elbow"
+        )
+        self.advanced_cluster_count_selection.setToolTip(
+            "Used only when Fixed count is Automatic. Elbow requires at least "
+            "three accepted candidate cluster counts."
+        )
+        form.addRow(
+            "Automatic selection:", self.advanced_cluster_count_selection
+        )
+        self.advanced_fixed_clusters = QSpinBox()
+        self.advanced_fixed_clusters.setRange(0, 10)
+        self.advanced_fixed_clusters.setSpecialValueText("Automatic")
+        self.advanced_fixed_clusters.valueChanged.connect(
+            self._cluster_count_controls_changed
+        )
+        form.addRow("Fixed count:", self.advanced_fixed_clusters)
+        self.advanced_scaling = QComboBox()
+        self.advanced_scaling.addItem("Robust median / IQR", "robust")
+        self.advanced_scaling.addItem("Z-score", "zscore")
+        self.advanced_scaling.addItem("None", "none")
+        form.addRow("Input scaling:", self.advanced_scaling)
+        self.advanced_seed = QSpinBox()
+        self.advanced_seed.setRange(0, 2_000_000_000)
+        self.advanced_seed.setValue(42)
+        form.addRow("Random seed:", self.advanced_seed)
+        self.advanced_min_cluster_spines = QSpinBox()
+        self.advanced_min_cluster_spines.setRange(2, 1_000_000)
+        self.advanced_min_cluster_spines.setValue(10)
+        form.addRow("Minimum spines/cluster:", self.advanced_min_cluster_spines)
+        self.advanced_min_cluster_fraction = QDoubleSpinBox()
+        self.advanced_min_cluster_fraction.setRange(0.0, 50.0)
+        self.advanced_min_cluster_fraction.setDecimals(1)
+        self.advanced_min_cluster_fraction.setValue(5.0)
+        self.advanced_min_cluster_fraction.setSuffix(" %")
+        form.addRow("Minimum cluster fraction:", self.advanced_min_cluster_fraction)
+        controls_layout.addWidget(run_group)
+
+        embedding_group = QGroupBox("Embedding and reproducibility")
+        embedding_form = QFormLayout(embedding_group)
+        self.advanced_embedding_dimensions = QSpinBox()
+        self.advanced_embedding_dimensions.setRange(2, 20)
+        self.advanced_embedding_dimensions.setValue(5)
+        embedding_form.addRow("Clustering dimensions:", self.advanced_embedding_dimensions)
+        self.advanced_plot_dimensions = QComboBox()
+        self.advanced_plot_dimensions.addItem("2D", 2)
+        self.advanced_plot_dimensions.addItem("3D", 3)
+        embedding_form.addRow("Interactive plot:", self.advanced_plot_dimensions)
+        self.advanced_neighbors = QSpinBox()
+        self.advanced_neighbors.setRange(2, 500)
+        self.advanced_neighbors.setValue(15)
+        embedding_form.addRow("Nearest neighbors:", self.advanced_neighbors)
+        self.advanced_min_dist = QDoubleSpinBox()
+        self.advanced_min_dist.setRange(0.0, 0.99)
+        self.advanced_min_dist.setDecimals(3)
+        self.advanced_min_dist.setSingleStep(0.05)
+        self.advanced_min_dist.setValue(0.1)
+        embedding_form.addRow("Minimum distance:", self.advanced_min_dist)
+        self.advanced_metric = QComboBox()
+        self.advanced_metric.addItem("Euclidean", "euclidean")
+        self.advanced_metric.addItem("Manhattan", "manhattan")
+        embedding_form.addRow("Distance metric:", self.advanced_metric)
+        self.advanced_iterations = QSpinBox()
+        self.advanced_iterations.setRange(50, 10_000)
+        self.advanced_iterations.setSingleStep(50)
+        self.advanced_iterations.setValue(500)
+        embedding_form.addRow("Optimization iterations:", self.advanced_iterations)
+        self.advanced_stability_repetitions = QSpinBox()
+        self.advanced_stability_repetitions.setRange(1, 10)
+        self.advanced_stability_repetitions.setValue(3)
+        self.advanced_stability_repetitions.setToolTip(
+            "Includes the primary fit. Additional fits quantify embedding-distance "
+            "and cluster-assignment stability across random seeds."
+        )
+        embedding_form.addRow("Seed repetitions:", self.advanced_stability_repetitions)
+        controls_layout.addWidget(embedding_group)
+
+        self.advanced_pcumap_group = QGroupBox("PCC/PCUMAP correlation controls")
+        pcumap_form = QFormLayout(self.advanced_pcumap_group)
+        self.advanced_pcumap_reference_points = QSpinBox()
+        self.advanced_pcumap_reference_points.setRange(2, 1_000_000)
+        self.advanced_pcumap_reference_points.setValue(100)
+        pcumap_form.addRow("Reference points:", self.advanced_pcumap_reference_points)
+        self.advanced_pcumap_beta = QDoubleSpinBox()
+        self.advanced_pcumap_beta.setRange(0.001, 1_000_000.0)
+        self.advanced_pcumap_beta.setDecimals(3)
+        self.advanced_pcumap_beta.setValue(10.0)
+        pcumap_form.addRow("Beta:", self.advanced_pcumap_beta)
+        self.advanced_pcumap_weight = QDoubleSpinBox()
+        self.advanced_pcumap_weight.setRange(0.0, 1_000_000_000.0)
+        self.advanced_pcumap_weight.setDecimals(1)
+        self.advanced_pcumap_weight.setValue(90_000.0)
+        pcumap_form.addRow("Correlation-loss weight:", self.advanced_pcumap_weight)
+        self.advanced_pcumap_start = QSpinBox()
+        self.advanced_pcumap_start.setRange(0, 10_000)
+        self.advanced_pcumap_start.setValue(10)
+        pcumap_form.addRow("Start correlation epoch:", self.advanced_pcumap_start)
+        self.advanced_pcumap_device = QComboBox()
+        self.advanced_pcumap_device.addItem("CPU (reproducible default)", "cpu")
+        self.advanced_pcumap_device.addItem("Automatic", "auto")
+        self.advanced_pcumap_device.addItem("CUDA GPU", "cuda")
+        pcumap_form.addRow("Compute device:", self.advanced_pcumap_device)
+        controls_layout.addWidget(self.advanced_pcumap_group)
+
+        action_group = QGroupBox("Run, appearance, and export")
+        action_form = QFormLayout(action_group)
+        self.run_advanced_button = QPushButton("Run / replace named advanced analysis")
+        self.run_advanced_button.clicked.connect(self._run_advanced_clustering)
+        action_form.addRow(self.run_advanced_button)
+        advanced_color_button = QPushButton("Change cluster colorsвЂ¦")
+        advanced_color_button.clicked.connect(self._change_advanced_colors)
+        action_form.addRow(advanced_color_button)
+        self.advanced_axes_color = QColor(DEFAULT_PLOT_STYLE["axes_color"])
+        self.advanced_axes_color_button = QPushButton("Change axes colorвЂ¦")
+        self.advanced_axes_color_button.clicked.connect(
+            lambda: self._change_advanced_plot_color("axes")
+        )
+        action_form.addRow(self.advanced_axes_color_button)
+        self.advanced_axes_alpha = QDoubleSpinBox()
+        self.advanced_axes_alpha.setRange(0.0, 1.0)
+        self.advanced_axes_alpha.setSingleStep(0.05)
+        self.advanced_axes_alpha.setValue(1.0)
+        self.advanced_axes_alpha.editingFinished.connect(
+            self._save_advanced_plot_style
+        )
+        action_form.addRow("Axes alpha:", self.advanced_axes_alpha)
+        self.advanced_background_color = QColor(DEFAULT_PLOT_STYLE["background_color"])
+        self.advanced_background_color_button = QPushButton("Change plot backgroundвЂ¦")
+        self.advanced_background_color_button.clicked.connect(
+            lambda: self._change_advanced_plot_color("background")
+        )
+        action_form.addRow(self.advanced_background_color_button)
+        self.advanced_background_alpha = QDoubleSpinBox()
+        self.advanced_background_alpha.setRange(0.0, 1.0)
+        self.advanced_background_alpha.setSingleStep(0.05)
+        self.advanced_background_alpha.setValue(1.0)
+        self.advanced_background_alpha.editingFinished.connect(
+            self._save_advanced_plot_style
+        )
+        action_form.addRow("Background alpha:", self.advanced_background_alpha)
+        export_button = QPushButton("Export separate advanced analysis packageвЂ¦")
+        export_button.clicked.connect(self._export_advanced_run)
+        action_form.addRow(export_button)
+        controls_layout.addWidget(action_group)
+        controls_layout.addStretch(1)
+        scroll.setWidget(controls)
+        splitter.addWidget(scroll)
+
+        output = QWidget()
+        output_layout = QVBoxLayout(output)
+        self.advanced_status = QLabel(
+            "Complete spine measurements before fitting a nonlinear embedding."
+        )
+        self.advanced_status.setWordWrap(True)
+        output_layout.addWidget(self.advanced_status)
+        self.advanced_display_tabs = QTabWidget()
+        advanced_plots_page = QWidget()
+        advanced_plots_layout = QVBoxLayout(advanced_plots_page)
+        plot_row = QHBoxLayout()
+        self.advanced_plot_mode = QComboBox()
+        self.advanced_plot_mode.addItem("Nonlinear embedding", "embedding")
+        self.advanced_plot_mode.addItem("Volume vs curvilinear length", "volume_length")
+        self.advanced_plot_mode.addItem("Protein-positive fraction", "protein_positive")
+        self.advanced_plot_mode.addItem("Protein puncta volume", "protein_volume")
+        self.advanced_plot_mode.addItem("Protein position profiles", "protein_position")
+        self.advanced_plot_mode.addItem("Group cluster proportions", "group_proportions")
+        self.advanced_plot_mode.addItem("Cluster profile heatmap", "cluster_heatmap")
+        self.advanced_plot_mode.currentIndexChanged.connect(
+            self._render_advanced_plot
+        )
+        plot_row.addWidget(self.advanced_plot_mode, 1)
+        self.advanced_show_legend = QCheckBox("Show legend")
+        self.advanced_show_legend.setChecked(True)
+        self.advanced_show_legend.toggled.connect(self._save_advanced_plot_style)
+        plot_row.addWidget(self.advanced_show_legend)
+        self.advanced_legend_position = QComboBox()
+        self.advanced_legend_position.addItem("Outside right", "outside_right")
+        self.advanced_legend_position.addItem("Below plot", "outside_bottom")
+        self.advanced_legend_position.addItem("Inside plot", "inside")
+        self.advanced_legend_position.currentIndexChanged.connect(
+            self._save_advanced_plot_style
+        )
+        plot_row.addWidget(self.advanced_legend_position)
+        advanced_plots_layout.addLayout(plot_row)
+        self.advanced_diagnostics = QLabel("")
+        self.advanced_diagnostics.setWordWrap(True)
+        advanced_plots_layout.addWidget(self.advanced_diagnostics)
+        self.advanced_plot = MorphologyPlotCanvas()
+        advanced_plots_layout.addWidget(self.advanced_plot, 1)
+        self.advanced_display_tabs.addTab(
+            advanced_plots_page, "Interactive clustering plots"
+        )
+        self.advanced_cluster_score_panel = ClusterCountScorePanel()
+        self.advanced_display_tabs.addTab(
+            self.advanced_cluster_score_panel, "Cluster-count scores"
+        )
+        output_layout.addWidget(self.advanced_display_tabs, 1)
+        splitter.addWidget(output)
+        splitter.setSizes([440, 960])
+        self._active_advanced_run: dict[str, object] | None = None
+        self.tabs.addTab(tab, "7. Advanced clustering")
+        self._advanced_reduction_changed()
+        self._cluster_count_controls_changed()
 
     def _role_combo(self, selected: str) -> QComboBox:
         combo = QComboBox()
@@ -5340,6 +6951,1012 @@ class MainWindow(QMainWindow):
         self.measurement_fixed_slices.setEnabled(method == "fixed")
         self.measurement_area_factor.setEnabled(method == "adaptive")
 
+    def _prepare_morphology_tab(self) -> None:
+        measured: list[int] = []
+        if self.manifest is not None:
+            measured = [
+                index
+                for index, specimen in enumerate(self.manifest["specimens"])
+                if specimen["checkpoints"].get("measurements", {}).get("state") == "complete"
+            ]
+        self.tabs.setTabEnabled(5, bool(measured))
+        current = self.morphology_specimen.currentData()
+        self.morphology_specimen.blockSignals(True)
+        self.morphology_specimen.clear()
+        if self.manifest is not None:
+            for index in measured:
+                specimen = self.manifest["specimens"][index]
+                reviews = specimen.get("morphology_review", {}).get("spines", {})
+                reviewed = sum(bool(value.get("reviewed")) for value in reviews.values())
+                self.morphology_specimen.addItem(
+                    f"{specimen['experimental_group']} — {specimen['specimen_id']} [{reviewed} geometry checked]",
+                    index,
+                )
+        if current is not None:
+            found = self.morphology_specimen.findData(current)
+            self.morphology_specimen.setCurrentIndex(max(0, found))
+        self.morphology_specimen.blockSignals(False)
+        selected_groups = {item.text() for item in self.morphology_groups.selectedItems()}
+        had_group_choices = self.morphology_groups.count() > 0
+        self.morphology_groups.clear()
+        if self.manifest is not None:
+            groups = sorted(
+                {
+                    str(self.manifest["specimens"][index]["experimental_group"])
+                    for index in measured
+                }
+            )
+            for group in groups:
+                self.morphology_groups.addItem(group)
+                item = self.morphology_groups.item(self.morphology_groups.count() - 1)
+                item.setSelected(group in selected_groups if had_group_choices else True)
+        current_run = self.morphology_saved_run.currentData()
+        self.morphology_saved_run.blockSignals(True)
+        self.morphology_saved_run.clear()
+        if self.manifest is not None:
+            for record in self.manifest.get("morphology_analysis", {}).get("runs", []):
+                if str(record.get("settings", {}).get("reduction_method", "pca")) != "pca":
+                    continue
+                suffix = " [stale—refit needed]" if record.get("stale") else ""
+                self.morphology_saved_run.addItem(f"{record.get('name', 'Analysis')}{suffix}", record.get("run_id"))
+        if current_run is not None:
+            found = self.morphology_saved_run.findData(current_run)
+            self.morphology_saved_run.setCurrentIndex(max(0, found))
+        self.morphology_saved_run.blockSignals(False)
+        if measured:
+            self._morphology_specimen_changed()
+        if self.morphology_saved_run.count():
+            self._morphology_saved_run_changed()
+        self._prepare_advanced_clustering_tab(measured)
+
+    def _prepare_advanced_clustering_tab(
+        self, measured: list[int] | None = None
+    ) -> None:
+        if measured is None:
+            measured = []
+            if self.manifest is not None:
+                measured = [
+                    index
+                    for index, specimen in enumerate(self.manifest["specimens"])
+                    if specimen["checkpoints"].get("measurements", {}).get("state")
+                    == "complete"
+                ]
+        self.tabs.setTabEnabled(6, bool(measured))
+        selected_groups = {item.text() for item in self.advanced_groups.selectedItems()}
+        had_groups = self.advanced_groups.count() > 0
+        self.advanced_groups.clear()
+        if self.manifest is not None:
+            groups = sorted(
+                {
+                    str(self.manifest["specimens"][index]["experimental_group"])
+                    for index in measured
+                }
+            )
+            for group in groups:
+                self.advanced_groups.addItem(group)
+                item = self.advanced_groups.item(self.advanced_groups.count() - 1)
+                item.setSelected(group in selected_groups if had_groups else True)
+        current_run = self.advanced_saved_run.currentData()
+        self.advanced_saved_run.blockSignals(True)
+        self.advanced_saved_run.clear()
+        if self.manifest is not None:
+            for record in self.manifest.get("morphology_analysis", {}).get("runs", []):
+                method = str(record.get("settings", {}).get("reduction_method", "pca"))
+                if method not in {"umap", "pcumap"}:
+                    continue
+                suffix = " [stale - refit needed]" if record.get("stale") else ""
+                label = "PCC/PCUMAP" if method == "pcumap" else "UMAP"
+                self.advanced_saved_run.addItem(
+                    f"{record.get('name', 'Analysis')} [{label}]{suffix}",
+                    record.get("run_id"),
+                )
+        if current_run is not None:
+            found = self.advanced_saved_run.findData(current_run)
+            if found >= 0:
+                self.advanced_saved_run.setCurrentIndex(found)
+        self.advanced_saved_run.blockSignals(False)
+        if self.advanced_saved_run.count():
+            self._advanced_saved_run_changed()
+
+    def _advanced_reduction_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self.advanced_pcumap_group.setVisible(
+            self.advanced_reduction.currentData() == "pcumap"
+        )
+
+    def _cluster_count_controls_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if hasattr(self, "morphology_cluster_count_selection"):
+            self.morphology_cluster_count_selection.setEnabled(
+                self.morphology_fixed_clusters.value() == 0
+            )
+        if hasattr(self, "advanced_cluster_count_selection"):
+            self.advanced_cluster_count_selection.setEnabled(
+                self.advanced_fixed_clusters.value() == 0
+            )
+
+    def _current_advanced_settings(self) -> MorphologyClusteringSettings:
+        features = tuple(
+            key for key, checkbox in self.advanced_features.items()
+            if checkbox.isChecked()
+        )
+        groups = tuple(item.text() for item in self.advanced_groups.selectedItems())
+        if self.advanced_groups.count() and not groups:
+            raise ValueError("Select at least one experimental group for clustering.")
+        return MorphologyClusteringSettings(
+            algorithm=str(self.advanced_algorithm.currentData()),
+            features=features,
+            pca_dimensions=3,
+            use_pca_for_clustering=False,
+            minimum_clusters=self.advanced_min_clusters.value(),
+            maximum_clusters=self.advanced_max_clusters.value(),
+            fixed_cluster_count=self.advanced_fixed_clusters.value(),
+            cluster_count_selection=str(
+                self.advanced_cluster_count_selection.currentData()
+            ),
+            scaling=str(self.advanced_scaling.currentData()),
+            random_seed=self.advanced_seed.value(),
+            minimum_cluster_spines=self.advanced_min_cluster_spines.value(),
+            minimum_cluster_fraction=self.advanced_min_cluster_fraction.value() / 100.0,
+            included_groups=groups,
+            reviewed_only=self.advanced_reviewed_only.isChecked(),
+            reduction_method=str(self.advanced_reduction.currentData()),
+            embedding_dimensions=self.advanced_embedding_dimensions.value(),
+            embedding_plot_dimensions=int(self.advanced_plot_dimensions.currentData()),
+            umap_n_neighbors=self.advanced_neighbors.value(),
+            umap_min_dist=self.advanced_min_dist.value(),
+            umap_metric=str(self.advanced_metric.currentData()),
+            umap_iterations=self.advanced_iterations.value(),
+            pcumap_reference_points=self.advanced_pcumap_reference_points.value(),
+            pcumap_beta=self.advanced_pcumap_beta.value(),
+            pcumap_correlation_weight=self.advanced_pcumap_weight.value(),
+            pcumap_correlation_start=self.advanced_pcumap_start.value(),
+            pcumap_device=str(self.advanced_pcumap_device.currentData()),
+            embedding_stability_repetitions=self.advanced_stability_repetitions.value(),
+        )
+
+    def _run_advanced_clustering(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        try:
+            settings = self._current_advanced_settings()
+            settings.validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot run advanced clustering", str(exc))
+            return
+        worker = MorphologyClusteringWorker(
+            self.manifest,
+            self.project_path,
+            self.advanced_run_name.text(),
+            settings,
+        )
+        worker.completed.connect(self._advanced_clustering_completed)
+        self._start_worker(worker, "advanced_morphology")
+
+    @Slot(object)
+    def _advanced_clustering_completed(self, result: dict[str, object]) -> None:
+        self._active_advanced_run = result
+        self._prepare_morphology_tab()
+        run_index = self.advanced_saved_run.findData(result.get("run_id"))
+        if run_index >= 0:
+            self.advanced_saved_run.setCurrentIndex(run_index)
+        self._active_advanced_run = result
+        self._refresh_advanced_plot_style_controls()
+        self._render_advanced_plot()
+        self._show_advanced_diagnostics(result)
+
+    def _show_advanced_diagnostics(self, result: dict[str, object]) -> None:
+        metadata = dict(result.get("embedding_metadata", {}))
+        stability = dict(result.get("embedding_stability", {}))
+        method = (
+            "PCC/PCUMAP"
+            if metadata.get("method") == "pcumap"
+            else str(metadata.get("method", "embedding")).upper()
+        )
+        trust = metadata.get("trustworthiness")
+        distance = metadata.get("distance_rank_correlation")
+        repeat_distance = stability.get("mean_distance_rank_correlation")
+        repeat_clusters = stability.get("mean_cluster_adjusted_rand")
+        values = [
+            f"Saved {result.get('name')}: {result.get('selected_cluster_count')} clusters from "
+            f"{result.get('included_spine_count')} valid complete spines in a "
+            f"{metadata.get('dimensions')}D {method} space.",
+            f"Trustworthiness: {float(trust):.3f}." if trust is not None else "",
+            f"Input/embedding distance-rank correlation: {float(distance):.3f}."
+            if distance is not None else "",
+            f"Across-seed embedding stability: {float(repeat_distance):.3f}."
+            if repeat_distance is not None else "",
+            f"Across-seed cluster adjusted Rand: {float(repeat_clusters):.3f}."
+            if repeat_clusters is not None else "",
+            "Protein puncta were descriptive only.",
+        ]
+        self.advanced_status.setText(" ".join(value for value in values if value))
+        self.advanced_diagnostics.setText(
+            f"Implementation: {metadata.get('implementation', '')} "
+            f"{metadata.get('implementation_version', '')}; neighbors used: "
+            f"{metadata.get('effective_neighbors')} (requested "
+            f"{metadata.get('requested_neighbors')}); stability fits completed: "
+            f"{stability.get('completed_repetitions', 1)}."
+        )
+
+    def _advanced_saved_run_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.advanced_saved_run.currentData() is None:
+            return
+        try:
+            result = load_morphology_run(
+                self.manifest, str(self.advanced_saved_run.currentData())
+            )
+            settings = MorphologyClusteringSettings.from_dict(
+                dict(result.get("settings", {}))
+            )
+            if settings.reduction_method not in {"umap", "pcumap"}:
+                return
+            self._active_advanced_run = result
+            self.advanced_run_name.setText(str(result.get("name", "")))
+            self.advanced_reduction.setCurrentIndex(
+                max(0, self.advanced_reduction.findData(settings.reduction_method))
+            )
+            for key, checkbox in self.advanced_features.items():
+                checkbox.setChecked(key in settings.features)
+            self.advanced_algorithm.setCurrentIndex(
+                max(0, self.advanced_algorithm.findData(settings.algorithm))
+            )
+            self.advanced_min_clusters.setValue(settings.minimum_clusters)
+            self.advanced_max_clusters.setValue(settings.maximum_clusters)
+            self.advanced_fixed_clusters.setValue(settings.fixed_cluster_count)
+            self.advanced_cluster_count_selection.setCurrentIndex(
+                max(
+                    0,
+                    self.advanced_cluster_count_selection.findData(
+                        settings.cluster_count_selection
+                    ),
+                )
+            )
+            self.advanced_scaling.setCurrentIndex(
+                max(0, self.advanced_scaling.findData(settings.scaling))
+            )
+            self.advanced_seed.setValue(settings.random_seed)
+            self.advanced_min_cluster_spines.setValue(settings.minimum_cluster_spines)
+            self.advanced_min_cluster_fraction.setValue(
+                settings.minimum_cluster_fraction * 100.0
+            )
+            selected_groups = set(settings.included_groups)
+            for index in range(self.advanced_groups.count()):
+                item = self.advanced_groups.item(index)
+                item.setSelected(not selected_groups or item.text() in selected_groups)
+            self.advanced_reviewed_only.setChecked(settings.reviewed_only)
+            self.advanced_embedding_dimensions.setValue(settings.embedding_dimensions)
+            self.advanced_plot_dimensions.setCurrentIndex(
+                max(
+                    0,
+                    self.advanced_plot_dimensions.findData(
+                        settings.embedding_plot_dimensions
+                    ),
+                )
+            )
+            self.advanced_neighbors.setValue(settings.umap_n_neighbors)
+            self.advanced_min_dist.setValue(settings.umap_min_dist)
+            self.advanced_metric.setCurrentIndex(
+                max(0, self.advanced_metric.findData(settings.umap_metric))
+            )
+            self.advanced_iterations.setValue(settings.umap_iterations)
+            self.advanced_stability_repetitions.setValue(
+                settings.embedding_stability_repetitions
+            )
+            self.advanced_pcumap_reference_points.setValue(
+                settings.pcumap_reference_points
+            )
+            self.advanced_pcumap_beta.setValue(settings.pcumap_beta)
+            self.advanced_pcumap_weight.setValue(settings.pcumap_correlation_weight)
+            self.advanced_pcumap_start.setValue(settings.pcumap_correlation_start)
+            self.advanced_pcumap_device.setCurrentIndex(
+                max(0, self.advanced_pcumap_device.findData(settings.pcumap_device))
+            )
+            self._advanced_reduction_changed()
+            self._refresh_advanced_plot_style_controls()
+            self._render_advanced_plot()
+            self._show_advanced_diagnostics(result)
+        except (OSError, ValueError) as exc:
+            self.advanced_status.setText(f"Cannot load saved advanced analysis: {exc}")
+
+    def _render_advanced_plot(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self._active_advanced_run is not None:
+            self.advanced_plot.show_run(
+                self._active_advanced_run,
+                str(self.advanced_plot_mode.currentData()),
+            )
+            self.advanced_cluster_score_panel.show_run(
+                self._active_advanced_run
+            )
+
+    def _change_advanced_colors(self) -> None:
+        if self._active_advanced_run is None:
+            return
+        colors: list[str] = []
+        for definition in self._active_advanced_run.get("cluster_definitions", []):
+            chosen = QColorDialog.getColor(
+                QColor(str(definition.get("color", "#457b9d"))),
+                self,
+                f"Color for morphology cluster {definition.get('morphology_cluster_id')}",
+            )
+            if not chosen.isValid():
+                return
+            colors.append(chosen.name())
+        try:
+            run_id = str(self._active_advanced_run.get("run_id", ""))
+            known = bool(
+                self.manifest
+                and any(
+                    str(record.get("run_id", "")) == run_id
+                    for record in self.manifest.get("morphology_analysis", {}).get("runs", [])
+                )
+            )
+            if known and self.manifest is not None and self.project_path is not None:
+                self._active_advanced_run = update_run_colors(
+                    self.manifest, self.project_path, run_id, colors
+                )
+            else:
+                for definition, color in zip(
+                    self._active_advanced_run.get("cluster_definitions", []), colors
+                ):
+                    definition["color"] = color
+            self._render_advanced_plot()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot save colors", str(exc))
+
+    def _refresh_advanced_plot_style_controls(self) -> None:
+        style = {
+            **DEFAULT_PLOT_STYLE,
+            **dict((self._active_advanced_run or {}).get("plot_style", {})),
+        }
+        self.advanced_axes_color = QColor(str(style["axes_color"]))
+        self.advanced_background_color = QColor(str(style["background_color"]))
+        controls = (
+            self.advanced_axes_alpha,
+            self.advanced_background_alpha,
+            self.advanced_show_legend,
+            self.advanced_legend_position,
+        )
+        for control in controls:
+            control.blockSignals(True)
+        self.advanced_axes_alpha.setValue(float(style["axes_alpha"]))
+        self.advanced_background_alpha.setValue(float(style["background_alpha"]))
+        self.advanced_show_legend.setChecked(bool(style["show_legend"]))
+        self.advanced_legend_position.setCurrentIndex(
+            max(
+                0,
+                self.advanced_legend_position.findData(str(style["legend_position"])),
+            )
+        )
+        for control in controls:
+            control.blockSignals(False)
+        self.advanced_axes_color_button.setStyleSheet(
+            f"background-color: {self.advanced_axes_color.name()};"
+        )
+        self.advanced_background_color_button.setStyleSheet(
+            f"background-color: {self.advanced_background_color.name()};"
+        )
+
+    def _change_advanced_plot_color(self, target: str) -> None:
+        current = QColor(
+            self.advanced_axes_color
+            if target == "axes"
+            else self.advanced_background_color
+        )
+        alpha = (
+            self.advanced_axes_alpha
+            if target == "axes"
+            else self.advanced_background_alpha
+        )
+        current.setAlphaF(alpha.value())
+        chosen = QColorDialog.getColor(
+            current,
+            self,
+            "Choose axes color" if target == "axes" else "Choose plot background",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel,
+        )
+        if not chosen.isValid():
+            return
+        if target == "axes":
+            self.advanced_axes_color = QColor(chosen)
+        else:
+            self.advanced_background_color = QColor(chosen)
+        alpha.setValue(chosen.alphaF())
+        self._save_advanced_plot_style()
+
+    def _save_advanced_plot_style(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self._active_advanced_run is None:
+            return
+        style = {
+            **DEFAULT_PLOT_STYLE,
+            **dict(self._active_advanced_run.get("plot_style", {})),
+            "axes_color": self.advanced_axes_color.name(),
+            "axes_alpha": self.advanced_axes_alpha.value(),
+            "background_color": self.advanced_background_color.name(),
+            "background_alpha": self.advanced_background_alpha.value(),
+            "show_legend": self.advanced_show_legend.isChecked(),
+            "legend_position": str(
+                self.advanced_legend_position.currentData() or "outside_right"
+            ),
+        }
+        self._active_advanced_run["plot_style"] = style
+        try:
+            run_id = str(self._active_advanced_run.get("run_id", ""))
+            known = bool(
+                self.manifest
+                and any(
+                    str(record.get("run_id", "")) == run_id
+                    for record in self.manifest.get("morphology_analysis", {}).get("runs", [])
+                )
+            )
+            if known and self.manifest is not None and self.project_path is not None:
+                self._active_advanced_run = update_run_plot_style(
+                    self.manifest, self.project_path, run_id, style
+                )
+            self._refresh_advanced_plot_style_controls()
+            self._render_advanced_plot()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot save plot style", str(exc))
+
+    def _export_advanced_run(self) -> None:
+        if self._active_advanced_run is None:
+            QMessageBox.information(
+                self, "No advanced run", "Run or select an advanced analysis first."
+            )
+            return
+        suggested = (
+            str(Path(self.manifest["output_directory"]) / "Synpo_advanced_clustering.xlsx")
+            if self.manifest
+            else "Synpo_advanced_clustering.xlsx"
+        )
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export advanced clustering analysis",
+            suggested,
+            "Excel workbook (*.xlsx)",
+        )
+        if not selected:
+            return
+        worker = MorphologyExportWorker(self._active_advanced_run, Path(selected))
+        worker.completed.connect(self._morphology_export_completed)
+        self._start_worker(worker, "advanced_morphology_export")
+
+    def _morphology_specimen_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        current_spine = self.morphology_spine.currentData()
+        self.morphology_spine.blockSignals(True)
+        self.morphology_spine.clear()
+        specimen_value = self.morphology_specimen.currentData()
+        if self.manifest is not None and specimen_value is not None:
+            try:
+                result = load_measurement_result(self.manifest, int(specimen_value))
+                decisions = self.manifest["specimens"][int(specimen_value)].get("morphology_review", {}).get("spines", {})
+                validity_decisions = self.manifest["specimens"][int(specimen_value)].get("distribution_review", {}).get("spines", {})
+                for row in result.get("morphology_rows", []):
+                    spine_id = int(row["spine_id"])
+                    marker = (
+                        "invalid"
+                        if validity_decisions.get(str(spine_id), {}).get("invalid_spine")
+                        else "checked ✓"
+                        if decisions.get(str(spine_id), {}).get("reviewed")
+                        else "unreviewed"
+                    )
+                    status = row.get("spine_length_status", "unknown")
+                    self.morphology_spine.addItem(f"Spine {spine_id} [{marker}; {status}]", spine_id)
+            except (OSError, ValueError, KeyError) as exc:
+                self.morphology_status.setText(f"Cannot load morphology measurements: {exc}")
+        if current_spine is not None:
+            found = self.morphology_spine.findData(current_spine)
+            if found >= 0:
+                self.morphology_spine.setCurrentIndex(found)
+        self.morphology_spine.blockSignals(False)
+        if self.morphology_spine.count():
+            self._morphology_spine_changed()
+
+    def _morphology_spine_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        specimen_value = self.morphology_specimen.currentData()
+        spine_value = self.morphology_spine.currentData()
+        if self.manifest is None or specimen_value is None or spine_value is None:
+            return
+        try:
+            preview = load_morphology_preview(self.manifest, int(specimen_value), int(spine_value))
+        except (OSError, ValueError, KeyError) as exc:
+            self.morphology_status.setText(f"Cannot load spine geometry: {exc}")
+            return
+        self._last_morphology_preview = preview
+        self.morphology_z.setRange(0, max(0, preview.spine_mask_stack.shape[0] - 1))
+        self.morphology_z.setValue((preview.spine_z_range[0] + preview.spine_z_range[1]) // 2)
+        decision = self.manifest["specimens"][int(specimen_value)].get("morphology_review", {}).get("spines", {}).get(str(int(spine_value)), {})
+        self.morphology_reviewed.setChecked(bool(decision.get("reviewed", False)))
+        validity = self.manifest["specimens"][int(specimen_value)].get("distribution_review", {}).get("spines", {}).get(str(int(spine_value)), {})
+        self.morphology_invalid.setChecked(bool(validity.get("invalid_spine", False)))
+        self.morphology_note.setText(str(decision.get("note", "")))
+        row = preview.row
+        specimen = self.manifest["specimens"][int(specimen_value)]
+        self.morphology_metrics.setText(
+            f"Group: {specimen['experimental_group']} | specimen: {specimen['specimen_id']} | "
+            f"curvilinear length: {row.get('spine_curvilinear_length_um')} µm | "
+            f"base-to-tip: {row.get('spine_base_to_tip_distance_um')} µm | "
+            f"tortuosity: {row.get('centerline_tortuosity')} | "
+            f"head/neck split: {row.get('head_neck_split_status')}"
+        )
+        self.morphology_status.setText("Orange = head; cyan = neck; magenta = protein puncta; white = centerline; green/yellow = base/tip.")
+        self._render_morphology_preview()
+
+    def _render_morphology_preview(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self._last_morphology_preview is None:
+            return
+        maximum = self.morphology_view_mode.currentData() == "maximum"
+        self.morphology_z.setEnabled(not maximum)
+        self.morphology_canvas.show_morphology(self._last_morphology_preview, self.morphology_z.value(), maximum)
+        self._morphology_tool_changed()
+
+    def _morphology_tool_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        tool = self.morphology_tool.currentData()
+        colors = {"set_base": "#2cff60", "set_tip": "#fff000", "paint_head": "#ff9123", "paint_neck": "#19bef0"}
+        if hasattr(self, "morphology_canvas"):
+            self.morphology_canvas.set_hint_color(QColor(colors.get(str(tool), "#ffffff")))
+            self.morphology_canvas.set_brush_diameter(1 if tool in {"set_base", "set_tip"} else self.morphology_brush.value())
+            self.morphology_brush.setEnabled(tool in {"paint_head", "paint_neck"})
+
+    def _morphology_anchor_point(self) -> tuple[int, int, int]:
+        preview = self._last_morphology_preview
+        points = self.morphology_canvas.hint_points()
+        if preview is None or not points:
+            raise ValueError("Click the desired spine voxel first.")
+        x, y = points[-1]
+        if not (0 <= y < preview.spine_mask_stack.shape[1] and 0 <= x < preview.spine_mask_stack.shape[2]):
+            raise ValueError("The selected point is outside the spine crop.")
+        possible = np.flatnonzero(preview.spine_mask_stack[:, y, x])
+        if not len(possible):
+            raise ValueError("Select a point on the colored spine mask.")
+        current = self.morphology_z.value()
+        z_index = int(possible[np.argmin(np.abs(possible - current))]) if self.morphology_view_mode.currentData() == "maximum" else current
+        if not preview.spine_mask_stack[z_index, y, x]:
+            raise ValueError("Select a spine voxel on the current Z slice.")
+        return z_index, y + preview.crop_origin_yx[0], x + preview.crop_origin_yx[1]
+
+    def _apply_morphology_edit(self) -> None:
+        if self.manifest is None or self.project_path is None or self._last_morphology_preview is None:
+            return
+        specimen_index = int(self.morphology_specimen.currentData())
+        spine_id = int(self.morphology_spine.currentData())
+        operation = str(self.morphology_tool.currentData())
+        try:
+            strokes = self.morphology_canvas.hint_strokes()
+            if operation in {"paint_head", "paint_neck"} and not strokes:
+                raise ValueError("Draw on the selected spine before applying the brush.")
+            arguments = {
+                "operation": operation,
+                "point_zyx": self._morphology_anchor_point() if operation in {"set_base", "set_tip"} else None,
+                "strokes_xy": strokes,
+                "maximum_projection": self.morphology_view_mode.currentData() == "maximum",
+                "z_index": self.morphology_z.value(),
+                "z_radius": self.morphology_z_radius.value(),
+                "brush_radius": max(0, self.morphology_brush.value() // 2),
+                "reviewed": self.morphology_reviewed.isChecked(),
+                "note": self.morphology_note.text(),
+                "invalid_spine": self.morphology_invalid.isChecked(),
+            }
+            self._start_morphology_edit_worker(specimen_index, spine_id, "apply", arguments)
+        except (OSError, ValueError, KeyError) as exc:
+            QMessageBox.warning(self, "Cannot apply geometry edit", str(exc))
+
+    def _undo_redo_morphology(self, redo: bool) -> None:
+        if self.manifest is None or self.project_path is None or self.morphology_spine.currentData() is None:
+            return
+        self._start_morphology_edit_worker(
+            int(self.morphology_specimen.currentData()),
+            int(self.morphology_spine.currentData()),
+            "redo" if redo else "undo",
+        )
+
+    def _reset_morphology(self, operation: str) -> None:
+        if self.manifest is None or self.project_path is None or self.morphology_spine.currentData() is None:
+            return
+        self._start_morphology_edit_worker(
+            int(self.morphology_specimen.currentData()),
+            int(self.morphology_spine.currentData()),
+            "apply",
+            {"operation": operation},
+        )
+
+    def _checkpoint_morphology_review(self) -> None:
+        if self.manifest is None or self.project_path is None or self.morphology_spine.currentData() is None:
+            return
+        self._start_morphology_edit_worker(
+            int(self.morphology_specimen.currentData()),
+            int(self.morphology_spine.currentData()),
+            "apply",
+            {
+                "operation": "checkpoint",
+                "reviewed": True,
+                "note": self.morphology_note.text(),
+                "invalid_spine": self.morphology_invalid.isChecked(),
+                "advance": True,
+            },
+        )
+
+    def _start_morphology_edit_worker(
+        self,
+        specimen_index: int,
+        spine_id: int,
+        mode: str,
+        arguments: dict[str, object] | None = None,
+    ) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        worker = MorphologyEditWorker(
+            self.manifest,
+            self.project_path,
+            specimen_index,
+            spine_id,
+            mode,
+            arguments,
+        )
+        worker.completed.connect(self._morphology_edit_completed)
+        self._start_worker(worker, "morphology_edit")
+
+    @Slot(object)
+    def _morphology_edit_completed(self, payload: dict[str, object]) -> None:
+        edited_spine = int(payload["spine_id"])
+        advance = bool(payload.get("advance", False))
+        self._prepare_measurements_tab()
+        self._prepare_morphology_tab()
+        current_index = self.morphology_spine.findData(edited_spine)
+        if current_index >= 0:
+            target = min(self.morphology_spine.count() - 1, current_index + (1 if advance else 0))
+            self.morphology_spine.setCurrentIndex(target)
+        self.morphology_status.setText(
+            f"Spine {edited_spine} geometry saved."
+            + (" Advanced to the next spine." if advance and current_index + 1 < self.morphology_spine.count() else "")
+        )
+
+    def _move_morphology_spine(self, offset: int) -> None:
+        if self.morphology_spine.count():
+            self.morphology_spine.setCurrentIndex(max(0, min(self.morphology_spine.count() - 1, self.morphology_spine.currentIndex() + int(offset))))
+
+    def _current_morphology_settings(self) -> MorphologyClusteringSettings:
+        features = tuple(key for key, checkbox in self.morphology_features.items() if checkbox.isChecked())
+        groups = tuple(item.text() for item in self.morphology_groups.selectedItems())
+        if self.morphology_groups.count() and not groups:
+            raise ValueError("Select at least one experimental group for clustering.")
+        return MorphologyClusteringSettings(
+            algorithm=str(self.morphology_algorithm.currentData()),
+            features=features,
+            pca_dimensions=int(self.morphology_pca_dimensions.currentData()),
+            use_pca_for_clustering=self.morphology_use_pca.isChecked(),
+            minimum_clusters=self.morphology_min_clusters.value(),
+            maximum_clusters=self.morphology_max_clusters.value(),
+            fixed_cluster_count=self.morphology_fixed_clusters.value(),
+            cluster_count_selection=str(
+                self.morphology_cluster_count_selection.currentData()
+            ),
+            scaling=str(self.morphology_scaling.currentData()),
+            random_seed=self.morphology_seed.value(),
+            minimum_cluster_spines=self.morphology_min_cluster_spines.value(),
+            minimum_cluster_fraction=self.morphology_min_cluster_fraction.value() / 100.0,
+            included_groups=groups,
+            reviewed_only=self.morphology_reviewed_only.isChecked(),
+        )
+
+    def _run_morphology_clustering(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        try:
+            settings = self._current_morphology_settings()
+            settings.validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot run clustering", str(exc))
+            return
+        worker = MorphologyClusteringWorker(self.manifest, self.project_path, self.morphology_run_name.text(), settings)
+        worker.completed.connect(self._morphology_clustering_completed)
+        self._start_worker(worker, "morphology")
+
+    @Slot(object)
+    def _morphology_clustering_completed(self, result: dict[str, object]) -> None:
+        self._active_morphology_run = result
+        self._prepare_morphology_tab()
+        self.morphology_display_tabs.setCurrentIndex(1)
+        self._render_morphology_plot()
+        self._refresh_morphology_plot_style_controls()
+        stability = result.get("bootstrap_stability", {}).get("mean_adjusted_rand")
+        stability_text = f" Mean specimen-bootstrap adjusted Rand: {float(stability):.3f}." if stability is not None else ""
+        reviewed_text = (
+            " geometry-reviewed"
+            if bool(result.get("settings", {}).get("reviewed_only", False))
+            else ""
+        )
+        self.morphology_status.setText(f"Saved {result.get('name')}: {result.get('selected_cluster_count')} clusters from {result.get('included_spine_count')}{reviewed_text} valid complete spines.{stability_text} Protein puncta were descriptive only.")
+
+    def _morphology_saved_run_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.morphology_saved_run.currentData() is None:
+            return
+        try:
+            self._active_morphology_run = load_morphology_run(self.manifest, str(self.morphology_saved_run.currentData()))
+            self.morphology_run_name.setText(str(self._active_morphology_run.get("name", "")))
+            settings = MorphologyClusteringSettings.from_dict(dict(self._active_morphology_run.get("settings", {})))
+            self.morphology_algorithm.setCurrentIndex(max(0, self.morphology_algorithm.findData(settings.algorithm)))
+            for key, checkbox in self.morphology_features.items():
+                checkbox.setChecked(key in settings.features)
+            self.morphology_pca_dimensions.setCurrentIndex(max(0, self.morphology_pca_dimensions.findData(settings.pca_dimensions)))
+            self.morphology_use_pca.setChecked(settings.use_pca_for_clustering)
+            self.morphology_min_clusters.setValue(settings.minimum_clusters)
+            self.morphology_max_clusters.setValue(settings.maximum_clusters)
+            self.morphology_fixed_clusters.setValue(settings.fixed_cluster_count)
+            self.morphology_cluster_count_selection.setCurrentIndex(
+                max(
+                    0,
+                    self.morphology_cluster_count_selection.findData(
+                        settings.cluster_count_selection
+                    ),
+                )
+            )
+            self.morphology_scaling.setCurrentIndex(max(0, self.morphology_scaling.findData(settings.scaling)))
+            self.morphology_seed.setValue(settings.random_seed)
+            self.morphology_min_cluster_spines.setValue(settings.minimum_cluster_spines)
+            self.morphology_min_cluster_fraction.setValue(settings.minimum_cluster_fraction * 100.0)
+            selected_groups = set(settings.included_groups)
+            for index in range(self.morphology_groups.count()):
+                item = self.morphology_groups.item(index)
+                item.setSelected(not selected_groups or item.text() in selected_groups)
+            self.morphology_reviewed_only.setChecked(settings.reviewed_only)
+            self._refresh_morphology_plot_style_controls()
+            self._render_morphology_plot()
+        except (OSError, ValueError) as exc:
+            self.morphology_status.setText(f"Cannot load saved analysis: {exc}")
+
+    def _render_morphology_plot(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self._active_morphology_run is not None:
+            self.morphology_plot.show_run(self._active_morphology_run, str(self.morphology_plot_mode.currentData()))
+            self.morphology_cluster_score_panel.show_run(
+                self._active_morphology_run
+            )
+
+    def _morphology_plot_mode_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self.morphology_feature_plot_row.setVisible(
+            self.morphology_plot_mode.currentData() == "custom_features"
+        )
+        self.morphology_pca_point_row.setVisible(
+            self.morphology_plot_mode.currentData()
+            in {"pca_interpretation", "pca_3d_features"}
+        )
+        self._render_morphology_plot()
+
+    def _change_morphology_colors(self) -> None:
+        if self._active_morphology_run is None:
+            return
+        colors = []
+        for definition in self._active_morphology_run.get("cluster_definitions", []):
+            current = QColor(str(definition.get("color", "#457b9d")))
+            chosen = QColorDialog.getColor(current, self, f"Color for morphology cluster {definition.get('morphology_cluster_id')}")
+            if not chosen.isValid():
+                return
+            colors.append(chosen.name())
+        try:
+            run_id = str(self._active_morphology_run.get("run_id", ""))
+            known_run = bool(self.manifest and any(
+                str(record.get("run_id", "")) == run_id
+                for record in self.manifest.get("morphology_analysis", {}).get("runs", [])
+            ))
+            if known_run and self.manifest is not None and self.project_path is not None:
+                self._active_morphology_run = update_run_colors(
+                    self.manifest, self.project_path, run_id, colors
+                )
+            else:
+                for definition, color in zip(
+                    self._active_morphology_run.get("cluster_definitions", []), colors
+                ):
+                    definition["color"] = color
+            self._render_morphology_plot()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot save colors", str(exc))
+
+    def _refresh_morphology_plot_style_controls(self) -> None:
+        style = {
+            **DEFAULT_PLOT_STYLE,
+            **dict((self._active_morphology_run or {}).get("plot_style", {})),
+        }
+        self.morphology_axes_color = QColor(str(style["axes_color"]))
+        self.morphology_background_color = QColor(str(style["background_color"]))
+        self.morphology_axes_alpha.blockSignals(True)
+        self.morphology_background_alpha.blockSignals(True)
+        self.morphology_show_legend.blockSignals(True)
+        self.morphology_legend_position.blockSignals(True)
+        self.morphology_custom_x.blockSignals(True)
+        self.morphology_custom_y.blockSignals(True)
+        self.morphology_pca_show_points.blockSignals(True)
+        self.morphology_pca_point_alpha.blockSignals(True)
+        self.morphology_axes_alpha.setValue(float(style["axes_alpha"]))
+        self.morphology_background_alpha.setValue(float(style["background_alpha"]))
+        self.morphology_show_legend.setChecked(bool(style["show_legend"]))
+        self.morphology_pca_show_points.setChecked(
+            bool(style["pca_show_points"])
+        )
+        self.morphology_pca_point_alpha.setValue(
+            float(style["pca_point_alpha"])
+        )
+        legend_index = self.morphology_legend_position.findData(
+            str(style["legend_position"])
+        )
+        self.morphology_legend_position.setCurrentIndex(max(0, legend_index))
+        features = list(
+            (self._active_morphology_run or {}).get("settings", {}).get(
+                "features", []
+            )
+        )
+        self.morphology_custom_x.clear()
+        self.morphology_custom_y.clear()
+        for feature in features:
+            label = MORPHOLOGY_FEATURES.get(feature, (feature, ""))[0]
+            self.morphology_custom_x.addItem(label, feature)
+            self.morphology_custom_y.addItem(label, feature)
+        x_feature = str(style.get("custom_x_feature", ""))
+        y_feature = str(style.get("custom_y_feature", ""))
+        x_index = self.morphology_custom_x.findData(x_feature)
+        y_index = self.morphology_custom_y.findData(y_feature)
+        self.morphology_custom_x.setCurrentIndex(max(0, x_index))
+        self.morphology_custom_y.setCurrentIndex(
+            max(0, y_index if y_index >= 0 else min(1, len(features) - 1))
+        )
+        self.morphology_axes_alpha.blockSignals(False)
+        self.morphology_background_alpha.blockSignals(False)
+        self.morphology_show_legend.blockSignals(False)
+        self.morphology_legend_position.blockSignals(False)
+        self.morphology_custom_x.blockSignals(False)
+        self.morphology_custom_y.blockSignals(False)
+        self.morphology_pca_show_points.blockSignals(False)
+        self.morphology_pca_point_alpha.blockSignals(False)
+        self.morphology_feature_plot_row.setVisible(
+            self.morphology_plot_mode.currentData() == "custom_features"
+        )
+        self.morphology_pca_point_row.setVisible(
+            self.morphology_plot_mode.currentData()
+            in {"pca_interpretation", "pca_3d_features"}
+        )
+        self.morphology_axes_color_button.setStyleSheet(
+            f"background-color: {self.morphology_axes_color.name()};"
+        )
+        self.morphology_background_color_button.setStyleSheet(
+            f"background-color: {self.morphology_background_color.name()};"
+        )
+
+    def _change_morphology_plot_color(self, target: str) -> None:
+        current = QColor(
+            self.morphology_axes_color
+            if target == "axes"
+            else self.morphology_background_color
+        )
+        alpha_control = (
+            self.morphology_axes_alpha
+            if target == "axes"
+            else self.morphology_background_alpha
+        )
+        current.setAlphaF(alpha_control.value())
+        chosen = QColorDialog.getColor(
+            current,
+            self,
+            "Choose axes color" if target == "axes" else "Choose plot background",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel,
+        )
+        if not chosen.isValid():
+            return
+        if target == "axes":
+            self.morphology_axes_color = QColor(chosen)
+        else:
+            self.morphology_background_color = QColor(chosen)
+        alpha_control.setValue(chosen.alphaF())
+        self._save_morphology_plot_style()
+
+    def _save_morphology_plot_style(self) -> None:
+        if self._active_morphology_run is None:
+            return
+        style = {
+            "axes_color": self.morphology_axes_color.name(),
+            "axes_alpha": self.morphology_axes_alpha.value(),
+            "background_color": self.morphology_background_color.name(),
+            "background_alpha": self.morphology_background_alpha.value(),
+            "show_legend": self.morphology_show_legend.isChecked(),
+            "legend_position": str(
+                self.morphology_legend_position.currentData() or "outside_right"
+            ),
+            "custom_x_feature": str(self.morphology_custom_x.currentData() or ""),
+            "custom_y_feature": str(self.morphology_custom_y.currentData() or ""),
+            "pca_show_points": self.morphology_pca_show_points.isChecked(),
+            "pca_point_alpha": self.morphology_pca_point_alpha.value(),
+        }
+        self._active_morphology_run["plot_style"] = dict(style)
+        try:
+            run_id = str(self._active_morphology_run.get("run_id", ""))
+            known_run = bool(
+                self.manifest
+                and any(
+                    str(record.get("run_id", "")) == run_id
+                    for record in self.manifest.get("morphology_analysis", {}).get("runs", [])
+                )
+            )
+            if known_run and self.manifest is not None and self.project_path is not None:
+                self._active_morphology_run = update_run_plot_style(
+                    self.manifest, self.project_path, run_id, style
+                )
+            self._refresh_morphology_plot_style_controls()
+            self._render_morphology_plot()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot save plot style", str(exc))
+
+    def _export_morphology_run(self) -> None:
+        if self._active_morphology_run is None:
+            QMessageBox.information(self, "No analysis run", "Run or select a named morphology analysis first.")
+            return
+        selected, _ = QFileDialog.getSaveFileName(self, "Export morphology analysis", str(Path(self.manifest["output_directory"]) / "Synpo_morphology_analysis.xlsx") if self.manifest else "Synpo_morphology_analysis.xlsx", "Excel workbook (*.xlsx)")
+        if not selected:
+            return
+        worker = MorphologyExportWorker(self._active_morphology_run, Path(selected))
+        worker.completed.connect(self._morphology_export_completed)
+        self._start_worker(worker, "morphology_export")
+
+    @Slot(object)
+    def _morphology_export_completed(self, result: dict[str, object]) -> None:
+        QMessageBox.information(self, "Morphology analysis exported", f"Workbook: {result.get('workbook')}\nPlots: {result.get('plot_directory')}\nReport: {result.get('report_pdf')}")
+
+    def _cluster_exported_morphology_workbook(self) -> None:
+        source, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Synpo morphology or measurement workbook",
+            "",
+            "Excel workbook (*.xlsx)",
+        )
+        if not source:
+            return
+        output, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save standalone morphology analysis",
+            str(Path(source).with_name(f"{Path(source).stem}_morphology_analysis.xlsx")),
+            "Excel workbook (*.xlsx)",
+        )
+        if not output:
+            return
+        try:
+            advanced = self.tabs.currentIndex() == 6
+            settings = (
+                self._current_advanced_settings()
+                if advanced
+                else self._current_morphology_settings()
+            )
+            settings.validate()
+            standalone_settings = settings.to_dict()
+            standalone_settings["included_groups"] = []
+            settings = MorphologyClusteringSettings.from_dict(standalone_settings)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot start standalone analysis", str(exc))
+            return
+        worker = StandaloneMorphologyWorker(
+            Path(source), Path(output), settings,
+            (
+                self.advanced_run_name.text().strip()
+                if advanced
+                else self.morphology_run_name.text().strip()
+            ) or "Standalone morphology analysis",
+        )
+        worker.completed.connect(self._standalone_morphology_completed)
+        self._start_worker(worker, "standalone_morphology")
+
+    @Slot(object)
+    def _standalone_morphology_completed(self, payload: dict[str, object]) -> None:
+        result = dict(payload.get("result", {}))
+        method = str(result.get("settings", {}).get("reduction_method", "pca"))
+        if method in {"umap", "pcumap"}:
+            self._active_advanced_run = result
+            self._refresh_advanced_plot_style_controls()
+            self._render_advanced_plot()
+            self._show_advanced_diagnostics(result)
+        else:
+            self._active_morphology_run = result
+            self._render_morphology_plot()
+        exported = payload.get("export", {})
+        QMessageBox.information(
+            self,
+            "Standalone morphology analysis complete",
+            f"Workbook: {exported.get('workbook')}\nPlots: {exported.get('plot_directory')}\nReport: {exported.get('report_pdf')}",
+        )
+
     def _prepare_measurements_tab(self) -> None:
         if self.manifest is None:
             self.tabs.setTabEnabled(4, False)
@@ -5379,6 +7996,13 @@ class MainWindow(QMainWindow):
         for control in controls:
             control.blockSignals(False)
         self._measurement_method_changed()
+        filter_enabled, filter_cutoff = spine_volume_filter_settings(self.manifest)
+        self.volume_filter_enabled.blockSignals(True)
+        self.volume_filter_cutoff.blockSignals(True)
+        self.volume_filter_enabled.setChecked(filter_enabled)
+        self.volume_filter_cutoff.setValue(filter_cutoff)
+        self.volume_filter_enabled.blockSignals(False)
+        self.volume_filter_cutoff.blockSignals(False)
 
         current = self.measurement_specimen.currentData()
         self.measurement_specimen.blockSignals(True)
@@ -5411,10 +8035,17 @@ class MainWindow(QMainWindow):
             return
         try:
             settings = self._current_measurement_settings()
-            self.manifest["measurements"]["settings"] = settings.to_dict()
+            filter_enabled, filter_cutoff = spine_volume_filter_settings(self.manifest)
+            self.manifest["measurements"]["settings"] = {
+                **settings.to_dict(),
+                "spine_volume_filter_enabled": filter_enabled,
+                "spine_volume_filter_cutoff_um3": filter_cutoff,
+            }
             for specimen in self.manifest["specimens"]:
                 checkpoint = specimen["checkpoints"].setdefault("measurements", {})
                 checkpoint["state"] = "not_started"
+            for run in self.manifest.get("morphology_analysis", {}).get("runs", []):
+                run["stale"] = True
             save_project(self.project_path, self.manifest)
             self._prepare_measurements_tab()
             self.measurement_status.setText(
@@ -5428,7 +8059,12 @@ class MainWindow(QMainWindow):
             return
         try:
             settings = self._current_measurement_settings()
-            self.manifest["measurements"]["settings"] = settings.to_dict()
+            filter_enabled, filter_cutoff = spine_volume_filter_settings(self.manifest)
+            self.manifest["measurements"]["settings"] = {
+                **settings.to_dict(),
+                "spine_volume_filter_enabled": filter_enabled,
+                "spine_volume_filter_cutoff_um3": filter_cutoff,
+            }
             save_project(self.project_path, self.manifest)
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot start measurements", str(exc))
@@ -5452,6 +8088,7 @@ class MainWindow(QMainWindow):
             f"Measurement batch complete: {len(summaries)} specimen checkpoint(s) ready."
         )
         self._prepare_measurements_tab()
+        self._prepare_morphology_tab()
 
     @Slot(str)
     def _measurements_cancelled(self, message: str) -> None:
@@ -5478,11 +8115,14 @@ class MainWindow(QMainWindow):
             self.measurement_table.setColumnCount(0)
             return
         try:
-            result = load_measurement_result(self.manifest, specimen_index)
+            raw_result = load_measurement_result(self.manifest, specimen_index)
+            result, _volume_audit = filtered_measurement_result(
+                self.manifest, specimen_index
+            )
         except (OSError, ValueError, KeyError) as exc:
             self.measurement_summary.setText(f"Cannot load measurements: {exc}")
             return
-        self._populate_spine_review_queue(result)
+        self._populate_spine_review_queue(raw_result)
         specimen_row = result["specimen_rows"][0]
         source = "corrected" if result.get("corrected_masks") else "automatic"
         self.measurement_summary.setText(
@@ -5617,7 +8257,8 @@ class MainWindow(QMainWindow):
             if specimen["checkpoints"].get("measurements", {}).get("state") != "complete":
                 continue
             try:
-                results.append(load_measurement_result(self.manifest, index))
+                filtered, _audit = filtered_measurement_result(self.manifest, index)
+                results.append(filtered)
             except (ValueError, OSError):
                 continue
         _specimen_rows, group_rows = distribution_summary_rows(results)
@@ -6053,6 +8694,179 @@ class MainWindow(QMainWindow):
                 else "Optional cluster-less spine review is complete for this specimen."
             )
 
+    def _save_volume_filter_controls(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self.project_path is None:
+            return
+        settings = self.manifest["measurements"].setdefault("settings", {})
+        settings["spine_volume_filter_enabled"] = self.volume_filter_enabled.isChecked()
+        settings["spine_volume_filter_cutoff_um3"] = self.volume_filter_cutoff.value()
+        for run in self.manifest.get("morphology_analysis", {}).get("runs", []):
+            run["stale"] = True
+        try:
+            save_project(self.project_path, self.manifest)
+        except OSError as exc:
+            QMessageBox.warning(self, "Cannot save volume filter", str(exc))
+            return
+        self._refresh_distribution_groups()
+        self._measurement_specimen_changed()
+        self._prepare_morphology_tab()
+
+    def _open_volume_filter_preview(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        rows: list[dict[str, object]] = []
+        for specimen_index, specimen in enumerate(self.manifest["specimens"]):
+            if specimen["checkpoints"].get("measurements", {}).get("state") != "complete":
+                continue
+            try:
+                result = load_measurement_result(self.manifest, specimen_index)
+            except (OSError, ValueError):
+                continue
+            decisions = specimen.get("distribution_review", {}).get("spines", {})
+            for source in result.get("spine_rows", []):
+                row = dict(source)
+                decision = decisions.get(str(int(row.get("spine_id") or 0)), {})
+                row["volume_filter_force_keep"] = bool(
+                    decision.get("volume_filter_force_keep", False)
+                )
+                rows.append(row)
+        enabled, cutoff = spine_volume_filter_settings(self.manifest)
+        dialog = SpineVolumeFilterDialog(
+            rows,
+            cutoff_um3=cutoff,
+            enabled=enabled,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        enabled, cutoff, force_keep = dialog.values()
+        represented = {
+            (
+                str(row.get("experimental_group", "")),
+                str(row.get("specimen_id", "")),
+                int(row.get("spine_id") or 0),
+            )
+            for row in rows
+        }
+        settings = self.manifest["measurements"].setdefault("settings", {})
+        settings["spine_volume_filter_enabled"] = enabled
+        settings["spine_volume_filter_cutoff_um3"] = cutoff
+        for run in self.manifest.get("morphology_analysis", {}).get("runs", []):
+            run["stale"] = True
+        for specimen in self.manifest["specimens"]:
+            group = str(specimen.get("experimental_group", ""))
+            specimen_id = str(specimen.get("specimen_id", ""))
+            decisions = specimen.setdefault(
+                "distribution_review", {"spines": {}, "updated_at": None}
+            ).setdefault("spines", {})
+            known_ids = {
+                key[2] for key in force_keep if key[0] == group and key[1] == specimen_id
+            }
+            represented_ids = {
+                key[2] for key in represented if key[0] == group and key[1] == specimen_id
+            }
+            for spine_id, decision in list(decisions.items()):
+                if int(spine_id) in represented_ids and int(spine_id) not in known_ids:
+                    decision.pop("volume_filter_force_keep", None)
+            for spine_id in known_ids:
+                decisions.setdefault(str(spine_id), {})[
+                    "volume_filter_force_keep"
+                ] = True
+            specimen["distribution_review"]["updated_at"] = time.time()
+        try:
+            save_project(self.project_path, self.manifest)
+        except OSError as exc:
+            QMessageBox.warning(self, "Cannot save volume filter", str(exc))
+            return
+        self.volume_filter_enabled.blockSignals(True)
+        self.volume_filter_cutoff.blockSignals(True)
+        self.volume_filter_enabled.setChecked(enabled)
+        self.volume_filter_cutoff.setValue(cutoff)
+        self.volume_filter_enabled.blockSignals(False)
+        self.volume_filter_cutoff.blockSignals(False)
+        self._refresh_distribution_groups()
+        self._measurement_specimen_changed()
+        self._prepare_morphology_tab()
+        self.measurement_status.setText(
+            "Spine-volume filter saved; summaries were refreshed without remeasurement."
+        )
+
+    def _filter_exported_measurement_workbook(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Filter a Synpo measurement workbook",
+            "",
+            "Excel workbook (*.xlsx)",
+        )
+        if not selected:
+            return
+        try:
+            inspection = inspect_exported_measurement_workbook(selected)
+        except (OSError, ValueError, KeyError) as exc:
+            QMessageBox.warning(self, "Cannot use workbook", str(exc))
+            return
+        if bool(inspection.get("filter_enabled", False)):
+            QMessageBox.warning(
+                self,
+                "Use the unfiltered source workbook",
+                "This workbook is already volume-filtered and no longer contains the omitted "
+                "detail rows. Select the original unfiltered workbook so the cutoff remains reversible.",
+            )
+            return
+        dialog = SpineVolumeFilterDialog(
+            list(inspection["spines"]),
+            cutoff_um3=float(inspection.get("cutoff_um3", 0.0)),
+            enabled=True,
+            parent=self,
+            allow_disable=False,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        _enabled, cutoff, force_keep = dialog.values()
+        source = Path(selected).resolve()
+        suggested = source.with_name(f"{source.stem}_volume-filtered.xlsx")
+        output, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save filtered Synpo workbook",
+            str(suggested),
+            "Excel workbook (*.xlsx)",
+        )
+        if not output:
+            return
+        if Path(output).resolve() == source:
+            QMessageBox.warning(
+                self,
+                "Choose another filename",
+                "The source workbook is the reversible original and cannot be overwritten.",
+            )
+            return
+        worker = WorkbookVolumeFilterWorker(
+            source, Path(output), cutoff, force_keep
+        )
+        worker.completed.connect(self._workbook_filter_completed)
+        self._start_worker(worker, "workbook_filter")
+
+    @Slot(object)
+    def _workbook_filter_completed(self, result: dict[str, object]) -> None:
+        unavailable = [
+            row["table"]
+            for row in result.get("compatibility_report", [])
+            if row.get("status") == "unavailable"
+            and row.get("table") != "PDF exports"
+        ]
+        report = (
+            "Unavailable exact recalculations: " + ", ".join(unavailable)
+            if unavailable
+            else "Every supported scientific table was recalculated exactly."
+        )
+        QMessageBox.information(
+            self,
+            "Filtered workbook verified",
+            f"Excluded {result['excluded_spine_count']} spine(s).\n"
+            f"Workbook: {result['workbook']}\nCSV folder: {result['csv_directory']}\n\n"
+            f"{report}\nPDFs were not regenerated because standalone mode has no image/cache data.",
+        )
+
     def _export_measurements(self) -> None:
         if self.manifest is None:
             return
@@ -6104,7 +8918,9 @@ class MainWindow(QMainWindow):
             return
         specimen_index = int(self.measurement_specimen.currentData())
         try:
-            result = load_measurement_result(self.manifest, specimen_index)
+            result, _audit = filtered_measurement_result(
+                self.manifest, specimen_index
+            )
         except (OSError, ValueError, KeyError):
             return
         key = str(self.measurement_table_level.currentData())
@@ -7294,6 +10110,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
         self.tabs.setTabEnabled(4, False)
+        self.tabs.setTabEnabled(5, False)
+        self.tabs.setTabEnabled(6, False)
         worker.completed.connect(self._scan_completed)
         self._start_worker(worker, "scan")
 
@@ -7676,6 +10494,7 @@ class MainWindow(QMainWindow):
             self._prepare_detection_tab()
             self._prepare_review_tab()
             self._prepare_measurements_tab()
+            self._prepare_morphology_tab()
             self.statusBar().showMessage(f"Saved {self.project_path}", 8000)
             self.setWindowTitle(f"Synpo Microscopy Processor — {self.project_path.name}")
         except (ValueError, OSError) as exc:
@@ -7726,6 +10545,7 @@ class MainWindow(QMainWindow):
         self._prepare_detection_tab()
         self._prepare_review_tab()
         self._prepare_measurements_tab()
+        self._prepare_morphology_tab()
         missing = sum(item["status"] != "ok" for item in quick_results)
         if missing:
             self.summary_label.setText(
@@ -8060,6 +10880,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
         self.tabs.setTabEnabled(4, False)
+        self.tabs.setTabEnabled(5, False)
+        self.tabs.setTabEnabled(6, False)
         self.source_edit.clear()
         self.output_edit.clear()
         self.table.setRowCount(0)
@@ -8073,6 +10895,8 @@ class MainWindow(QMainWindow):
         for action in (
             self.new_action,
             self.open_action,
+            self.filter_export_action,
+            self.cluster_export_action,
             self.save_action,
             self.verify_action,
             self.relink_action,
@@ -8139,6 +10963,9 @@ class MainWindow(QMainWindow):
             )
             self.save_distribution_review_button.setEnabled(not running)
             self.export_measurements_button.setEnabled(not running and measured)
+            self.volume_filter_enabled.setEnabled(not running and self.manifest is not None)
+            self.volume_filter_cutoff.setEnabled(not running and self.manifest is not None)
+            self.volume_filter_preview_button.setEnabled(not running and measured)
             self.centerline_hint_button.setEnabled(
                 not running
                 and measured
@@ -8155,6 +10982,29 @@ class MainWindow(QMainWindow):
                 )
             )
             self.open_spine_map_button.setEnabled(not running and measured)
+        if hasattr(self, "run_morphology_button"):
+            measured = bool(
+                self.manifest
+                and any(
+                    specimen["checkpoints"].get("measurements", {}).get("state") == "complete"
+                    for specimen in self.manifest["specimens"]
+                )
+            )
+            self.run_morphology_button.setEnabled(not running and measured)
+            self.morphology_color_button.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_axes_color_button.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_background_color_button.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_axes_alpha.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_background_alpha.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_show_legend.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_legend_position.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_custom_x.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_custom_y.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_pca_show_points.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_pca_point_alpha.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_reviewed_only.setEnabled(not running and measured)
+            self.export_morphology_button.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_geometry_group.setEnabled(not running and measured)
         if not running and not self.progress_label.text():
             self.progress_label.setText("Ready")
 

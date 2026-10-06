@@ -11,20 +11,24 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from PySide6.QtCore import QPointF
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtWidgets import QApplication, QAbstractItemView
 
 from synpo.app import (
     BatchPreprocessWorker,
+    ClusterCountScorePanel,
     MainWindow,
+    MorphologyPlotCanvas,
     PreviewWorker,
     REVIEW_BRUSH_COLORS,
     ReviewCanvas,
     ReviewWorker,
     SliceView,
     SpineMapView,
+    SpineVolumeFilterDialog,
 )
 from synpo.detection import ALWAYS_LOW_MEMORY_MODE, DetectionSettings
+from synpo.morphology import DEFAULT_FEATURES
 from synpo.preprocessing import PreprocessingSettings
 from synpo.project import default_preprocessing_manifest, migrate_manifest
 from synpo.review import ReviewAction, ReviewResult
@@ -125,6 +129,35 @@ class Stage7AUiTests(unittest.TestCase):
         self.assertEqual(window.review_memory_mode.count(), 2)
         self.assertFalse(window.context_status_widget.isVisible())
         view.close()
+        window.deleteLater()
+        self.app.processEvents()
+
+    def test_spine_volume_filter_controls_and_preview_dialog(self) -> None:
+        window = MainWindow()
+        self.assertIn("Filter exported measurement workbook", window.filter_export_action.text())
+        self.assertEqual(window.volume_filter_cutoff.suffix(), " µm³")
+        rows = [
+            {
+                "experimental_group": "group-a",
+                "specimen_id": "cell-1",
+                "roi_id": 1,
+                "dendrite_id": 2,
+                "spine_id": 3,
+                "volume_um3": 0.1,
+                "spine_valid": True,
+                "has_protein_cluster": True,
+                "included_cluster_count": 1,
+            }
+        ]
+        dialog = SpineVolumeFilterDialog(
+            rows, cutoff_um3=0.2, enabled=True, parent=window
+        )
+        self.assertEqual(dialog.table.rowCount(), 1)
+        self.assertIn("Would exclude 1", dialog.summary.text())
+        dialog.table.item(0, 7).setCheckState(Qt.CheckState.Checked)
+        self.app.processEvents()
+        self.assertIn("Would exclude 0", dialog.summary.text())
+        dialog.close()
         window.deleteLater()
         self.app.processEvents()
 
@@ -377,6 +410,261 @@ class Stage7AUiTests(unittest.TestCase):
         window.deleteLater()
         self.app.processEvents()
 
+    def test_morphology_panel_keeps_protein_descriptive_only(self) -> None:
+        window = MainWindow()
+        self.assertEqual(window.tabs.tabText(5), "6. Morphology clustering")
+        self.assertEqual(
+            {key for key, checkbox in window.morphology_features.items() if checkbox.isChecked()},
+            set(DEFAULT_FEATURES),
+        )
+        self.assertFalse(
+            any("protein" in key.casefold() for key in window.morphology_features)
+        )
+        self.assertEqual(
+            {window.morphology_algorithm.itemData(index) for index in range(window.morphology_algorithm.count())},
+            {"gaussian_mixture", "ward", "kmeans"},
+        )
+        self.assertEqual(
+            window.morphology_groups.selectionMode(),
+            QAbstractItemView.SelectionMode.MultiSelection,
+        )
+        self.assertEqual(window.morphology_axes_alpha.value(), 1.0)
+        self.assertEqual(window.morphology_background_alpha.value(), 1.0)
+        self.assertFalse(window.morphology_reviewed_only.isChecked())
+        self.assertFalse(window._current_morphology_settings().reviewed_only)
+        self.assertTrue(window.morphology_show_legend.isChecked())
+        self.assertEqual(
+            window.morphology_legend_position.currentData(), "outside_right"
+        )
+        self.assertGreaterEqual(
+            window.morphology_plot_mode.findData("custom_features"), 0
+        )
+        self.assertGreaterEqual(
+            window.morphology_plot_mode.findData("pca_interpretation"), 0
+        )
+        self.assertGreaterEqual(
+            window.morphology_plot_mode.findData("pca_3d_features"), 0
+        )
+        self.assertTrue(window.morphology_pca_show_points.isChecked())
+        self.assertAlmostEqual(window.morphology_pca_point_alpha.value(), 0.68)
+        window.morphology_plot_mode.setCurrentIndex(
+            window.morphology_plot_mode.findData("pca_interpretation")
+        )
+        self.assertFalse(window.morphology_pca_point_row.isHidden())
+        window.deleteLater()
+        self.app.processEvents()
+
+    def test_morphology_puncta_and_custom_feature_plots_render(self) -> None:
+        result = {
+            "settings": {
+                "features": ["log_volume", "curvilinear_length"],
+                "pca_dimensions": 2,
+            },
+            "cluster_definitions": [
+                {"morphology_cluster_id": 1, "color": "#e63946"},
+                {"morphology_cluster_id": 2, "color": "#457b9d"},
+            ],
+            "pca_loadings": [
+                {
+                    "feature": "log_volume",
+                    "pca_1_loading": 0.8,
+                    "pca_2_loading": -0.6,
+                    "pca_1_explained_fraction": 0.7,
+                    "pca_2_explained_fraction": 0.3,
+                },
+                {
+                    "feature": "curvilinear_length",
+                    "pca_1_loading": 0.6,
+                    "pca_2_loading": 0.8,
+                    "pca_1_explained_fraction": 0.7,
+                    "pca_2_explained_fraction": 0.3,
+                },
+            ],
+            "feature_centers": [-1.2, 1.0],
+            "feature_scales": [0.5, 0.8],
+            "pca_feature_means": [0.0, 0.0],
+            "assignments": [
+                {
+                    "morphology_cluster_id": 1,
+                    "experimental_group": "control",
+                    "volume_um3": 0.02,
+                    "spine_curvilinear_length_um": 0.7,
+                    "has_protein_cluster": True,
+                    "protein_puncta_total_volume_um3": 0.003,
+                    "pca_1": -0.8,
+                    "pca_2": 0.2,
+                },
+                {
+                    "morphology_cluster_id": 2,
+                    "experimental_group": "treated",
+                    "volume_um3": 0.12,
+                    "spine_curvilinear_length_um": 1.8,
+                    "has_protein_cluster": True,
+                    "protein_puncta_total_volume_um3": 0.011,
+                    "pca_1": 0.9,
+                    "pca_2": -0.1,
+                },
+            ],
+            "plot_style": {
+                "show_legend": True,
+                "legend_position": "outside_right",
+                "custom_x_feature": "log_volume",
+                "custom_y_feature": "curvilinear_length",
+            },
+        }
+        canvas = MorphologyPlotCanvas()
+        canvas.show_run(result, "protein_volume")
+        puncta_axis = canvas.figure.axes[0]
+        self.assertGreater(len(puncta_axis.patches), 0)
+        self.assertIn("Protein puncta volume", puncta_axis.get_ylabel())
+        self.assertIsNotNone(puncta_axis.get_legend())
+        puncta_labels = {
+            text.get_text() for text in puncta_axis.get_legend().get_texts()
+        }
+        self.assertTrue(
+            {
+                "Cluster 1 box",
+                "Cluster 2 box",
+                "Colored points: individual protein-positive spines",
+                "Hollow black points: box-plot outliers (same spines)",
+                "Experimental group: control",
+                "Experimental group: treated",
+            }.issubset(puncta_labels)
+        )
+
+        canvas.show_run(result, "custom_features")
+        axis = canvas.figure.axes[0]
+        self.assertEqual(axis.get_xlabel(), "Log spine volume")
+        self.assertEqual(axis.get_ylabel(), "Curvilinear length")
+        self.assertIsNotNone(axis.get_legend())
+
+        result["plot_style"]["show_legend"] = False
+        canvas.show_run(result, "custom_features")
+        self.assertIsNone(canvas.figure.axes[0].get_legend())
+
+        canvas.show_run(result, "pca_interpretation")
+        self.assertGreaterEqual(len(canvas.figure.axes), 4)
+        self.assertTrue(
+            any(
+                axis.get_title().startswith("PCA scores")
+                for axis in canvas.figure.axes
+            )
+        )
+        result["plot_style"].update(
+            {"pca_show_points": True, "pca_point_alpha": 0.12}
+        )
+        canvas.show_run(result, "pca_interpretation")
+        score_axis = canvas.figure.axes[0]
+        self.assertTrue(
+            any(collection.get_alpha() == 0.12 for collection in score_axis.collections)
+        )
+        result["plot_style"]["pca_show_points"] = False
+        canvas.show_run(result, "pca_interpretation")
+        self.assertEqual(len(canvas.figure.axes[0].collections), 0)
+        result["settings"].update(
+            {
+                "reduction_method": "pcumap",
+                "embedding_dimensions": 5,
+                "embedding_plot_dimensions": 3,
+            }
+        )
+        for index, assignment in enumerate(result["assignments"]):
+            assignment.update(
+                {
+                    "embedding_1": float(index),
+                    "embedding_2": float(index) / 2.0,
+                    "embedding_3": -float(index),
+                }
+            )
+        canvas.show_run(result, "embedding")
+        embedding_axis = canvas.figure.axes[0]
+        self.assertEqual(embedding_axis.name, "3d")
+        self.assertEqual(embedding_axis.get_xlabel(), "PCC/PCUMAP 1")
+        self.assertIn("5D PCC/PCUMAP clustering space", embedding_axis.get_title())
+        canvas.close()
+
+    def test_cluster_count_score_panel_plots_and_tabulates_each_method(self) -> None:
+        result = {
+            "settings": {"cluster_count_selection": "silhouette"},
+            "selected_cluster_count": 3,
+            "candidate_diagnostics": [
+                {
+                    "cluster_count": 1,
+                    "criterion": 140.0,
+                    "criterion_name": "SSE-BIC",
+                    "silhouette": None,
+                    "within_cluster_sse": 120.0,
+                    "elbow_distance": 0.0,
+                    "cluster_sizes": [60],
+                    "accepted": True,
+                    "selected": False,
+                },
+                {
+                    "cluster_count": 2,
+                    "criterion": 105.0,
+                    "criterion_name": "SSE-BIC",
+                    "silhouette": 0.51,
+                    "within_cluster_sse": 70.0,
+                    "elbow_distance": 0.31,
+                    "cluster_sizes": [31, 29],
+                    "accepted": True,
+                    "selected": False,
+                },
+                {
+                    "cluster_count": 3,
+                    "criterion": 101.0,
+                    "criterion_name": "SSE-BIC",
+                    "silhouette": 0.62,
+                    "within_cluster_sse": 51.0,
+                    "elbow_distance": 0.42,
+                    "cluster_sizes": [20, 19, 21],
+                    "accepted": True,
+                    "selected": True,
+                },
+                {
+                    "cluster_count": 4,
+                    "criterion": 110.0,
+                    "criterion_name": "SSE-BIC",
+                    "silhouette": 0.48,
+                    "within_cluster_sse": 45.0,
+                    "elbow_distance": 0.0,
+                    "cluster_sizes": [3, 17, 19, 21],
+                    "accepted": False,
+                    "selected": False,
+                },
+            ],
+        }
+        panel = ClusterCountScorePanel()
+        panel.show_run(result)
+        self.assertEqual(panel.score_method.currentData(), "silhouette")
+        self.assertEqual(panel.table.rowCount(), 4)
+        axis = panel.figure.axes[0]
+        self.assertEqual(axis.get_xlabel(), "Number of clusters")
+        self.assertEqual(axis.get_ylabel(), "Mean silhouette score")
+        self.assertIn("selected 3 clusters", panel.summary.text())
+        panel.score_method.setCurrentIndex(panel.score_method.findData("elbow"))
+        self.app.processEvents()
+        self.assertEqual(panel.figure.axes[0].get_ylabel(), "Within-cluster SSE")
+        self.assertEqual(panel.table.item(2, 1).text(), "51")
+        self.assertEqual(panel.table.item(3, 3).text(), "No")
+        panel.close()
+
+    def test_morphology_checkpoint_advances_from_the_edited_spine(self) -> None:
+        window = MainWindow()
+        window.morphology_spine.clear()
+        for spine_id in (11, 12, 13):
+            window.morphology_spine.addItem(f"Spine {spine_id}", spine_id)
+        window.morphology_spine.setCurrentIndex(1)
+        with patch.object(window, "_prepare_measurements_tab"), patch.object(
+            window, "_prepare_morphology_tab"
+        ):
+            window._morphology_edit_completed(
+                {"spine_id": 12, "advance": True, "result": {}}
+            )
+        self.assertEqual(window.morphology_spine.currentData(), 13)
+        window.deleteLater()
+        self.app.processEvents()
+
     def test_stage7d_flexible_import_controls_are_available(self) -> None:
         window = MainWindow()
         self.assertEqual(window.channel_a_marker.text(), "ChanA")
@@ -387,6 +675,35 @@ class Stage7AUiTests(unittest.TestCase):
             window._current_channel_markers(), {"ChanA": "cy", "ChanB": "cl"}
         )
         self.assertIn("manually choose", window.manual_pair_button.text().lower())
+        window.deleteLater()
+        self.app.processEvents()
+
+    def test_advanced_clustering_tab_exposes_real_reducer_controls(self) -> None:
+        window = MainWindow()
+        self.assertEqual(window.tabs.tabText(6), "7. Advanced clustering")
+        self.assertEqual(window.advanced_reduction.currentData(), "umap")
+        self.assertEqual(window.advanced_embedding_dimensions.value(), 5)
+        self.assertEqual(window.advanced_plot_dimensions.currentData(), 2)
+        self.assertEqual(window.morphology_cluster_count_selection.count(), 3)
+        self.assertEqual(
+            window.morphology_cluster_count_selection.currentData(),
+            "information_criterion",
+        )
+        self.assertEqual(window.advanced_cluster_count_selection.count(), 3)
+        window.advanced_cluster_count_selection.setCurrentIndex(
+            window.advanced_cluster_count_selection.findData("silhouette")
+        )
+        self.assertFalse(window.advanced_pcumap_group.isVisible())
+        window.advanced_reduction.setCurrentIndex(
+            window.advanced_reduction.findData("pcumap")
+        )
+        self.assertEqual(window.advanced_reduction.currentData(), "pcumap")
+        settings = window._current_advanced_settings()
+        self.assertEqual(settings.reduction_method, "pcumap")
+        self.assertEqual(settings.embedding_dimensions, 5)
+        self.assertEqual(settings.cluster_count_selection, "silhouette")
+        window.advanced_fixed_clusters.setValue(3)
+        self.assertFalse(window.advanced_cluster_count_selection.isEnabled())
         window.deleteLater()
         self.app.processEvents()
 

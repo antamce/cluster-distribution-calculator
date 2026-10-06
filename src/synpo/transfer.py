@@ -172,6 +172,8 @@ def settings_only_manifest(manifest: dict[str, object]) -> dict[str, object]:
             "object_status": {"dendrite": {}, "spine": {}},
         }
         specimen["distribution_review"] = {"spines": {}, "updated_at": None}
+        specimen["morphology_review"] = {"spines": {}, "updated_at": None}
+    result["morphology_analysis"] = {"runs": [], "active_run_id": None}
     return result
 
 

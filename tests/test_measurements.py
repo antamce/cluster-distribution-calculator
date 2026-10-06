@@ -13,15 +13,19 @@ import zarr
 from synpo.detection import detection_cache_path
 from synpo.measurements import (
     MeasurementSettings,
+    apply_morphology_review_edit,
     _cluster_keep_lookup,
     clear_centerline_endpoint_hint,
     cluster_end_comparison_rows,
     load_measurement_result,
+    load_morphology_preview,
     load_spine_review_preview,
     measure_project,
+    redo_morphology_review,
     set_centerline_endpoint_hint,
     set_distribution_review,
     set_spine_quality_review,
+    undo_morphology_review,
 )
 from synpo.distribution import calculate_spine_distribution
 from synpo.exporting import collect_export_tables, export_measurements
@@ -267,6 +271,35 @@ class MeasurementTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "manual review"):
                 measure_project(manifest, project_path)
 
+    def test_project_volume_filter_is_reversible_and_uses_saved_override(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_project(root)
+            measure_project(manifest, project_path)
+            raw_before = load_measurement_result(manifest, 0)
+            manifest["measurements"]["settings"].update(
+                {
+                    "spine_volume_filter_enabled": True,
+                    "spine_volume_filter_cutoff_um3": 1.0,
+                }
+            )
+            tables = collect_export_tables(manifest)
+            self.assertEqual(tables["Spine_Master"], [])
+            self.assertEqual(len(tables["Volume_Filtered_Spines"]), 1)
+            self.assertEqual(tables["Specimen_Master"][0]["spine_count"], 0)
+            self.assertEqual(
+                load_measurement_result(manifest, 0)["spine_rows"],
+                raw_before["spine_rows"],
+                "post-measurement filtering must not rewrite the cached result",
+            )
+
+            manifest["specimens"][0]["distribution_review"]["spines"].setdefault(
+                "1", {}
+            )["volume_filter_force_keep"] = True
+            overridden = collect_export_tables(manifest)
+            self.assertEqual(len(overridden["Spine_Master"]), 1)
+            self.assertEqual(overridden["Volume_Filtered_Spines"], [])
+            self.assertTrue(overridden["Spine_Master"][0]["volume_filter_force_keep"])
+
     def test_fixed_and_adaptive_end_trimming(self) -> None:
         areas = np.zeros((8, 2), dtype=np.int64)
         areas[1:7, 1] = [80, 70, 20, 22, 19, 20]
@@ -346,6 +379,61 @@ class MeasurementTests(unittest.TestCase):
             tables = collect_export_tables(manifest)
             self.assertEqual(len(tables["Invalid_Spines"]), 1)
             self.assertEqual(len(tables["Spine_Review_Audit"]), 1)
+
+    def test_all_spine_lengths_and_max_projection_geometry_brush(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_project(root)
+            measure_project(manifest, project_path)
+            result = load_measurement_result(manifest, 0)
+            self.assertEqual(len(result["morphology_rows"]), 1)
+            self.assertIsNotNone(result["spine_rows"][0]["spine_curvilinear_length_um"])
+            self.assertIsNotNone(result["spine_rows"][0]["spine_base_to_tip_distance_um"])
+            preview = load_morphology_preview(manifest, 0, 1)
+            y, x = np.argwhere(np.any(preview.spine_mask_stack, axis=0))[0]
+            expected_z = set(np.flatnonzero(preview.spine_mask_stack[:, y, x]).tolist())
+            apply_morphology_review_edit(
+                manifest,
+                project_path,
+                0,
+                1,
+                operation="paint_head",
+                strokes_xy=(((int(x), int(y)),),),
+                maximum_projection=True,
+                brush_radius=0,
+            )
+            decision = manifest["specimens"][0]["morphology_review"]["spines"]["1"]
+            painted = {
+                int(point[0])
+                for point in decision["head_override_voxels_zyx"]
+                if int(point[1]) == int(y) + preview.crop_origin_yx[0]
+                and int(point[2]) == int(x) + preview.crop_origin_yx[1]
+            }
+            self.assertEqual(painted, expected_z)
+            undo_morphology_review(manifest, project_path, 0, 1)
+            self.assertFalse(
+                manifest["specimens"][0]["morphology_review"]["spines"]["1"].get(
+                    "head_override_voxels_zyx"
+                )
+            )
+            redo_morphology_review(manifest, project_path, 0, 1)
+            self.assertTrue(
+                manifest["specimens"][0]["morphology_review"]["spines"]["1"].get(
+                    "head_override_voxels_zyx"
+                )
+            )
+            apply_morphology_review_edit(
+                manifest,
+                project_path,
+                0,
+                1,
+                operation="checkpoint",
+                reviewed=True,
+                invalid_spine=True,
+                note="exclude during morphology review",
+            )
+            excluded = load_measurement_result(manifest, 0)
+            self.assertFalse(excluded["spine_rows"][0]["spine_valid"])
+            self.assertEqual(excluded["specimen_rows"][0]["spine_count"], 0)
 
     def test_calibrated_curved_axis_assigns_every_voxel_once(self) -> None:
         spine = np.zeros((7, 18, 28), dtype=bool)

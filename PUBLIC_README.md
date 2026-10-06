@@ -118,6 +118,8 @@ Channel roles are confirmed for every batch. By default, Channel A contains prot
    measurements and begin protein-cluster-positive spine review.
 7. Optionally review cluster-less spines and exclude invalid detections.
 8. Export the workbook, CSV tables, and any requested validation PDFs.
+9. Review all-spine centerline/head-neck geometry, then create and export one or
+   more named morphology clustering analyses if needed.
 
 Automatic checkpoints are written throughout preprocessing, detection, correction, and measurement. Completed specimens remain available if a later batch operation is cancelled or interrupted.
 
@@ -227,10 +229,116 @@ The verified export contains:
 - Calibration, measurement, and distribution settings.
 - Optional two-panel PDF pages showing reviewed spines and distribution profiles.
 
+The measurement panel can apply one reversible calibrated spine-volume cutoff
+without changing masks or rerunning measurements. Its preview includes a histogram,
+group/specimen removal counts, warnings, and per-spine Keep overrides. Spines below
+the cutoff and their linked cluster/distribution rows are omitted, every supported
+summary is recalculated, and a dedicated audit plus a numeric valid-spine volume
+distribution sheet are exported. Manual invalidity remains independent and cannot
+be overridden by the volume filter.
+
+**File -> Filter exported measurement workbook...** performs the same exact
+recalculation from a Synpo `.xlsx` when the project and TIFF files are unavailable.
+It creates a new workbook and matching CSV directory, preserves user-added sheets,
+and writes a compatibility report for legacy tables it cannot exactly reconstruct.
+Standalone mode does not regenerate PDFs.
+
+## Morphology clustering
+
+The **6. Morphology clustering** panel measures and reviews every valid spine,
+whether or not it contains protein puncta. The ordinary measurement export adds
+curvilinear shaft-contact-to-tip length and straight base-to-tip distance with
+centerline QC fields. Point tools correct the centerline base and tip; head/neck
+brushes work on either one Z slice or the XY maximum projection, with undo/redo and
+review checkpoints. Brush processing and geometry recalculation are backgrounded
+to keep the interface responsive. Checkpoint-and-advance opens the following spine,
+and an invalid-spine option excludes a reviewed spine from all downstream metrics.
+
+Named runs provide Gaussian-mixture, Ward, and k-means clustering; selectable
+morphology features; robust, z-score, or unscaled inputs; adjustable 1-10 cluster
+search; and 2D or 3D PCA plots. Linear, logarithmic, and square-root volume choices
+are available. Protein-puncta values are deliberately excluded from PCA and
+cluster formation. They are used only for plots and descriptive summaries of the
+resulting morphology clusters, both across all spines and within protein-positive
+spines.
+
+Automatic cluster-count selection can use the information criterion, maximum
+silhouette score, or an elbow detector on the within-cluster SSE curve. The elbow
+method requires at least three accepted candidate counts. Minimum cluster-size
+rules are applied first, all candidate diagnostics are exported, and a fixed count
+overrides the automatic method.
+
+The standard and advanced clustering tabs also provide a cluster-count score panel
+with an annotated score curve and exact-value table for all three methods. Rejected
+small-cluster candidates and the solution selected for the saved run are identified.
+
+A **Cluster geometry-reviewed spines only** checkbox switches between all otherwise
+valid spines and only those explicitly marked **Geometry checked**. The selection
+is saved with each named run, and omitted unreviewed spines remain visible in the
+analysis exclusion audit.
+
+One or more experimental groups can be selected for each named run. Scatter plots
+show group membership with distinct marker shapes while preserving cluster colors.
+Axes and background colors and opacity are editable and are retained in exported
+figures. Plot legends can be hidden or placed inside, outside-right, or below the
+plot. Any two selected clustering features can be plotted against one another using
+their exact transformed values, and protein-puncta volume views include the
+individual observations as well as box plots. Puncta point colors identify
+morphology clusters, marker shapes identify experimental groups, and the legend
+distinguishes colored individual-spine points from hollow black box-plot outliers.
+
+The **PCA interpretation** view shows spine scores and numbered loading vectors,
+a loading heatmap, explained variance, and the explicit linear formula for each
+displayed component. Three-component runs use a rotatable 3D PC1/PC2/PC3 view;
+two-component runs remain 2D. Exported `PCA_Equations` and `PCA_Feature_Preparation` sheets
+record the full-precision formulas and every transformation, scale, and centering
+value needed to reproduce the PCA scores.
+A separate full-size **3D PCA with feature axes** view and exported figure are
+available for three-component runs.
+The interpretation and feature-axis views can fade their spine points with a
+point-opacity setting or hide them entirely, leaving the loading vectors visible;
+the setting is saved with the named run and used for plot exports.
+
+The separate **7. Advanced clustering** tab adds actual higher-dimensional UMAP
+and PCC/PCUMAP (Gildenblat and Pahnke) clustering while retaining PCA as the
+default interpretable baseline in tab 6. Users choose a 2-20 dimensional embedding
+and a 2D or 3D view; Gaussian mixture, Ward, or k-means receives the full fitted
+embedding as its clustering input. Plot color identifies cluster and marker shape
+identifies experimental group. Protein puncta remain descriptive-only.
+
+UMAP controls include neighbors, minimum distance, metric, iterations, and seed.
+PCC/PCUMAP also exposes reference points, beta, correlation-loss weight/start, and
+compute device. Named advanced runs save all settings and report trustworthiness,
+distance-rank preservation, and repeated-seed embedding and cluster stability.
+Exports include every embedding coordinate, dedicated diagnostic/stability sheets
+and CSVs, and high-resolution nonlinear plots. The current environment uses
+TorchDR for UMAP and PCUMAP; the legacy macOS UMAP fallback can take longer on its
+first fit while Numba compiles.
+
+The separate morphology package contains Excel and CSV data, candidate-model and
+specimen-bootstrap stability and audit tables, editable cluster colors, a PDF
+report, vector PDF/SVG figures, and 600-DPI PNG figures. A saved morphology
+workbook can also be re-clustered through
+**File -> Cluster exported morphology workbook...** without the original project
+or TIFF files.
+
 Source TIFFs are never modified. The compressed project cache can be removed after final export has been verified.
 
 ## Beta-release notes
 
+- Spine-volume filtering can now be applied reversibly inside a project or directly
+  to an exported workbook, with linked rows removed and supported summaries
+  recalculated from the remaining valid spines.
+- All-spine morphology review adds editable base/tip and head/neck geometry,
+  calibrated spine lengths, manual invalid-spine exclusion, and responsive
+  maximum-projection painting.
+- Named morphology analyses now support PCA, UMAP, and PCC/PCUMAP; GMM, Ward, and
+  k-means; reviewed-only and experimental-group subsets; configurable plots and
+  high-resolution exports; explicit PCA equations and feature vectors; and
+  descriptive-only protein-puncta summaries.
+- Automatic cluster-count selection offers information criterion, silhouette, and
+  elbow methods. Candidate-score panels show exact scores for every cluster count,
+  and PCA feature-vector views can fade or hide spine points.
 - Projects can now be moved between computers as validated compressed transfer
   ZIPs. Full transfers retain cached results and corrections; settings-only
   transfers retain setup and specimen comments while resetting derived state.

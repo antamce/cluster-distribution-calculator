@@ -67,7 +67,7 @@ def default_review_manifest() -> dict[str, object]:
 
 def default_measurements_manifest() -> dict[str, object]:
     return {
-        "algorithm_version": 3,
+        "algorithm_version": 4,
         "settings": {
             "minimum_cluster_spine_overlap_percent": 80.0,
             "cluster_end_method": "adaptive",
@@ -75,6 +75,8 @@ def default_measurements_manifest() -> dict[str, object]:
             "adaptive_area_factor": 1.8,
             "minimum_retained_slices": 2,
             "maximum_centerline_gap_um": 1.0,
+            "spine_volume_filter_enabled": False,
+            "spine_volume_filter_cutoff_um3": 0.0,
         },
     }
 
@@ -111,9 +113,16 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
         else 0
     )
     measurements = manifest.setdefault("measurements", default_measurements_manifest())
-    measurements["algorithm_version"] = 3
+    measurements["algorithm_version"] = 4
     measurements.setdefault("settings", {})
     measurements["settings"].setdefault("maximum_centerline_gap_um", 1.0)
+    measurements["settings"].setdefault("spine_volume_filter_enabled", False)
+    measurements["settings"].setdefault("spine_volume_filter_cutoff_um3", 0.0)
+    morphology_analysis = manifest.setdefault(
+        "morphology_analysis", {"runs": [], "active_run_id": None}
+    )
+    morphology_analysis.setdefault("runs", [])
+    morphology_analysis.setdefault("active_run_id", None)
     import_settings = manifest.setdefault(
         "import_settings",
         {
@@ -186,14 +195,14 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
             measurement_checkpoint.setdefault("state", "not_started")
             measurement_checkpoint.setdefault("updated_at", None)
         if (
-            previous_measurement_algorithm < 3
+            previous_measurement_algorithm < 4
             and checkpoints["measurements"].get("state") == "complete"
         ):
             checkpoints["measurements"].update(
                 {
                     "state": "not_started",
                     "updated_at": None,
-                    "reason": "Centerline component handling was updated; recalculate measurements.",
+                    "reason": "All-spine morphology and calibrated length measurements were added; recalculate measurements.",
                 }
             )
         review = specimen.setdefault(
@@ -212,6 +221,11 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
         )
         distribution_review.setdefault("spines", {})
         distribution_review.setdefault("updated_at", None)
+        morphology_review = specimen.setdefault(
+            "morphology_review", {"spines": {}, "updated_at": None}
+        )
+        morphology_review.setdefault("spines", {})
+        morphology_review.setdefault("updated_at", None)
         analysis = specimen.setdefault(
             "analysis", {"excluded": False, "exclusion_reason": "", "rois_xy": []}
         )
@@ -310,6 +324,7 @@ def create_project_manifest(
         "detection": default_detection_manifest(),
         "review_settings": default_review_manifest(),
         "measurements": default_measurements_manifest(),
+        "morphology_analysis": {"runs": [], "active_run_id": None},
         "cache": {"format": "zarr-v2-blosc-zstd", "path": None, "deletion_eligible": False},
         "specimens": specimens,
     }

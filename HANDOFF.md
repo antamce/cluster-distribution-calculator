@@ -3,7 +3,7 @@
 This document is the context-free continuation record for Synpo. Read it before
 changing code, publishing a release, or proposing the next stage. It describes the
 current approved behavior, scientific invariants, architecture, repository state,
-validation procedure, and remaining work as of 2026-09-27.
+validation procedure, and remaining work as of 2026-10-06.
 
 ## One-minute orientation
 
@@ -16,18 +16,18 @@ validation procedure, and remaining work as of 2026-09-27.
 - Dedicated Conda environment: `synpo-microscopy`. Never modify the user's separate
   environment named `synpo`.
 - Current development branch: `lsh`.
-- Current development release: `lsh` HEAD, titled `Add tested project transfer and
-  review workflow updates`.
+- Current development release: `lsh` HEAD, titled `Add morphology analysis and
+  volume-filter workflows`.
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
-- Current public beta commit: `a7991f5a263ecac126263ad890b4cc86040b1a7a`
-  (`Add project transfer and tested workflow improvements`).
-- Current full Windows result: 79 passed and 1 platform-specific test skipped.
+- Current public beta commit: `aef5ce8e3324f6b8900289cfb62b0e4074e4ff4b`
+  (`Add morphology analysis and spine filtering`).
+- Current full Windows result: 102 passed and 1 platform-specific test skipped.
   PowerShell and Bash syntax checks, Windows runtime resolution, Python 3.10 syntax
   parsing, and the offscreen application construction smoke test also passed.
   Conda dry-run resolution passed for Catalina `osx-64`, macOS 11 `osx-arm64`,
   and macOS 12 on both `osx-64` and `osx-arm64`.
-- Current user status: the complete approved post-testing update was published to
-  public `main` as `a7991f5` on 2026-09-27. An actual approximately
+- Current user status: the complete approved morphology-analysis and volume-filter
+  update was published to public `main` as `aef5ce8` on 2026-10-06. An actual approximately
   `80 x 2048 x 2048` stack on a 4 GB device and a Catalina launch remain preferred
   field tests.
 - This release adds an Advanced-menu diagnostic mode for an
@@ -46,6 +46,57 @@ validation procedure, and remaining work as of 2026-09-27.
 - Development method: build in stages and do not move to a new stage until the user
   explicitly approves the previous one. All behavior through the current beta is
   approved.
+- The current public release adds all-spine calibrated length and morphology
+  metrics, editable base/tip and head/neck geometry (including maximum-projection
+  brushes and undo/redo), and a sixth interactive morphology-clustering panel.
+  Named runs support GMM, Ward, and k-means with 2D/3D PCA, editable colors, and
+  separate Excel/CSV/PDF/SVG/600-DPI PNG analysis packages. Protein puncta are an
+  explicit descriptive-only layer: they never enter PCA or clustering. Standalone
+  re-clustering from exported morphology workbooks is supported.
+- The morphology follow-up removes per-voxel Zarr reads from head/neck painting,
+  throttles stroke redraws, and moves geometry recalculation to a worker thread.
+  Checkpoint-and-advance preserves its queue position, morphology-stage invalidity
+  is an auditable all-metric exclusion, named runs can select any subset of
+  experimental groups, and group marker shapes appear alongside cluster colors.
+  Per-run axes/background colors and alpha values affect both interactive and
+  exported plots. The latest plot follow-up adds saved legend visibility/placement,
+  an arbitrary X/Y view for any selected clustering features, and repairs the
+  Matplotlib protein-puncta-volume box plot while showing its source observations.
+  A dedicated PCA-interpretation dashboard adds score/loading vectors, a loading
+  heatmap, explained-variance bars, explicit equations, reproducibility metadata,
+  and a matching high-resolution exported figure. Three-component runs render the
+  score/loading-vector panel as an interactive 3D PC1/PC2/PC3 view and also expose
+  a standalone full-size 3D feature-axis biplot. Protein-puncta-volume observations
+  use group-specific marker shapes; their legend explains cluster-colored points
+  and hollow black box-plot outliers.
+  Both PCA feature-vector views persist controls for showing/hiding spine points
+  and for their opacity; feature vectors stay fully opaque and exports honor the
+  chosen point display.
+- Named morphology runs can optionally include only spines explicitly marked
+  `geometry_reviewed`; the default remains all otherwise valid complete spines.
+  Unreviewed exclusions are retained in the run audit and the toggle is serialized
+  in `MorphologyClusteringSettings`.
+- Automatic morphology cluster-count selection now offers the existing information
+  criterion, maximum silhouette, or a normalized within-cluster-SSE elbow. The
+  chosen method is saved for PCA, UMAP, and PCUMAP runs; fixed counts override it.
+  Candidate exports include raw SSE, silhouette, elbow distance, acceptance, and
+  the selected candidate.
+- Tabs 6 and 7 have a `Cluster-count scores` view that reuses the saved candidate
+  diagnostics (no refit), annotates exact values, highlights accepted/rejected and
+  selected candidates, and tabulates information criterion, silhouette, or the
+  within-cluster-SSE elbow curve.
+- A seventh, separate advanced-clustering tab now keeps PCA as the default baseline
+  while adding actual higher-dimensional UMAP and Gildenblat/Pahnke PCC/PCUMAP.
+  The full 2-20D embedding is passed to GMM, Ward, or k-means; the 2D/3D plot uses
+  coordinates from that same fitted space, with cluster colors and experimental-
+  group marker shapes. Named advanced runs retain selected groups, reviewed-only
+  filtering, reducer parameters, styling, and standalone-workbook support.
+- Advanced exports include every embedding coordinate, implementation/effective
+  parameters, trustworthiness, distance-rank preservation, repeated-seed embedding
+  correlation and cluster ARI, plus high-resolution nonlinear plots. The current
+  environment installs `pccdr==1.0.3` (TorchDR/PyTorch) and uses TorchDR for both
+  modern UMAP and PCUMAP; `umap-learn` is the legacy macOS fallback. The Catalina/
+  macOS 11 environment intentionally omits PCC/PCUMAP.
 
 ## Repository and release safety
 
@@ -73,6 +124,10 @@ the same publishing target.
   as curated commit `a7991f5`, based on `5ad52bc`. Its exact 31-file public tree
   passed the complete 80-test suite (79 passed, 1 platform skip) and an offscreen
   application-construction smoke test before publication.
+- The morphology-analysis and spine-volume-filter update was published on
+  2026-10-06 as curated commit `aef5ce8`, based on `a7991f5`. Its exact 32-file
+  public tree passed the complete 103-test suite (102 passed, 1 platform skip),
+  Python compilation, and an offscreen seven-tab application smoke test.
 - The public tree contains user-facing source, both environment files, Windows and
   macOS launcher files, launcher helpers, icons, package metadata, and README. It
   intentionally excludes `HANDOFF.md`, `tests/`, `PUBLIC_README.md`, development
@@ -139,7 +194,7 @@ $env:PYTHONPATH = (Resolve-Path "src").Path
 conda run -n synpo-microscopy python -m pytest -q
 ```
 
-Current Windows baseline: `46 passed, 1 skipped` (the macOS Bash execution test is
+Current Windows baseline: `102 passed, 1 skipped` (the macOS Bash execution test is
 the expected skip). Also perform an offscreen application
 construction smoke test after material UI changes. The application title should
 contain `Synpo Microscopy Processor - Beta 0.8.0` (typographic dash may differ).
@@ -291,14 +346,20 @@ and optional registered flag follow them.
   physical aspect handling, cropped marching-cubes meshes, RAM/face limits, and the
   native Qt 3D renderer.
 - `src/synpo/measurements.py`: association, cluster-end trimming, raw specimen/
-  dendrite/spine/cluster metrics, checkpoint signatures, resume, and comparison
+  dendrite/spine/cluster metrics, all-spine length and geometry measurements,
+  editable morphology review, checkpoint signatures, resume, and comparison
   illustrations.
+- `src/synpo/morphology.py`: named morphology clustering runs, custom PCA,
+  GMM/Ward/k-means fitting, candidate and specimen-bootstrap diagnostics,
+  descriptive-only protein summaries, arbitrary selected-feature plots, explicit
+  reproducible PCA interpretation, standalone workbook input, and separate
+  analysis/figure exports.
 - `src/synpo/distribution.py`: calibrated curved spine axes, endpoint hints, A* path
   completion, ten-bin voxel assignment, review state, aggregation and SEM.
 - `src/synpo/exporting.py`: verified Excel/CSV exports and optional validation/audit
   PDF generation.
 - `src/synpo/cli.py`: non-GUI scan/inspection command.
-- `tests/`: 80-test release suite, including importer, project, preprocessing,
+- `tests/`: 103-test development suite, including importer, project, preprocessing,
   detection, diagnostics, review, measurement, 3D rendering, and beta UI regression
   coverage.
 
@@ -544,6 +605,22 @@ laptop. Treat these as historical guidance, not guaranteed performance.
 - Optional multi-page PDFs use two original-channel XY maximum panels plus the
   ten-color mask/centerline and individual line/bar distribution. Main,
   distribution-excluded, and invalid-spine audit PDFs are independent options.
+- A saved post-measurement spine-volume filter uses one calibrated `um3` cutoff and
+  the strict rule `volume_um3 < cutoff`; equality is retained. It operates on deep
+  copies of saved measurement results and never modifies masks/results on disk.
+- Per-spine `volume_filter_force_keep` decisions live beside distribution-review
+  decisions. They override only the volume rule; manual invalidity always wins.
+  Changing the cutoff/overrides refreshes in-app summaries without remeasurement.
+- Project exports omit volume-filtered spines from all primary/link tables and PDFs,
+  recompute ROI/dendrite/specimen/group/profile statistics, and keep manual invalid
+  and volume-filter-only audit rows separate. `Spine_Volume_Distribution` uses
+  shared Freedman-Diaconis bins with Sturges/constant-data fallbacks and contains
+  pooled plus specimen-weighted numeric results.
+- **File -> Filter exported measurement workbook...** reconstructs results from
+  detailed workbook sheets, writes a new workbook and CSV directory, preserves
+  unrecognized sheets, and records exact/unavailable recalculations in
+  `Compatibility_Report`. Unsupported legacy summaries are marked unavailable,
+  never approximated. This standalone path cannot regenerate PDFs.
 
 ### Beta 0.8.0 additions (approved)
 
@@ -655,23 +732,24 @@ For a material change:
   bar-chart alternative.
 - Statistics remain external to Synpo.
 
-## State after the 2026-09-27 public release
+## State after the 2026-10-06 public release
 
-- Development implementation: the current release commit on development branch
-  `lsh`; push it only to development `origin/lsh`.
+- Development implementation: `lsh` HEAD, titled `Add morphology analysis and
+  volume-filter workflows`; push it only to development `origin/lsh`.
 - Public repository: `antamce/cluster-distribution`, branch `main`, verified remote
-  commit `a7991f5a263ecac126263ad890b4cc86040b1a7a`.
-- The public commit contains 31 distributable files. It excludes tests,
+  commit `aef5ce8e3324f6b8900289cfb62b0e4074e4ff4b`.
+- The public commit contains 32 distributable files. It excludes tests,
   `HANDOFF.md`, `PUBLIC_README.md`, microscopy data, caches, and pytest-only
   dependencies/configuration. The public `README.md` came from `PUBLIC_README.md`
-  and documents diagnostics, per-specimen reruns, exclusions/ROIs, correction
-  tools, centerline bridging, and project transfers.
+  and documents volume filtering, all-spine geometry review, PCA/UMAP/PCUMAP,
+  cluster-count scoring, feature-vector visibility, and all earlier workflows.
 - Validation immediately before publication: the development tree and exact
-  curated public source both passed all 80 tests (79 passed, 1 platform-specific
-  launcher skip). The curated public application also passed offscreen construction.
+  curated public source both passed all 103 tests (102 passed, 1 platform-specific
+  launcher skip). The curated public application also passed Python compilation
+  and offscreen construction with all seven tabs.
 - Public push was verified with `git ls-remote`. The exact temporary checkout
   `C:\Users\user\Documents\code2\Synpo\.public-release-work` was confirmed clean at
-  `a7991f5` and then deleted. The development worktree should be clean after this
+  `aef5ce8` and then deleted. The development worktree should be clean after this
   handoff record is committed.
 - Next expected activity is user testing, particularly on the Intel Catalina
   device. Do not describe macOS as field-validated until those results arrive.

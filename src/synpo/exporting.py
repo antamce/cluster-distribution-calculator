@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -9,9 +10,12 @@ import numpy as np
 from openpyxl import Workbook, load_workbook
 
 from .measurements import (
+    apply_spine_volume_filter,
     distribution_summary_rows,
+    filtered_measurement_result,
     load_distribution_preview,
-    load_measurement_result,
+    spine_volume_distribution_rows,
+    spine_volume_filter_settings,
 )
 
 
@@ -70,28 +74,75 @@ def _group_summary(specimen_rows: list[dict[str, object]]) -> list[dict[str, obj
 
 
 def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[str, object]]]:
-    results = [
-        load_measurement_result(manifest, index)
-        for index, specimen in enumerate(manifest["specimens"])
-        if specimen["checkpoints"].get("measurements", {}).get("state") == "complete"
-    ]
+    results: list[dict[str, object]] = []
+    volume_audit: list[dict[str, object]] = []
+    for index, specimen_record in enumerate(manifest["specimens"]):
+        if specimen_record["checkpoints"].get("measurements", {}).get("state") != "complete":
+            continue
+        result, audit = filtered_measurement_result(manifest, index)
+        distribution_by_spine = {
+            int(row.get("spine_id") or 0): row
+            for row in result.get("distribution_rows", [])
+        }
+        for row in audit:
+            distribution = distribution_by_spine.get(int(row.get("spine_id") or 0), {})
+            row.update(
+                {
+                    "distribution_included": distribution.get("distribution_included"),
+                    "distribution_reviewed": distribution.get(
+                        "distribution_reviewed", row.get("distribution_reviewed")
+                    ),
+                    "distribution_axis_status": distribution.get(
+                        "distribution_axis_status"
+                    ),
+                    "distribution_review_required": distribution.get(
+                        "distribution_review_required"
+                    ),
+                    "centerline_endpoint_source": distribution.get(
+                        "centerline_endpoint_source"
+                    ),
+                    "review_note": distribution.get(
+                        "review_note", row.get("validity_note", "")
+                    ),
+                }
+            )
+        results.append(result)
+        volume_audit.extend(audit)
+    return collect_export_tables_from_results(manifest, results, volume_audit=volume_audit)
+
+
+def collect_export_tables_from_results(
+    manifest: dict[str, object],
+    results: list[dict[str, object]],
+    *,
+    volume_audit: list[dict[str, object]] | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    filter_enabled, cutoff = spine_volume_filter_settings(manifest)
     specimen = [row for result in results for row in result.get("specimen_rows", [])]
     roi = [row for result in results for row in result.get("roi_rows", [])]
     dendrite = [row for result in results for row in result.get("dendrite_rows", [])]
-    spine = [row for result in results for row in result.get("spine_rows", [])]
+    all_spines = [row for result in results for row in result.get("spine_rows", [])]
+    spine = [row for row in all_spines if not bool(row.get("volume_filter_excluded", False))]
     clusters = [
         row
         for result in results
         for row in result.get("cluster_rows", [])
         if row.get("row_type") == "individual_cluster"
+        and not bool(row.get("volume_filter_excluded", False))
     ]
     sums = [
         row
         for result in results
         for row in result.get("cluster_rows", [])
         if row.get("row_type") == "spine_cluster_sum"
+        and not bool(row.get("volume_filter_excluded", False))
     ]
-    distributions = [row for result in results for row in result.get("distribution_rows", [])]
+    distributions = [
+        row
+        for result in results
+        for row in result.get("distribution_rows", [])
+        if not bool(row.get("volume_filter_excluded", False))
+    ]
     distribution_specimen, distribution_group = distribution_summary_rows(results)
     excluded = [
         row
@@ -101,7 +152,7 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
     invalid_ids = {
         (str(row.get("experimental_group", "")), str(row.get("specimen_id", "")), int(row["spine_id"]))
         for row in spine
-        if not bool(row.get("spine_valid", True))
+        if not bool(row.get("manual_spine_valid", row.get("spine_valid", True)))
     }
     invalid = [
         row
@@ -111,8 +162,10 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
     reviewed_spines = [
         row
         for row in spine
-        if bool(row.get("validity_reviewed", False))
+        if not bool(row.get("volume_filter_excluded", False))
+        and (bool(row.get("validity_reviewed", False))
         or bool(row.get("distribution_reviewed", False))
+        )
     ]
     settings = [
         {"section": "calibration", **dict(manifest["calibration"])},
@@ -124,6 +177,13 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
             "aggregation": "spine means within specimen, then specimen means within group",
             "group_error_bars": "SEM across specimen means",
             "ratio_units": "fraction 0-1",
+        },
+        {
+            "section": "spine_volume_filter",
+            "enabled": filter_enabled,
+            "cutoff_um3": cutoff,
+            "rule": "exclude volume_um3 < cutoff_um3; equality retained",
+            "force_keep_scope": "volume rule only; manually invalid spines remain invalid",
         },
     ]
     excluded_specimens = [
@@ -148,8 +208,12 @@ def collect_export_tables(manifest: dict[str, object]) -> dict[str, list[dict[st
         "Distribution_Excluded": excluded,
         "Invalid_Spines": invalid,
         "Spine_Review_Audit": reviewed_spines,
+        "Volume_Filtered_Spines": list(volume_audit or []),
         "Excluded_Specimens": excluded_specimens,
         "Group_Summary": _group_summary(specimen),
+        "Spine_Volume_Distribution": spine_volume_distribution_rows(
+            results, filter_enabled=filter_enabled, cutoff_um3=cutoff
+        ),
         "Settings": settings,
     }
 
@@ -185,6 +249,426 @@ def _write_csvs(directory: Path, tables: dict[str, list[dict[str, object]]]) -> 
                     writer.writerow({key: _cell(row.get(key)) for key in columns})
         written.append(path)
     return written
+
+
+def _worksheet_rows(workbook, name: str) -> list[dict[str, object]]:  # type: ignore[no-untyped-def]
+    if name not in workbook.sheetnames:
+        return []
+    values = list(workbook[name].iter_rows(values_only=True))
+    if not values or not values[0] or values[0][0] == "No rows":
+        return []
+    headers = [str(value) if value is not None else "" for value in values[0]]
+    return [
+        {header: value for header, value in zip(headers, row) if header}
+        for row in values[1:]
+        if any(value is not None for value in row)
+    ]
+
+
+def _worksheet_columns(workbook, name: str) -> set[str]:  # type: ignore[no-untyped-def]
+    if name not in workbook.sheetnames:
+        return set()
+    first = next(workbook[name].iter_rows(min_row=1, max_row=1, values_only=True), ())
+    if not first or first[0] == "No rows":
+        return set()
+    return {str(value) for value in first if value is not None and str(value)}
+
+
+def inspect_exported_measurement_workbook(path: str | Path) -> dict[str, object]:
+    """Validate a Synpo workbook and return rows needed by the filter dialog."""
+    source = Path(path).resolve()
+    workbook = load_workbook(source, read_only=True, data_only=True)
+    try:
+        rows = _worksheet_rows(workbook, "Spine_Master")
+        required = {
+            "experimental_group",
+            "specimen_id",
+            "spine_id",
+            "dendrite_id",
+            "volume_um3",
+            "spine_valid",
+        }
+        columns = _worksheet_columns(workbook, "Spine_Master")
+        missing = sorted(required - columns)
+        if missing:
+            raise ValueError(
+                "Spine_Master is missing required column(s): " + ", ".join(missing)
+            )
+        settings = _worksheet_rows(workbook, "Settings")
+        volume_setting = next(
+            (row for row in settings if row.get("section") == "spine_volume_filter"),
+            {},
+        )
+        return {
+            "path": str(source),
+            "spines": rows,
+            "cutoff_um3": float(volume_setting.get("cutoff_um3") or 0.0),
+            "filter_enabled": bool(volume_setting.get("enabled", False)),
+            "sheet_names": list(workbook.sheetnames),
+            "sheet_columns": {
+                name: sorted(_worksheet_columns(workbook, name))
+                for name in workbook.sheetnames
+            },
+        }
+    finally:
+        workbook.close()
+
+
+def _group_workbook_results(
+    tables: dict[str, list[dict[str, object]]],
+) -> list[dict[str, object]]:
+    keys = sorted(
+        {
+            (str(row.get("experimental_group", "")), str(row.get("specimen_id", "")))
+            for row in tables.get("Spine_Master", [])
+        }
+    )
+    results: list[dict[str, object]] = []
+    table_map = {
+        "Specimen_Master": "specimen_rows",
+        "ROI_Master": "roi_rows",
+        "Dendrite_Master": "dendrite_rows",
+        "Spine_Master": "spine_rows",
+        "Distribution_Individual": "distribution_rows",
+    }
+    for group, specimen in keys:
+        result: dict[str, object] = {}
+        for table_name, result_name in table_map.items():
+            result[result_name] = [
+                dict(row)
+                for row in tables.get(table_name, [])
+                if str(row.get("experimental_group", "")) == group
+                and str(row.get("specimen_id", "")) == specimen
+            ]
+        if not result["specimen_rows"]:
+            result["specimen_rows"] = [
+                {"experimental_group": group, "specimen_id": specimen}
+            ]
+        clusters: list[dict[str, object]] = []
+        for table_name, row_type in (
+            ("Cluster_Individual", "individual_cluster"),
+            ("Cluster_Sums", "spine_cluster_sum"),
+        ):
+            for source in tables.get(table_name, []):
+                if str(source.get("experimental_group", "")) != group or str(
+                    source.get("specimen_id", "")
+                ) != specimen:
+                    continue
+                row = dict(source)
+                row.setdefault("row_type", row_type)
+                clusters.append(row)
+        result["cluster_rows"] = clusters
+        results.append(result)
+    return results
+
+
+def _replace_sheet(workbook, name: str, rows: list[dict[str, object]]) -> None:  # type: ignore[no-untyped-def]
+    index = workbook.sheetnames.index(name) if name in workbook.sheetnames else len(workbook.sheetnames)
+    if name in workbook.sheetnames:
+        workbook.remove(workbook[name])
+    sheet = workbook.create_sheet(name[:31], index)
+    columns = _columns(rows)
+    if not columns:
+        sheet.append(["No rows"])
+        return
+    sheet.append(columns)
+    for row in rows:
+        sheet.append([_cell(row.get(column)) for column in columns])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+
+
+def _write_workbook_csv_directory(workbook, directory: Path) -> list[Path]:  # type: ignore[no-untyped-def]
+    directory.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    used: set[str] = set()
+    for sheet in workbook.worksheets:
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", sheet.title).strip("._") or "Sheet"
+        candidate = stem
+        suffix = 2
+        while candidate.lower() in used:
+            candidate = f"{stem}_{suffix}"
+            suffix += 1
+        used.add(candidate.lower())
+        path = directory / f"{candidate}.csv"
+        with path.open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.writer(stream)
+            for row in sheet.iter_rows(values_only=True):
+                writer.writerow([_cell(value) for value in row])
+        written.append(path)
+    return written
+
+
+def filter_exported_measurement_workbook(
+    source_path: str | Path,
+    output_path: str | Path,
+    *,
+    cutoff_um3: float,
+    force_keep_keys: set[tuple[str, str, int]] | None = None,
+) -> dict[str, object]:
+    """Filter and exactly recalculate supported tables in an exported workbook."""
+    source = Path(source_path).resolve()
+    output = Path(output_path).resolve()
+    if source == output:
+        raise ValueError("Choose a new output file; the source workbook is never overwritten.")
+    inspection = inspect_exported_measurement_workbook(source)
+    if bool(inspection.get("filter_enabled", False)):
+        raise ValueError(
+            "This workbook is already volume-filtered and no longer contains the omitted "
+            "detail rows. Select the original unfiltered workbook so changing the cutoff "
+            "remains reversible."
+        )
+    force_keep = force_keep_keys or set()
+    values = load_workbook(source, read_only=True, data_only=True)
+    try:
+        tables = {name: _worksheet_rows(values, name) for name in values.sheetnames}
+    finally:
+        values.close()
+    sheet_columns = {
+        str(name): set(columns)
+        for name, columns in dict(inspection["sheet_columns"]).items()
+    }
+    table_requirements = {
+        "Spine_Master": {"experimental_group", "specimen_id", "dendrite_id", "spine_id", "volume_um3", "spine_valid"},
+        "Cluster_Individual": {"experimental_group", "specimen_id", "spine_id"},
+        "Cluster_Sums": {"experimental_group", "specimen_id", "spine_id"},
+        "Distribution_Individual": {"experimental_group", "specimen_id", "spine_id", "distribution_included"},
+        "Dendrite_Master": {"experimental_group", "specimen_id", "roi_id", "dendrite_id", "length_um"},
+        "ROI_Master": {"experimental_group", "specimen_id", "roi_id"},
+        "Specimen_Master": {"experimental_group", "specimen_id"},
+    }
+    table_issues: dict[str, str] = {}
+    for name, required in table_requirements.items():
+        if name not in inspection["sheet_names"]:
+            table_issues[name] = f"missing detailed sheet {name}"
+            continue
+        missing_columns = sorted(required - sheet_columns.get(name, set()))
+        if missing_columns:
+            table_issues[name] = "missing column(s): " + ", ".join(missing_columns)
+            if name != "Spine_Master":
+                tables[name] = []
+    spine_summary_columns = {
+        "roi_id",
+        "has_protein_cluster",
+        "cluster_to_spine_volume_ratio",
+    }
+    cluster_summary_columns = {"dendrite_id", "roi_id", "volume_inside_spine_um3"}
+    distribution_summary_columns = {
+        "dendrite_id",
+        "roi_id",
+        "distribution_included",
+        *{f"bin_{index:02d}_ratio" for index in range(1, 11)},
+    }
+    summary_missing: list[str] = []
+    for name in ("Dendrite_Master", "Cluster_Individual", "Distribution_Individual"):
+        if name in table_issues:
+            summary_missing.append(table_issues[name])
+    for name, required in (
+        ("Spine_Master", spine_summary_columns),
+        ("Cluster_Individual", cluster_summary_columns),
+        ("Distribution_Individual", distribution_summary_columns),
+    ):
+        missing = sorted(required - sheet_columns.get(name, set()))
+        if missing:
+            summary_missing.append(f"{name} missing column(s): {', '.join(missing)}")
+    summary_ready = not summary_missing
+    distribution_ready = (
+        "Distribution_Individual" not in table_issues
+        and not (
+            {f"bin_{index:02d}_ratio" for index in range(1, 11)}
+            - sheet_columns.get("Distribution_Individual", set())
+        )
+    )
+    review_audit_columns = {"validity_reviewed"}
+    review_audit_ready = not (
+        review_audit_columns - sheet_columns.get("Spine_Master", set())
+    )
+    audit_columns = {
+        "roi_id",
+        "has_protein_cluster",
+        "included_cluster_count",
+        "inside_cluster_volume_sum_um3",
+    }
+    missing_audit_columns = sorted(
+        audit_columns - sheet_columns.get("Spine_Master", set())
+    )
+    raw_results = _group_workbook_results(tables)
+    filtered_results: list[dict[str, object]] = []
+    audit: list[dict[str, object]] = []
+    for result in raw_results:
+        identity = result.get("specimen_rows", [{}])[0]
+        group = str(identity.get("experimental_group", ""))
+        specimen = str(identity.get("specimen_id", ""))
+        ids = {
+            spine_id
+            for key_group, key_specimen, spine_id in force_keep
+            if key_group == group and key_specimen == specimen
+        }
+        filtered, excluded = apply_spine_volume_filter(
+            result,
+            enabled=True,
+            cutoff_um3=cutoff_um3,
+            force_keep_ids=ids,
+            refresh_summaries=summary_ready,
+        )
+        distribution_by_spine = {
+            int(row.get("spine_id") or 0): row
+            for row in filtered.get("distribution_rows", [])
+        }
+        for row in excluded:
+            distribution = distribution_by_spine.get(int(row.get("spine_id") or 0), {})
+            row.update(
+                {
+                    "distribution_included": distribution.get("distribution_included"),
+                    "distribution_reviewed": distribution.get("distribution_reviewed"),
+                    "distribution_axis_status": distribution.get("distribution_axis_status"),
+                    "distribution_review_required": distribution.get("distribution_review_required"),
+                    "centerline_endpoint_source": distribution.get("centerline_endpoint_source"),
+                    "review_note": distribution.get("review_note", row.get("validity_note", "")),
+                }
+            )
+        filtered_results.append(filtered)
+        audit.extend(excluded)
+
+    manifest = {
+        "measurements": {
+            "settings": {
+                "spine_volume_filter_enabled": True,
+                "spine_volume_filter_cutoff_um3": float(cutoff_um3),
+            }
+        },
+        "calibration": {},
+        "specimens": [],
+    }
+    recalculated = collect_export_tables_from_results(
+        manifest, filtered_results, volume_audit=audit
+    )
+    available = set(inspection["sheet_names"]) - set(table_issues)
+    if summary_ready:
+        available.add("__summary_inputs__")
+    if distribution_ready:
+        available.add("__distribution_inputs__")
+    if review_audit_ready:
+        available.add("__review_audit_inputs__")
+    dependencies = {
+        "Spine_Master": {"Spine_Master"},
+        "Cluster_Individual": {"Spine_Master", "Cluster_Individual"},
+        "Cluster_Sums": {"Spine_Master", "Cluster_Sums"},
+        "Distribution_Individual": {"Spine_Master", "Distribution_Individual"},
+        "Distribution_Specimen": {"Spine_Master", "Distribution_Individual", "__distribution_inputs__"},
+        "Distribution_Group": {"Spine_Master", "Distribution_Individual", "__distribution_inputs__"},
+        "Distribution_Excluded": {"Spine_Master", "Distribution_Individual"},
+        "Dendrite_Master": {"Spine_Master", "Dendrite_Master", "Cluster_Individual", "Distribution_Individual", "__summary_inputs__"},
+        "ROI_Master": {"Spine_Master", "ROI_Master", "Dendrite_Master", "Cluster_Individual", "Distribution_Individual", "__summary_inputs__"},
+        "Specimen_Master": {"Spine_Master", "Specimen_Master", "Dendrite_Master", "Cluster_Individual", "Distribution_Individual", "__summary_inputs__"},
+        "Group_Summary": {"Spine_Master", "Specimen_Master", "Dendrite_Master", "Cluster_Individual", "Distribution_Individual", "__summary_inputs__"},
+        "Invalid_Spines": {"Spine_Master"},
+        "Spine_Review_Audit": {"Spine_Master", "__review_audit_inputs__"},
+        "Volume_Filtered_Spines": {"Spine_Master"},
+        "Spine_Volume_Distribution": {"Spine_Master"},
+    }
+    report: list[dict[str, object]] = []
+    workbook = load_workbook(source, data_only=False)
+    for name, needed in dependencies.items():
+        missing = sorted(needed - available)
+        if missing:
+            status = "unavailable"
+            reasons = [
+                "; ".join(summary_missing)
+                if item == "__summary_inputs__"
+                else "Distribution_Individual is missing one or more bin_01_ratio through bin_10_ratio columns"
+                if item == "__distribution_inputs__"
+                else "Spine_Master is missing validity_reviewed"
+                if item == "__review_audit_inputs__"
+                else table_issues.get(item, f"missing detailed sheet {item}")
+                for item in missing
+            ]
+            detail = "Exact recalculation unavailable: " + "; ".join(
+                dict.fromkeys(reasons)
+            )
+            if name in workbook.sheetnames:
+                _replace_sheet(
+                    workbook,
+                    name,
+                    [{"status": "NOT RECALCULATED", "reason": detail}],
+                )
+        else:
+            status = "recalculated"
+            detail = "Filtered and recalculated exactly from detailed source sheets."
+            _replace_sheet(workbook, name, recalculated.get(name, []))
+            if name == "Volume_Filtered_Spines" and missing_audit_columns:
+                status = "recalculated_with_unavailable_fields"
+                detail = (
+                    "Exclusion rows were recalculated exactly, but legacy Spine_Master "
+                    "does not provide: " + ", ".join(missing_audit_columns)
+                )
+        report.append({"table": name, "status": status, "detail": detail})
+
+    report.append(
+        {
+            "table": "Settings",
+            "status": "updated",
+            "detail": "Original settings retained and the applied volume-filter rule appended.",
+        }
+    )
+    if "Excluded_Specimens" in workbook.sheetnames:
+        report.append(
+            {
+                "table": "Excluded_Specimens",
+                "status": "preserved",
+                "detail": "Not spine-volume dependent; preserved unchanged.",
+            }
+        )
+    known = set(dependencies) | {"Settings", "Excluded_Specimens", "Compatibility_Report"}
+    for name in workbook.sheetnames:
+        if name not in known:
+            report.append(
+                {
+                    "table": name,
+                    "status": "preserved_unrecognized",
+                    "detail": "User-added or unrecognized sheet preserved unchanged.",
+                }
+            )
+    report.append(
+        {
+            "table": "PDF exports",
+            "status": "unavailable",
+            "detail": "Standalone workbooks contain no source pixels/cache; PDFs were not regenerated.",
+        }
+    )
+
+    original_settings = [
+        row for row in tables.get("Settings", []) if row.get("section") != "spine_volume_filter"
+    ]
+    original_settings.append(
+        {
+            "section": "spine_volume_filter",
+            "enabled": True,
+            "cutoff_um3": float(cutoff_um3),
+            "rule": "exclude volume_um3 < cutoff_um3; equality retained",
+            "source_workbook": str(source),
+        }
+    )
+    _replace_sheet(workbook, "Settings", original_settings)
+    _replace_sheet(workbook, "Compatibility_Report", report)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(output)
+    csv_directory = output.parent / f"{output.stem}_csv"
+    csv_paths = _write_workbook_csv_directory(workbook, csv_directory)
+    workbook.close()
+    load_workbook(output, read_only=True).close()
+    return {
+        "workbook": str(output),
+        "csv_directory": str(csv_directory),
+        "source_workbook": str(source),
+        "cutoff_um3": float(cutoff_um3),
+        "excluded_spine_count": len(audit),
+        "force_kept_count": len(force_keep),
+        "compatibility_report": report,
+        "csv_count": len(csv_paths),
+        "pdfs_regenerated": False,
+        "verified": True,
+    }
 
 
 def _pdf_pages_matplotlib_legacy(
@@ -482,17 +966,21 @@ def export_measurements(
     indexed_rows: list[tuple[int, dict[str, object]]] = []
     for specimen_index, _specimen in enumerate(manifest["specimens"]):
         try:
-            result = load_measurement_result(manifest, specimen_index)
+            result, _audit = filtered_measurement_result(manifest, specimen_index)
         except ValueError:
             continue
-        indexed_rows.extend((specimen_index, row) for row in result.get("distribution_rows", []))
+        indexed_rows.extend(
+            (specimen_index, row)
+            for row in result.get("distribution_rows", [])
+            if not bool(row.get("volume_filter_excluded", False))
+        )
     selections = []
     if validation_pdf:
         selections.append((path.with_name(f"{path.stem}_distribution_validation.pdf"), [item for item in indexed_rows if bool(item[1].get("spine_valid", True)) and bool(item[1].get("distribution_included", False))], True))
     if excluded_audit_pdf:
         selections.append((path.with_name(f"{path.stem}_distribution_excluded_audit.pdf"), [item for item in indexed_rows if bool(item[1].get("spine_valid", True)) and not bool(item[1].get("distribution_included", False))], False))
     if invalid_audit_pdf:
-        selections.append((path.with_name(f"{path.stem}_invalid_spines_audit.pdf"), [item for item in indexed_rows if not bool(item[1].get("spine_valid", True))], False))
+        selections.append((path.with_name(f"{path.stem}_invalid_spines_audit.pdf"), [item for item in indexed_rows if not bool(item[1].get("manual_spine_valid", item[1].get("spine_valid", True)))], False))
     for pdf_path, selected, summaries in selections:
         _pdf_pages(
             manifest,
