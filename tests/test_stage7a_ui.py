@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication, QAbstractItemView
 from synpo.app import (
     BatchPreprocessWorker,
     ClusterCountScorePanel,
+    CorrelationMatrixPanel,
     MainWindow,
     MorphologyPlotCanvas,
     PreviewWorker,
@@ -111,6 +112,10 @@ class Stage7AUiTests(unittest.TestCase):
         self.assertEqual(window.distribution_review_mode.count(), 2)
         self.assertEqual(
             window.distribution_review_mode.itemData(1), "cluster_less"
+        )
+        self.assertIn(
+            "all eligible spines",
+            window.accept_all_distribution_spines.text().lower(),
         )
         self.assertIn("numbered spine map", window.open_spine_map_button.text().lower())
         view = SpineMapView()
@@ -447,12 +452,58 @@ class Stage7AUiTests(unittest.TestCase):
         )
         self.assertTrue(window.morphology_pca_show_points.isChecked())
         self.assertAlmostEqual(window.morphology_pca_point_alpha.value(), 0.68)
+        self.assertEqual(len(window.morphology_correlation_panel.feature_checks), 15)
+        self.assertEqual(window.morphology_display_tabs.count(), 4)
+        self.assertEqual(window.advanced_display_tabs.count(), 3)
         window.morphology_plot_mode.setCurrentIndex(
             window.morphology_plot_mode.findData("pca_interpretation")
         )
         self.assertFalse(window.morphology_pca_point_row.isHidden())
         window.deleteLater()
         self.app.processEvents()
+
+    def test_correlation_panel_has_independent_features_groups_and_custom_colors(self) -> None:
+        assignments = []
+        for index in range(8):
+            volume = 0.02 + index * 0.01
+            assignments.append(
+                {
+                    "experimental_group": "control" if index < 4 else "treated",
+                    "volume_um3": volume,
+                    "spine_curvilinear_length_um": volume * 4.0,
+                    "spine_base_to_tip_distance_um": 0.5 + index * 0.02,
+                    "centerline_tortuosity": 1.0 + index * 0.01,
+                    "maximum_width_um": 0.2 + index * 0.01,
+                    "principal_axis_elongation": 1.2 + index * 0.03,
+                }
+            )
+        result = {
+            "settings": {"features": ["linear_volume", "curvilinear_length"]},
+            "assignments": assignments,
+            "plot_style": {
+                "correlation_features": ["linear_volume", "curvilinear_length"],
+                "correlation_scope": "control",
+                "correlation_colormap": "custom",
+                "correlation_negative_color": "#0011aa",
+                "correlation_zero_color": "#eeeeee",
+                "correlation_positive_color": "#aa1100",
+                "correlation_alpha": 0.75,
+            },
+        }
+        panel = CorrelationMatrixPanel()
+        panel.show_run(result)
+        self.assertEqual(panel.scope.currentData(), "control")
+        self.assertEqual(panel.colormap.currentData(), "custom")
+        self.assertAlmostEqual(panel.alpha.value(), 0.75)
+        self.assertEqual(panel._data["included_spine_count"], 4)
+        self.assertIn("fewer than 30", panel.summary.text())
+        settings = panel.settings()
+        self.assertEqual(
+            settings["correlation_features"],
+            ["linear_volume", "curvilinear_length"],
+        )
+        self.assertEqual(settings["correlation_positive_color"], "#aa1100")
+        panel.close()
 
     def test_morphology_puncta_and_custom_feature_plots_render(self) -> None:
         result = {

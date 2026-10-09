@@ -13,6 +13,7 @@ import zarr
 from synpo.detection import detection_cache_path
 from synpo.measurements import (
     MeasurementSettings,
+    accept_all_eligible_distribution_spines,
     apply_morphology_review_edit,
     _cluster_keep_lookup,
     clear_centerline_endpoint_hint,
@@ -299,6 +300,67 @@ class MeasurementTests(unittest.TestCase):
             self.assertEqual(len(overridden["Spine_Master"]), 1)
             self.assertEqual(overridden["Volume_Filtered_Spines"], [])
             self.assertTrue(overridden["Spine_Master"][0]["volume_filter_force_keep"])
+
+    def test_bulk_distribution_acceptance_respects_invalid_and_volume_filter(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_project(root)
+            measure_project(manifest, project_path)
+
+            accepted = accept_all_eligible_distribution_spines(
+                manifest, project_path
+            )
+            self.assertEqual(accepted["eligible_count"], 1)
+            self.assertEqual(accepted["accepted_count"], 1)
+            row = load_measurement_result(manifest, 0)["distribution_rows"][0]
+            self.assertTrue(row["distribution_reviewed"])
+            self.assertTrue(row["distribution_included"])
+
+            set_distribution_review(
+                manifest,
+                project_path,
+                0,
+                1,
+                distribution_included=False,
+                invalid_spine=True,
+                note="manual invalidation",
+            )
+            invalid = accept_all_eligible_distribution_spines(
+                manifest, project_path
+            )
+            self.assertEqual(invalid["accepted_count"], 0)
+            self.assertEqual(invalid["invalid_count"], 1)
+            invalid_row = load_measurement_result(manifest, 0)["distribution_rows"][0]
+            self.assertFalse(invalid_row["spine_valid"])
+            self.assertFalse(invalid_row["distribution_included"])
+
+        with workspace_directory() as root:
+            manifest, project_path = self.make_project(root)
+            measure_project(manifest, project_path)
+            manifest["measurements"]["settings"].update(
+                {
+                    "spine_volume_filter_enabled": True,
+                    "spine_volume_filter_cutoff_um3": 1.0,
+                }
+            )
+            filtered = accept_all_eligible_distribution_spines(
+                manifest, project_path
+            )
+            self.assertEqual(filtered["accepted_count"], 0)
+            self.assertEqual(filtered["volume_filtered_count"], 1)
+            filtered_row = load_measurement_result(manifest, 0)["distribution_rows"][0]
+            self.assertFalse(filtered_row["distribution_reviewed"])
+
+            manifest["specimens"][0]["distribution_review"]["spines"].setdefault(
+                "1", {}
+            )["volume_filter_force_keep"] = True
+            force_kept = accept_all_eligible_distribution_spines(
+                manifest, project_path
+            )
+            self.assertEqual(force_kept["accepted_count"], 1)
+            self.assertEqual(force_kept["volume_filtered_count"], 0)
+            kept_row = load_measurement_result(manifest, 0)["distribution_rows"][0]
+            self.assertTrue(kept_row["distribution_reviewed"])
+            self.assertTrue(kept_row["distribution_included"])
 
     def test_fixed_and_adaptive_end_trimming(self) -> None:
         areas = np.zeros((8, 2), dtype=np.int64)

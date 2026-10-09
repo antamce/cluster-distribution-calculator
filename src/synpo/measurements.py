@@ -685,6 +685,114 @@ def set_distribution_review(
     return result
 
 
+def accept_all_eligible_distribution_spines(
+    manifest: dict[str, object],
+    project_path: str | Path,
+) -> dict[str, int]:
+    """Accept every valid, retained spine that has a usable distribution path.
+
+    Volume filtering remains reversible: eligibility is evaluated on filtered
+    copies, while only review decisions are written back to cached measurement
+    results.  Existing invalid-spine decisions and review notes are preserved.
+    """
+    counts = {
+        "measured_specimen_count": 0,
+        "eligible_count": 0,
+        "accepted_count": 0,
+        "already_accepted_count": 0,
+        "invalid_count": 0,
+        "volume_filtered_count": 0,
+        "unusable_path_count": 0,
+    }
+    changed = False
+    usable_statuses = {"ok", "insufficient_axis_resolution"}
+    for specimen_index, specimen in enumerate(manifest.get("specimens", [])):
+        checkpoint = specimen.get("checkpoints", {}).get("measurements", {})
+        if checkpoint.get("state") != "complete":
+            continue
+        counts["measured_specimen_count"] += 1
+        result = load_measurement_result(manifest, specimen_index)
+        filtered, _audit = filtered_measurement_result(manifest, specimen_index)
+        filtered_rows = {
+            int(row.get("spine_id") or 0): row
+            for row in filtered.get("distribution_rows", [])
+        }
+        raw_rows = {
+            int(row.get("spine_id") or 0): row
+            for row in result.get("distribution_rows", [])
+        }
+        eligible_ids: set[int] = set()
+        for spine_id, row in filtered_rows.items():
+            if bool(row.get("volume_filter_excluded", False)):
+                counts["volume_filtered_count"] += 1
+                continue
+            if not bool(row.get("spine_valid", True)):
+                counts["invalid_count"] += 1
+                continue
+            if str(row.get("distribution_axis_status", "")) not in usable_statuses:
+                counts["unusable_path_count"] += 1
+                continue
+            counts["eligible_count"] += 1
+            eligible_ids.add(spine_id)
+            raw = raw_rows.get(spine_id)
+            if raw is not None and bool(raw.get("distribution_reviewed", False)) and bool(
+                raw.get("distribution_included", False)
+            ):
+                counts["already_accepted_count"] += 1
+
+        if not eligible_ids:
+            continue
+        timestamp = time.time()
+        reviews = specimen.setdefault(
+            "distribution_review", {"spines": {}, "updated_at": None}
+        ).setdefault("spines", {})
+        for spine_id in eligible_ids:
+            decision = reviews.setdefault(str(spine_id), {})
+            decision.update(
+                {
+                    "reviewed": True,
+                    "distribution_reviewed": True,
+                    "validity_reviewed": True,
+                    "review_kind": "cluster_positive",
+                    "distribution_included": True,
+                    "invalid_spine": False,
+                    "updated_at": timestamp,
+                }
+            )
+            decision.setdefault(
+                "note", str(raw_rows.get(spine_id, {}).get("review_note", ""))
+            )
+            raw = raw_rows.get(spine_id)
+            if raw is not None:
+                raw.update(
+                    {
+                        "distribution_reviewed": True,
+                        "distribution_included": True,
+                        "spine_valid": True,
+                        "review_note": str(decision.get("note", "")),
+                    }
+                )
+        for row in result.get("spine_rows", []):
+            if int(row.get("spine_id") or 0) in eligible_ids:
+                row.update(
+                    {
+                        "spine_valid": True,
+                        "validity_reviewed": True,
+                        "review_kind": "cluster_positive",
+                    }
+                )
+        _refresh_result_summaries(result)
+        _write_result(measurement_result_path(manifest, specimen_index), result)
+        specimen["distribution_review"]["updated_at"] = timestamp
+        checkpoint["review_updated_at"] = timestamp
+        counts["accepted_count"] += len(eligible_ids)
+        changed = True
+
+    if changed:
+        save_project(project_path, manifest)
+    return counts
+
+
 def set_spine_quality_review(
     manifest: dict[str, object],
     project_path: str | Path,

@@ -3,7 +3,7 @@
 This document is the context-free continuation record for Synpo. Read it before
 changing code, publishing a release, or proposing the next stage. It describes the
 current approved behavior, scientific invariants, architecture, repository state,
-validation procedure, and remaining work as of 2026-10-06.
+validation procedure, and remaining work as of 2026-10-09.
 
 ## One-minute orientation
 
@@ -16,12 +16,12 @@ validation procedure, and remaining work as of 2026-10-06.
 - Dedicated Conda environment: `synpo-microscopy`. Never modify the user's separate
   environment named `synpo`.
 - Current development branch: `lsh`.
-- Current development release: `lsh` HEAD, titled `Add morphology analysis and
-  volume-filter workflows`.
+- Current development release: `lsh` HEAD, titled `Add feature correlation and
+  bulk distribution review`.
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
 - Current public beta commit: `aef5ce8e3324f6b8900289cfb62b0e4074e4ff4b`
   (`Add morphology analysis and spine filtering`).
-- Current full Windows result: 102 passed and 1 platform-specific test skipped.
+- Current full Windows result: 105 passed and 1 platform-specific test skipped.
   PowerShell and Bash syntax checks, Windows runtime resolution, Python 3.10 syntax
   parsing, and the offscreen application construction smoke test also passed.
   Conda dry-run resolution passed for Catalina `osx-64`, macOS 11 `osx-arm64`,
@@ -85,6 +85,15 @@ validation procedure, and remaining work as of 2026-10-06.
   diagnostics (no refit), annotates exact values, highlights accepted/rejected and
   selected candidates, and tabulates information criterion, silhouette, or the
   within-cluster-SSE elbow curve.
+- Tabs 6 and 7 also have a saved `Feature correlations` view. It computes a
+  listwise-complete spine-by-feature Pearson matrix from independently selected
+  morphology metrics, flags adjustable high-`|r|` pairs and same-source transforms,
+  and opens a neutral two-feature scatter when a cell is clicked. Pooled mode ignores
+  group labels; an optional group scope restricts rows for biological/QC comparison.
+  Styling includes preset or custom three-color maps, alpha, and hierarchical
+  ordering. Direct export supports SVG/PDF and 300/600/1200-DPI PNG; full analysis
+  exports add exact matrix/pair/settings tables and optional per-group matrices and
+  figures.
 - A seventh, separate advanced-clustering tab now keeps PCA as the default baseline
   while adding actual higher-dimensional UMAP and Gildenblat/Pahnke PCC/PCUMAP.
   The full 2-20D embedding is passed to GMM, Ward, or k-means; the 2D/3D plot uses
@@ -194,7 +203,7 @@ $env:PYTHONPATH = (Resolve-Path "src").Path
 conda run -n synpo-microscopy python -m pytest -q
 ```
 
-Current Windows baseline: `102 passed, 1 skipped` (the macOS Bash execution test is
+Current Windows baseline: `105 passed, 1 skipped` (the macOS Bash execution test is
 the expected skip). Also perform an offscreen application
 construction smoke test after material UI changes. The application title should
 contain `Synpo Microscopy Processor - Beta 0.8.0` (typographic dash may differ).
@@ -359,7 +368,7 @@ and optional registered flag follow them.
 - `src/synpo/exporting.py`: verified Excel/CSV exports and optional validation/audit
   PDF generation.
 - `src/synpo/cli.py`: non-GUI scan/inspection command.
-- `tests/`: 103-test development suite, including importer, project, preprocessing,
+- `tests/`: 106-test development suite, including importer, project, preprocessing,
   detection, diagnostics, review, measurement, 3D rendering, and beta UI regression
   coverage.
 
@@ -611,6 +620,10 @@ laptop. Treat these as historical guidance, not guaranteed performance.
 - Per-spine `volume_filter_force_keep` decisions live beside distribution-review
   decisions. They override only the volume rule; manual invalidity always wins.
   Changing the cutoff/overrides refreshes in-app summaries without remeasurement.
+- Stage 5 has a project-wide bulk acceptance checkbox for distribution review. It
+  checkpoints all valid, non-volume-filtered spines with usable paths, preserves
+  review notes/manual invalidations, and reports invalid, filtered, and pathless
+  skips separately.
 - Project exports omit volume-filtered spines from all primary/link tables and PDFs,
   recompute ROI/dendrite/specimen/group/profile statistics, and keep manual invalid
   and volume-filter-only audit rows separate. `Spine_Volume_Distribution` uses

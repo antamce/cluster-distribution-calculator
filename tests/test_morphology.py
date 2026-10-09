@@ -13,9 +13,11 @@ import numpy as np
 from synpo.morphology import (
     DEFAULT_FEATURES,
     MorphologyClusteringSettings,
+    draw_feature_correlation,
     draw_pca_3d_feature_axes,
     draw_pca_interpretation,
     export_morphology_analysis,
+    feature_correlation_data,
     load_morphology_rows_from_workbook,
     morphology_feature_value,
     pca_interpretation_data,
@@ -106,6 +108,50 @@ def test_protein_values_do_not_change_clusters() -> None:
     assert [row["morphology_cluster_id"] for row in first["assignments"]] == [
         row["morphology_cluster_id"] for row in second["assignments"]
     ]
+
+
+def test_feature_correlation_detects_redundancy_and_optional_group_subset() -> None:
+    result = run_morphology_clustering(
+        morphology_rows(), MorphologyClusteringSettings(fixed_cluster_count=2)
+    )
+    data = feature_correlation_data(
+        result,
+        ["linear_volume", "sqrt_volume", "curvilinear_length"],
+        threshold=0.8,
+    )
+    assert data["included_spine_count"] == 80
+    volume_pair = next(
+        row
+        for row in data["pairs"]
+        if {row["feature_1"], row["feature_2"]}
+        == {"linear_volume", "sqrt_volume"}
+    )
+    assert volume_pair["same_source_measurement"] is True
+    assert volume_pair["high_correlation"] is True
+    assert float(volume_pair["pearson_r"]) > 0.99
+
+    control = feature_correlation_data(
+        result,
+        ["linear_volume", "curvilinear_length"],
+        experimental_group="control",
+    )
+    assert control["included_spine_count"] == 40
+    assert control["experimental_group"] == "control"
+
+    figure = Figure(figsize=(10, 6))
+    plotted = draw_feature_correlation(
+        figure,
+        result,
+        features=["linear_volume", "sqrt_volume", "curvilinear_length"],
+        colormap="custom",
+        negative_color="#0011aa",
+        zero_color="#eeeeee",
+        positive_color="#aa1100",
+        scatter_pair=("linear_volume", "sqrt_volume"),
+    )
+    assert plotted["included_spine_count"] == 80
+    assert len(figure.axes) >= 3
+    assert any(axis.get_title().startswith("Selected pair") for axis in figure.axes)
 
 
 @pytest.mark.parametrize("selection", ["silhouette", "elbow"])
@@ -286,6 +332,12 @@ def test_export_and_standalone_workbook_round_trip() -> None:
                     "legend_position": "outside_bottom",
                     "custom_x_feature": "maximum_width",
                     "custom_y_feature": "elongation",
+                    "correlation_features": [
+                        "linear_volume",
+                        "curvilinear_length",
+                    ],
+                    "correlation_scope": "__pooled__",
+                    "correlation_export_group_matrices": True,
                 },
             }
         )
@@ -299,9 +351,19 @@ def test_export_and_standalone_workbook_round_trip() -> None:
         ).is_file()
         assert (Path(output["plot_directory"]) / "pca_interpretation.svg").is_file()
         assert (Path(output["plot_directory"]) / "pca_3d_feature_axes.svg").is_file()
+        assert (Path(output["plot_directory"]) / "feature_correlation_matrix.svg").is_file()
+        assert (Path(output["plot_directory"]) / "feature_correlation_control.svg").is_file()
+        assert (Path(output["plot_directory"]) / "feature_correlation_treated.svg").is_file()
         loaded = load_morphology_rows_from_workbook(output["workbook"])
         assert len(loaded) == 80
         workbook = load_workbook(output["workbook"], read_only=True, data_only=True)
+        assert "Feature_Correlation" in workbook.sheetnames
+        assert "Feature_Corr_Pairs" in workbook.sheetnames
+        assert "Feature_Corr_Settings" in workbook.sheetnames
+        group_correlation_rows = list(
+            workbook["Feature_Corr_By_Group"].iter_rows(values_only=True)
+        )
+        assert len(group_correlation_rows) > 2
         settings_rows = list(workbook["Morphology_Cluster_Settings"].iter_rows(values_only=True))
         equation_rows = list(workbook["PCA_Equations"].iter_rows(values_only=True))
         preparation_rows = list(

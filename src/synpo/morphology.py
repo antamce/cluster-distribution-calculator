@@ -14,7 +14,8 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
-from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
+from scipy.spatial.distance import squareform
 from scipy.special import logsumexp
 
 from .measurements import filtered_measurement_result
@@ -65,6 +66,16 @@ DEFAULT_PLOT_STYLE = {
     "custom_y_feature": "",
     "pca_show_points": True,
     "pca_point_alpha": 0.68,
+    "correlation_features": list(DEFAULT_FEATURES),
+    "correlation_scope": "__pooled__",
+    "correlation_threshold": 0.80,
+    "correlation_colormap": "coolwarm",
+    "correlation_negative_color": "#2166ac",
+    "correlation_zero_color": "#f7f7f7",
+    "correlation_positive_color": "#b2182b",
+    "correlation_alpha": 1.0,
+    "correlation_reorder": False,
+    "correlation_export_group_matrices": False,
 }
 
 
@@ -314,6 +325,260 @@ def _feature_expression(feature: str) -> str:
     if feature == "sqrt_volume":
         return f"sqrt({column})"
     return column
+
+
+def feature_correlation_data(
+    result: dict[str, object],
+    features: list[str] | tuple[str, ...],
+    *,
+    experimental_group: str | None = None,
+    threshold: float = 0.80,
+    reorder: bool = False,
+) -> dict[str, object]:
+    """Calculate a listwise-complete Pearson matrix across spine features.
+
+    Experimental groups can optionally select a subset of spines, but group labels
+    never enter the correlation calculation itself.
+    """
+    selected = list(dict.fromkeys(str(feature) for feature in features))
+    unknown = [feature for feature in selected if feature not in MORPHOLOGY_FEATURES]
+    if unknown:
+        raise ValueError("Unknown correlation feature(s): " + ", ".join(unknown))
+    if len(selected) < 2:
+        raise ValueError("Select at least two metrics for the correlation matrix.")
+    threshold = min(1.0, max(0.0, float(threshold)))
+    rows = [
+        dict(row)
+        for row in result.get("assignments", [])
+        if experimental_group is None
+        or str(row.get("experimental_group", "")) == experimental_group
+    ]
+    complete_rows: list[dict[str, object]] = []
+    vectors: list[list[float]] = []
+    for row in rows:
+        values = [morphology_feature_value(row, feature) for feature in selected]
+        if all(value is not None for value in values):
+            complete_rows.append(row)
+            vectors.append([float(value) for value in values if value is not None])
+    if len(complete_rows) < 3:
+        scope = (
+            f"experimental group {experimental_group!r}"
+            if experimental_group is not None
+            else "the pooled analysis population"
+        )
+        raise ValueError(
+            f"Pearson correlation requires at least three listwise-complete spines; "
+            f"{scope} has {len(complete_rows)}."
+        )
+    matrix_values = np.asarray(vectors, dtype=np.float64)
+    standard_deviations = np.std(matrix_values, axis=0, ddof=1)
+    correlation = np.full((len(selected), len(selected)), np.nan, dtype=np.float64)
+    variable = standard_deviations > 1e-12
+    if np.count_nonzero(variable):
+        variable_values = matrix_values[:, variable]
+        variable_correlation = np.atleast_2d(np.corrcoef(variable_values, rowvar=False))
+        variable_indices = np.flatnonzero(variable)
+        for local_row, matrix_row in enumerate(variable_indices):
+            for local_column, matrix_column in enumerate(variable_indices):
+                correlation[matrix_row, matrix_column] = float(
+                    variable_correlation[local_row, local_column]
+                )
+
+    if reorder and len(selected) > 2:
+        distance = 1.0 - np.abs(np.nan_to_num(correlation, nan=0.0))
+        np.fill_diagonal(distance, 0.0)
+        distance = np.clip((distance + distance.T) / 2.0, 0.0, 1.0)
+        order = list(
+            int(value)
+            for value in leaves_list(
+                linkage(squareform(distance, checks=False), method="average")
+            )
+        )
+        selected = [selected[index] for index in order]
+        matrix_values = matrix_values[:, order]
+        standard_deviations = standard_deviations[order]
+        correlation = correlation[np.ix_(order, order)]
+
+    pairs: list[dict[str, object]] = []
+    for row_index, first in enumerate(selected):
+        for column_index in range(row_index + 1, len(selected)):
+            second = selected[column_index]
+            value = correlation[row_index, column_index]
+            same_source = MORPHOLOGY_FEATURES[first][1] == MORPHOLOGY_FEATURES[second][1]
+            high_correlation = bool(np.isfinite(value) and abs(float(value)) >= threshold)
+            pairs.append(
+                {
+                    "feature_1": first,
+                    "feature_1_label": MORPHOLOGY_FEATURES[first][0],
+                    "feature_2": second,
+                    "feature_2_label": MORPHOLOGY_FEATURES[second][0],
+                    "pearson_r": float(value) if np.isfinite(value) else None,
+                    "absolute_pearson_r": abs(float(value)) if np.isfinite(value) else None,
+                    "high_correlation": high_correlation,
+                    "same_source_measurement": same_source,
+                    "warning": (
+                        "same source measurement and high absolute correlation"
+                        if same_source and high_correlation
+                        else "same source measurement"
+                        if same_source
+                        else "high absolute correlation"
+                        if high_correlation
+                        else ""
+                    ),
+                }
+            )
+    return {
+        "features": selected,
+        "feature_labels": [MORPHOLOGY_FEATURES[feature][0] for feature in selected],
+        "feature_sources": [MORPHOLOGY_FEATURES[feature][1] for feature in selected],
+        "matrix": [
+            [float(value) if np.isfinite(value) else None for value in row]
+            for row in correlation
+        ],
+        "values_by_feature": {
+            feature: [float(value) for value in matrix_values[:, index]]
+            for index, feature in enumerate(selected)
+        },
+        "pairs": pairs,
+        "included_spine_count": len(complete_rows),
+        "candidate_spine_count": len(rows),
+        "missing_spine_count": len(rows) - len(complete_rows),
+        "experimental_group": experimental_group,
+        "threshold": threshold,
+        "reordered": bool(reorder),
+        "constant_features": [
+            feature
+            for feature, spread in zip(selected, standard_deviations)
+            if spread <= 1e-12
+        ],
+    }
+
+
+def draw_feature_correlation(
+    figure: object,
+    result: dict[str, object],
+    *,
+    features: list[str] | tuple[str, ...],
+    experimental_group: str | None = None,
+    threshold: float = 0.80,
+    reorder: bool = False,
+    colormap: str = "coolwarm",
+    negative_color: str = "#2166ac",
+    zero_color: str = "#f7f7f7",
+    positive_color: str = "#b2182b",
+    alpha: float = 1.0,
+    scatter_pair: tuple[str, str] | None = None,
+) -> dict[str, object]:
+    """Draw an annotated Pearson heatmap and optional selected-pair scatter."""
+    from matplotlib import colormaps
+    from matplotlib.colors import LinearSegmentedColormap
+
+    data = feature_correlation_data(
+        result,
+        features,
+        experimental_group=experimental_group,
+        threshold=threshold,
+        reorder=reorder,
+    )
+    figure.clear()
+    show_scatter = bool(
+        scatter_pair
+        and scatter_pair[0] in data["features"]
+        and scatter_pair[1] in data["features"]
+    )
+    grid = figure.add_gridspec(1, 2, width_ratios=(1.5, 1.0)) if show_scatter else None
+    axis = figure.add_subplot(grid[0, 0] if grid is not None else 111)
+    if colormap == "custom":
+        cmap = LinearSegmentedColormap.from_list(
+            "synpo_custom_correlation",
+            [negative_color, zero_color, positive_color],
+        )
+    else:
+        try:
+            cmap = colormaps.get_cmap(colormap).copy()
+        except ValueError:
+            cmap = colormaps.get_cmap("coolwarm").copy()
+    cmap.set_bad("#bdbdbd")
+    matrix = np.asarray(
+        [
+            [np.nan if value is None else float(value) for value in row]
+            for row in data["matrix"]
+        ],
+        dtype=np.float64,
+    )
+    image = axis.imshow(
+        np.ma.masked_invalid(matrix),
+        cmap=cmap,
+        vmin=-1.0,
+        vmax=1.0,
+        alpha=min(1.0, max(0.0, float(alpha))),
+        aspect="equal",
+    )
+    labels = list(data["feature_labels"])
+    axis.set_xticks(np.arange(len(labels)), labels, rotation=42, ha="right")
+    axis.set_yticks(np.arange(len(labels)), labels)
+    pair_lookup = {
+        frozenset((str(row["feature_1"]), str(row["feature_2"]))): row
+        for row in data["pairs"]
+    }
+    selected_features = list(data["features"])
+    for row_index, first in enumerate(selected_features):
+        for column_index, second in enumerate(selected_features):
+            value = matrix[row_index, column_index]
+            if not np.isfinite(value):
+                text_value = "N/A"
+                flagged = False
+                same_source = False
+            else:
+                pair = pair_lookup.get(frozenset((first, second)), {})
+                flagged = bool(pair.get("high_correlation", False))
+                same_source = bool(pair.get("same_source_measurement", False))
+                text_value = f"{value:.2f}" + ("†" if same_source else "")
+            axis.text(
+                column_index,
+                row_index,
+                text_value,
+                ha="center",
+                va="center",
+                fontsize=8,
+                fontweight="bold" if flagged or same_source else "normal",
+                color="white" if np.isfinite(value) and abs(value) >= 0.58 else "black",
+            )
+    scope = (
+        f"group: {experimental_group or '(blank)'}"
+        if experimental_group is not None
+        else "all included spines"
+    )
+    axis.set_title(
+        f"Pearson correlation of morphology metrics ({scope}, n={data['included_spine_count']})"
+    )
+    figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04, label="Pearson r")
+    if show_scatter and grid is not None and scatter_pair is not None:
+        scatter_axis = figure.add_subplot(grid[0, 1])
+        first, second = scatter_pair
+        x_values = list(data["values_by_feature"][first])
+        y_values = list(data["values_by_feature"][second])
+        scatter_axis.scatter(x_values, y_values, s=18, alpha=0.58, color="#356b8c")
+        first_index = selected_features.index(first)
+        second_index = selected_features.index(second)
+        value = matrix[first_index, second_index]
+        scatter_axis.set(
+            xlabel=MORPHOLOGY_FEATURES[first][0],
+            ylabel=MORPHOLOGY_FEATURES[second][0],
+            title=(
+                f"Selected pair\nPearson r = {value:.4f}"
+                if np.isfinite(value)
+                else "Selected pair\nPearson r is undefined"
+            ),
+        )
+        scatter_axis.grid(alpha=0.2)
+    figure.text(
+        0.01,
+        0.01,
+        "Bold values meet the warning threshold; † marks features derived from the same source measurement.",
+        fontsize=8,
+    )
+    return data
 
 
 def pca_interpretation_data(result: dict[str, object]) -> dict[str, object]:
@@ -1984,6 +2249,39 @@ def update_run_plot_style(
         "pca_point_alpha": min(
             1.0, max(0.0, float(plot_style.get("pca_point_alpha", 0.68)))
         ),
+        "correlation_features": [
+            str(feature)
+            for feature in plot_style.get("correlation_features", DEFAULT_FEATURES)
+            if str(feature) in MORPHOLOGY_FEATURES
+        ],
+        "correlation_scope": str(
+            plot_style.get("correlation_scope", "__pooled__")
+        ),
+        "correlation_threshold": min(
+            1.0,
+            max(0.0, float(plot_style.get("correlation_threshold", 0.80))),
+        ),
+        "correlation_colormap": str(
+            plot_style.get("correlation_colormap", "coolwarm")
+        ),
+        "correlation_negative_color": str(
+            plot_style.get("correlation_negative_color", "#2166ac")
+        ),
+        "correlation_zero_color": str(
+            plot_style.get("correlation_zero_color", "#f7f7f7")
+        ),
+        "correlation_positive_color": str(
+            plot_style.get("correlation_positive_color", "#b2182b")
+        ),
+        "correlation_alpha": min(
+            1.0, max(0.0, float(plot_style.get("correlation_alpha", 1.0)))
+        ),
+        "correlation_reorder": bool(
+            plot_style.get("correlation_reorder", False)
+        ),
+        "correlation_export_group_matrices": bool(
+            plot_style.get("correlation_export_group_matrices", False)
+        ),
     }
     path = morphology_run_path(manifest, run_id)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -2078,6 +2376,100 @@ def export_morphology_analysis(
         }
         for row in interpretation.get("components", [])
     ]
+    correlation_style = {
+        **DEFAULT_PLOT_STYLE,
+        **dict(result.get("plot_style", {})),
+    }
+    correlation_features = [
+        str(feature)
+        for feature in correlation_style.get(
+            "correlation_features", DEFAULT_FEATURES
+        )
+        if str(feature) in MORPHOLOGY_FEATURES
+    ]
+    if len(correlation_features) < 2:
+        correlation_features = list(DEFAULT_FEATURES)
+    correlation_scope = str(
+        correlation_style.get("correlation_scope", "__pooled__")
+    )
+    correlation_group = None if correlation_scope == "__pooled__" else correlation_scope
+    correlation_threshold = float(
+        correlation_style.get("correlation_threshold", 0.80)
+    )
+    correlation_error = ""
+    correlation_data: dict[str, object] | None = None
+    try:
+        correlation_data = feature_correlation_data(
+            result,
+            correlation_features,
+            experimental_group=correlation_group,
+            threshold=correlation_threshold,
+            reorder=bool(correlation_style.get("correlation_reorder", False)),
+        )
+    except ValueError as exc:
+        correlation_error = str(exc)
+
+    def correlation_matrix_rows(
+        data: dict[str, object], group: str | None
+    ) -> list[dict[str, object]]:
+        feature_keys = list(data["features"])
+        feature_labels = list(data["feature_labels"])
+        matrix_rows: list[dict[str, object]] = []
+        for row_index, feature in enumerate(feature_keys):
+            matrix_rows.append(
+                {
+                    "experimental_group": group if group is not None else "__pooled__",
+                    "feature": feature,
+                    "feature_label": feature_labels[row_index],
+                    **{
+                        column_feature: data["matrix"][row_index][column_index]
+                        for column_index, column_feature in enumerate(feature_keys)
+                    },
+                }
+            )
+        return matrix_rows
+
+    correlation_matrix_table = (
+        correlation_matrix_rows(correlation_data, correlation_group)
+        if correlation_data is not None
+        else []
+    )
+    correlation_pair_table = (
+        [
+            {
+                "experimental_group": (
+                    correlation_group
+                    if correlation_group is not None
+                    else "__pooled__"
+                ),
+                "included_spine_count": correlation_data["included_spine_count"],
+                **dict(row),
+            }
+            for row in correlation_data["pairs"]
+        ]
+        if correlation_data is not None
+        else []
+    )
+    correlation_group_table: list[dict[str, object]] = []
+    correlation_group_data: list[tuple[str, dict[str, object]]] = []
+    if bool(correlation_style.get("correlation_export_group_matrices", False)):
+        for group in sorted(
+            {str(row.get("experimental_group", "")) for row in result.get("assignments", [])}
+        ):
+            try:
+                group_data = feature_correlation_data(
+                    result,
+                    correlation_features,
+                    experimental_group=group,
+                    threshold=correlation_threshold,
+                    reorder=bool(correlation_style.get("correlation_reorder", False)),
+                )
+            except ValueError:
+                continue
+            correlation_group_data.append((group, group_data))
+            correlation_group_table.extend(
+                correlation_matrix_rows(group_data, group)
+            )
     tables = {
         "Spine_Morphology": list(result.get("assignments", [])),
         "Spine_Cluster_Assignments": [
@@ -2111,6 +2503,34 @@ def export_morphology_analysis(
         "Embedding_Diagnostics": [dict(result.get("embedding_metadata", {}))],
         "Embedding_Stability": [dict(result.get("embedding_stability", {}))],
         "Plot_Data": plot_rows,
+        "Feature_Correlation": correlation_matrix_table,
+        "Feature_Corr_Pairs": correlation_pair_table,
+        "Feature_Corr_Settings": [
+            {
+                "features": correlation_features,
+                "scope": correlation_scope,
+                "pearson_threshold": correlation_threshold,
+                "listwise_complete": True,
+                "included_spine_count": (
+                    correlation_data.get("included_spine_count")
+                    if correlation_data is not None
+                    else 0
+                ),
+                "missing_spine_count": (
+                    correlation_data.get("missing_spine_count")
+                    if correlation_data is not None
+                    else None
+                ),
+                "reordered_by_absolute_correlation": bool(
+                    correlation_style.get("correlation_reorder", False)
+                ),
+                "export_group_matrices": bool(
+                    correlation_style.get("correlation_export_group_matrices", False)
+                ),
+                "error": correlation_error,
+            }
+        ],
+        "Feature_Corr_By_Group": correlation_group_table,
     }
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -2245,6 +2665,52 @@ def export_morphology_analysis(
         figure = plt.figure(figsize=(10, 8))
         draw_pca_3d_feature_axes(figure, result)
         figures.append(("pca_3d_feature_axes", figure))
+
+    if correlation_data is not None:
+        figure = plt.figure(
+            figsize=(
+                max(8.0, len(correlation_features) * 0.85),
+                max(7.0, len(correlation_features) * 0.72),
+            )
+        )
+        draw_feature_correlation(
+            figure,
+            result,
+            features=correlation_features,
+            experimental_group=correlation_group,
+            threshold=correlation_threshold,
+            reorder=bool(correlation_style.get("correlation_reorder", False)),
+            colormap=str(correlation_style.get("correlation_colormap", "coolwarm")),
+            negative_color=str(correlation_style.get("correlation_negative_color", "#2166ac")),
+            zero_color=str(correlation_style.get("correlation_zero_color", "#f7f7f7")),
+            positive_color=str(correlation_style.get("correlation_positive_color", "#b2182b")),
+            alpha=float(correlation_style.get("correlation_alpha", 1.0)),
+        )
+        figures.append(("feature_correlation_matrix", figure))
+    for group, _group_data in correlation_group_data:
+        figure = plt.figure(
+            figsize=(
+                max(8.0, len(correlation_features) * 0.85),
+                max(7.0, len(correlation_features) * 0.72),
+            )
+        )
+        draw_feature_correlation(
+            figure,
+            result,
+            features=correlation_features,
+            experimental_group=group,
+            threshold=correlation_threshold,
+            reorder=bool(correlation_style.get("correlation_reorder", False)),
+            colormap=str(correlation_style.get("correlation_colormap", "coolwarm")),
+            negative_color=str(correlation_style.get("correlation_negative_color", "#2166ac")),
+            zero_color=str(correlation_style.get("correlation_zero_color", "#f7f7f7")),
+            positive_color=str(correlation_style.get("correlation_positive_color", "#b2182b")),
+            alpha=float(correlation_style.get("correlation_alpha", 1.0)),
+        )
+        safe_group = "".join(
+            character if character.isalnum() else "_" for character in group
+        ).strip("_") or "blank"
+        figures.append((f"feature_correlation_{safe_group[:48]}", figure))
 
     cluster_ids = sorted(colors)
     figure, axis = plt.subplots(figsize=(8, 6))

@@ -385,6 +385,11 @@ spines within each specimen, then average specimen means by experimental group;
 the screen shows SEM across specimen means. Line profiles are the default, with a
 bar-chart switch and automatic or fixed 0–1 scaling.
 
+Check **Accept all eligible spines in all measured specimens** to checkpoint every
+valid, non-volume-filtered spine with a usable distribution path at once. Manual
+invalidations and review notes are preserved; filtered or pathless spines are
+reported as skipped.
+
 The cropped spine viewer normally remains an XY maximum projection and requires no
 manual correction. If the automatic distal endpoint is wrong, press **Centerline
 end hint**. The same panel switches to an exact Z-slice viewer with a slider limited
@@ -485,6 +490,27 @@ score against the candidate cluster count, prints each exact score beside its po
 marks rejected candidates and the selected solution, and provides an exact-value
 table. The panel can switch among information criterion, silhouette, and the raw
 within-cluster-SSE elbow curve without rerunning the analysis.
+
+Both tabs also include a **Feature correlations** panel for screening redundant
+clustering inputs. Its metric checklist is independent of the clustering checklist,
+with a button to copy the current clustering selection. Synpo calculates a
+listwise-complete spine-by-feature Pearson matrix across the run's included spines;
+experimental-group labels do not enter the pooled calculation. A scope selector can
+optionally restrict the same calculation to one group for biological or correction-
+consistency checks. Exact coefficients are printed in the heatmap, constant metrics
+are shown as undefined, and an adjustable `|r|` threshold flags strongly correlated
+pairs without removing them. Features derived from the same source measurement,
+including linear/log/square-root volume, receive a separate warning even when their
+Pearson coefficient is below the threshold. Clicking a cell adds the corresponding
+two-feature scatter plot.
+
+Correlation matrices support hierarchical feature ordering, preset diverging and
+grayscale colormaps, custom negative/zero/positive colors, and heatmap alpha. The
+current figure can be exported directly as SVG, PDF, or 300/600/1200-DPI PNG. Full
+analysis packages add `Feature_Correlation`, `Feature_Corr_Pairs`, and
+`Feature_Corr_Settings` workbook/CSV tables plus vector PDF/SVG and 600-DPI PNG
+figures. An optional setting also exports one matrix and figure per experimental
+group; group membership only selects rows and is never treated as a feature.
 
 **Cluster geometry-reviewed spines only** switches a named run between every
 otherwise valid spine and only spines explicitly marked **Geometry checked**.

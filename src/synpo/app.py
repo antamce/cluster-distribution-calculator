@@ -118,6 +118,7 @@ from .measurements import (
     SpineReviewPreview,
     MeasurementSettings,
     MorphologyPreview,
+    accept_all_eligible_distribution_spines,
     apply_morphology_review_edit,
     cluster_end_comparison_rows,
     clear_centerline_endpoint_hint,
@@ -148,10 +149,12 @@ from .morphology import (
     MorphologyClusteringSettings,
     draw_pca_3d_feature_axes,
     draw_pca_interpretation,
+    draw_feature_correlation,
     draw_protein_puncta_volume,
     export_morphology_analysis,
     load_morphology_run,
     morphology_feature_value,
+    feature_correlation_data,
     run_morphology_clustering_from_workbook,
     save_named_morphology_run,
     update_run_colors,
@@ -1698,6 +1701,426 @@ class ClusterCountScorePanel(QWidget):
             "gray crosses failed the configured minimum cluster-size rule."
         )
         self.canvas.draw_idle()
+
+
+class CorrelationMatrixPanel(QWidget):
+    """Interactive Pearson feature-redundancy matrix for a saved analysis run."""
+
+    settings_changed = Signal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._result: dict[str, object] | None = None
+        self._result_identity: int | None = None
+        self._data: dict[str, object] | None = None
+        self._matrix_axis: object | None = None
+        self._selected_pair: tuple[str, str] | None = None
+        self._negative_color = QColor("#2166ac")
+        self._zero_color = QColor("#f7f7f7")
+        self._positive_color = QColor("#b2182b")
+
+        layout = QVBoxLayout(self)
+        feature_group = QGroupBox("Metrics included in this matrix")
+        feature_layout = QGridLayout(feature_group)
+        self.feature_checks: dict[str, QCheckBox] = {}
+        for index, (feature, (label, _column)) in enumerate(
+            MORPHOLOGY_FEATURES.items()
+        ):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(feature in DEFAULT_FEATURES)
+            self.feature_checks[feature] = checkbox
+            feature_layout.addWidget(checkbox, index // 3, index % 3)
+        layout.addWidget(feature_group)
+
+        selection_row = QHBoxLayout()
+        copy_button = QPushButton("Copy clustering metrics")
+        copy_button.clicked.connect(self._copy_clustering_features)
+        selection_row.addWidget(copy_button)
+        select_all_button = QPushButton("Select all")
+        select_all_button.clicked.connect(
+            lambda: self._set_all_features(True)
+        )
+        selection_row.addWidget(select_all_button)
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(lambda: self._set_all_features(False))
+        selection_row.addWidget(clear_button)
+        selection_row.addStretch(1)
+        layout.addLayout(selection_row)
+
+        options = QGridLayout()
+        options.addWidget(QLabel("Spine population:"), 0, 0)
+        self.scope = QComboBox()
+        self.scope.setToolTip(
+            "Pooled ignores group labels. Choosing one group simply restricts the "
+            "spines included in the same feature-to-feature Pearson calculation."
+        )
+        options.addWidget(self.scope, 0, 1)
+        options.addWidget(QLabel("Flag |r| at or above:"), 0, 2)
+        self.threshold = QDoubleSpinBox()
+        self.threshold.setRange(0.0, 1.0)
+        self.threshold.setDecimals(2)
+        self.threshold.setSingleStep(0.05)
+        self.threshold.setValue(0.80)
+        options.addWidget(self.threshold, 0, 3)
+        self.reorder = QCheckBox("Group similar metrics")
+        self.reorder.setToolTip(
+            "Hierarchically reorder metrics by absolute Pearson correlation."
+        )
+        options.addWidget(self.reorder, 1, 0, 1, 2)
+        self.export_groups = QCheckBox(
+            "Include one matrix per experimental group in full export"
+        )
+        options.addWidget(self.export_groups, 1, 2, 1, 2)
+
+        options.addWidget(QLabel("Colormap:"), 2, 0)
+        self.colormap = QComboBox()
+        for label, value in (
+            ("Coolwarm", "coolwarm"),
+            ("Red / blue", "RdBu_r"),
+            ("Purple / orange", "PuOr"),
+            ("Brown / blue-green", "BrBG"),
+            ("Pink / green", "PiYG"),
+            ("Grayscale", "Greys"),
+            ("Custom three-color", "custom"),
+        ):
+            self.colormap.addItem(label, value)
+        self.colormap.currentIndexChanged.connect(self._colormap_changed)
+        options.addWidget(self.colormap, 2, 1)
+        options.addWidget(QLabel("Heatmap alpha:"), 2, 2)
+        self.alpha = QDoubleSpinBox()
+        self.alpha.setRange(0.0, 1.0)
+        self.alpha.setDecimals(2)
+        self.alpha.setSingleStep(0.05)
+        self.alpha.setValue(1.0)
+        options.addWidget(self.alpha, 2, 3)
+
+        custom_colors = QHBoxLayout()
+        self.negative_color_button = QPushButton("Negative color…")
+        self.negative_color_button.clicked.connect(
+            lambda: self._choose_color("negative")
+        )
+        custom_colors.addWidget(self.negative_color_button)
+        self.zero_color_button = QPushButton("Zero color…")
+        self.zero_color_button.clicked.connect(
+            lambda: self._choose_color("zero")
+        )
+        custom_colors.addWidget(self.zero_color_button)
+        self.positive_color_button = QPushButton("Positive color…")
+        self.positive_color_button.clicked.connect(
+            lambda: self._choose_color("positive")
+        )
+        custom_colors.addWidget(self.positive_color_button)
+        custom_colors.addStretch(1)
+        custom_widget = QWidget()
+        custom_widget.setLayout(custom_colors)
+        options.addWidget(custom_widget, 3, 0, 1, 4)
+        layout.addLayout(options)
+
+        action_row = QHBoxLayout()
+        update_button = QPushButton("Update matrix")
+        update_button.clicked.connect(self._apply_and_render)
+        action_row.addWidget(update_button)
+        action_row.addStretch(1)
+        action_row.addWidget(QLabel("Export format:"))
+        self.export_format = QComboBox()
+        self.export_format.addItem("SVG (vector)", "svg")
+        self.export_format.addItem("PDF (vector)", "pdf")
+        self.export_format.addItem("PNG", "png")
+        action_row.addWidget(self.export_format)
+        action_row.addWidget(QLabel("PNG DPI:"))
+        self.export_dpi = QComboBox()
+        for dpi in (300, 600, 1200):
+            self.export_dpi.addItem(str(dpi), dpi)
+        self.export_dpi.setCurrentIndex(1)
+        action_row.addWidget(self.export_dpi)
+        export_button = QPushButton("Export correlation figure…")
+        export_button.clicked.connect(self._export_figure)
+        action_row.addWidget(export_button)
+        layout.addLayout(action_row)
+
+        self.summary = QLabel(
+            "Run or load a clustering analysis to inspect feature redundancy."
+        )
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.figure = Figure(figsize=(9.5, 6.2), tight_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setMinimumSize(560, 390)
+        self.canvas.mpl_connect("button_press_event", self._matrix_clicked)
+        layout.addWidget(self.canvas, 1)
+        self._refresh_color_buttons()
+        self._colormap_changed()
+
+    def show_run(self, result: dict[str, object]) -> None:
+        is_new_result = id(result) != self._result_identity
+        self._result = result
+        self._result_identity = id(result)
+        if is_new_result:
+            style = {
+                **DEFAULT_PLOT_STYLE,
+                **dict(result.get("plot_style", {})),
+            }
+            controls = (
+                self.scope,
+                self.threshold,
+                self.reorder,
+                self.export_groups,
+                self.colormap,
+                self.alpha,
+            )
+            for control in controls:
+                control.blockSignals(True)
+            groups = sorted(
+                {
+                    str(row.get("experimental_group", ""))
+                    for row in result.get("assignments", [])
+                }
+            )
+            self.scope.clear()
+            self.scope.addItem("All included spines (pooled)", "__pooled__")
+            for group in groups:
+                self.scope.addItem(group or "(blank group)", group)
+            scope_index = self.scope.findData(
+                str(style.get("correlation_scope", "__pooled__"))
+            )
+            self.scope.setCurrentIndex(max(0, scope_index))
+            selected = {
+                str(feature)
+                for feature in style.get(
+                    "correlation_features", DEFAULT_FEATURES
+                )
+            }
+            for feature, checkbox in self.feature_checks.items():
+                checkbox.setChecked(feature in selected)
+            self.threshold.setValue(float(style["correlation_threshold"]))
+            self.reorder.setChecked(bool(style["correlation_reorder"]))
+            self.export_groups.setChecked(
+                bool(style["correlation_export_group_matrices"])
+            )
+            self.colormap.setCurrentIndex(
+                max(
+                    0,
+                    self.colormap.findData(str(style["correlation_colormap"])),
+                )
+            )
+            self.alpha.setValue(float(style["correlation_alpha"]))
+            self._negative_color = QColor(
+                str(style["correlation_negative_color"])
+            )
+            self._zero_color = QColor(str(style["correlation_zero_color"]))
+            self._positive_color = QColor(
+                str(style["correlation_positive_color"])
+            )
+            for control in controls:
+                control.blockSignals(False)
+            self._selected_pair = None
+            self._refresh_color_buttons()
+            self._colormap_changed()
+        self._render()
+
+    def settings(self) -> dict[str, object]:
+        scope_data = self.scope.currentData()
+        return {
+            "correlation_features": [
+                feature
+                for feature, checkbox in self.feature_checks.items()
+                if checkbox.isChecked()
+            ],
+            "correlation_scope": (
+                "__pooled__" if scope_data is None else str(scope_data)
+            ),
+            "correlation_threshold": self.threshold.value(),
+            "correlation_colormap": str(self.colormap.currentData() or "coolwarm"),
+            "correlation_negative_color": self._negative_color.name(),
+            "correlation_zero_color": self._zero_color.name(),
+            "correlation_positive_color": self._positive_color.name(),
+            "correlation_alpha": self.alpha.value(),
+            "correlation_reorder": self.reorder.isChecked(),
+            "correlation_export_group_matrices": self.export_groups.isChecked(),
+        }
+
+    def _set_all_features(self, selected: bool) -> None:
+        for checkbox in self.feature_checks.values():
+            checkbox.setChecked(selected)
+
+    def _copy_clustering_features(self) -> None:
+        if self._result is None:
+            return
+        selected = {
+            str(feature)
+            for feature in dict(self._result.get("settings", {})).get(
+                "features", []
+            )
+        }
+        for feature, checkbox in self.feature_checks.items():
+            checkbox.setChecked(feature in selected)
+
+    def _choose_color(self, target: str) -> None:
+        current = {
+            "negative": self._negative_color,
+            "zero": self._zero_color,
+            "positive": self._positive_color,
+        }[target]
+        chosen = QColorDialog.getColor(current, self, f"Choose {target} correlation color")
+        if not chosen.isValid():
+            return
+        if target == "negative":
+            self._negative_color = chosen
+        elif target == "zero":
+            self._zero_color = chosen
+        else:
+            self._positive_color = chosen
+        self._refresh_color_buttons()
+        self.colormap.setCurrentIndex(self.colormap.findData("custom"))
+
+    def _refresh_color_buttons(self) -> None:
+        for button, color in (
+            (self.negative_color_button, self._negative_color),
+            (self.zero_color_button, self._zero_color),
+            (self.positive_color_button, self._positive_color),
+        ):
+            button.setStyleSheet(f"background-color: {color.name()};")
+
+    def _colormap_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        enabled = self.colormap.currentData() == "custom"
+        self.negative_color_button.setEnabled(enabled)
+        self.zero_color_button.setEnabled(enabled)
+        self.positive_color_button.setEnabled(enabled)
+
+    def _current_features(self) -> list[str]:
+        return [
+            feature
+            for feature, checkbox in self.feature_checks.items()
+            if checkbox.isChecked()
+        ]
+
+    def _apply_and_render(self) -> None:
+        if len(self._current_features()) < 2:
+            QMessageBox.warning(
+                self,
+                "Cannot calculate correlation matrix",
+                "Select at least two metrics.",
+            )
+            return
+        self._selected_pair = None
+        if self._render():
+            self.settings_changed.emit(self.settings())
+
+    def _render(self) -> bool:
+        self.figure.clear()
+        self._matrix_axis = None
+        self._data = None
+        if self._result is None:
+            self.canvas.draw_idle()
+            return False
+        scope_data = self.scope.currentData()
+        scope = "__pooled__" if scope_data is None else str(scope_data)
+        group = None if scope == "__pooled__" else scope
+        try:
+            self._data = draw_feature_correlation(
+                self.figure,
+                self._result,
+                features=self._current_features(),
+                experimental_group=group,
+                threshold=self.threshold.value(),
+                reorder=self.reorder.isChecked(),
+                colormap=str(self.colormap.currentData() or "coolwarm"),
+                negative_color=self._negative_color.name(),
+                zero_color=self._zero_color.name(),
+                positive_color=self._positive_color.name(),
+                alpha=self.alpha.value(),
+                scatter_pair=self._selected_pair,
+            )
+        except ValueError as exc:
+            axis = self.figure.add_subplot(111)
+            axis.text(
+                0.5,
+                0.5,
+                str(exc),
+                ha="center",
+                va="center",
+                wrap=True,
+                transform=axis.transAxes,
+            )
+            axis.set_axis_off()
+            self.summary.setText(str(exc))
+            self.canvas.draw_idle()
+            return False
+        self._matrix_axis = self.figure.axes[0] if self.figure.axes else None
+        flagged = [
+            row
+            for row in self._data["pairs"]
+            if row.get("high_correlation") or row.get("same_source_measurement")
+        ]
+        warnings = "; ".join(
+            f"{row['feature_1_label']} / {row['feature_2_label']}: "
+            + (
+                f"r={float(row['pearson_r']):.3f}, "
+                if row.get("pearson_r") is not None
+                else "r=N/A, "
+            )
+            + str(row["warning"])
+            for row in flagged
+        )
+        count = int(self._data["included_spine_count"])
+        missing = int(self._data["missing_spine_count"])
+        small_sample = " Warning: fewer than 30 complete spines." if count < 30 else ""
+        self.summary.setText(
+            f"Pearson matrix: {count} listwise-complete spines; {missing} omitted for "
+            f"missing selected metrics.{small_sample} Click a matrix cell to inspect "
+            f"its scatter plot."
+            + (f" Flagged pairs: {warnings}" if warnings else " No pairs are flagged.")
+        )
+        self.canvas.draw_idle()
+        return True
+
+    def _matrix_clicked(self, event) -> None:  # type: ignore[no-untyped-def]
+        if (
+            self._data is None
+            or event.inaxes is not self._matrix_axis
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return
+        column = int(round(float(event.xdata)))
+        row = int(round(float(event.ydata)))
+        features = list(self._data["features"])
+        if not (0 <= row < len(features) and 0 <= column < len(features)):
+            return
+        self._selected_pair = (features[column], features[row])
+        self._render()
+
+    def _export_figure(self) -> None:
+        if self._data is None and not self._render():
+            return
+        extension = str(self.export_format.currentData() or "svg")
+        filters = {
+            "svg": "SVG vector figure (*.svg)",
+            "pdf": "PDF vector figure (*.pdf)",
+            "png": "PNG image (*.png)",
+        }
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export correlation matrix",
+            f"feature_correlation_matrix.{extension}",
+            filters[extension],
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        if path.suffix.casefold() != f".{extension}":
+            path = path.with_suffix(f".{extension}")
+        arguments: dict[str, object] = {"bbox_inches": "tight"}
+        if extension == "png":
+            arguments["dpi"] = int(self.export_dpi.currentData())
+        try:
+            self.figure.savefig(path, **arguments)
+        except OSError as exc:
+            QMessageBox.warning(self, "Cannot export correlation figure", str(exc))
+            return
+        QMessageBox.information(
+            self, "Correlation figure exported", f"Saved: {path}"
+        )
 
 
 class ProjectionView(SliceView):
@@ -5069,6 +5492,17 @@ class MainWindow(QMainWindow):
         self.save_distribution_review_button = QPushButton("Checkpoint decision and advance")
         self.save_distribution_review_button.clicked.connect(self._save_distribution_review)
         distribution_form.addRow(self.save_distribution_review_button)
+        self.accept_all_distribution_spines = QCheckBox(
+            "Accept all eligible spines in all measured specimens"
+        )
+        self.accept_all_distribution_spines.setToolTip(
+            "Marks every non-invalidated, non-volume-filtered spine with a usable "
+            "distribution path as reviewed and included. Existing review notes are preserved."
+        )
+        self.accept_all_distribution_spines.toggled.connect(
+            self._accept_all_distribution_spines
+        )
+        distribution_form.addRow(self.accept_all_distribution_spines)
         navigation = QHBoxLayout()
         self.previous_distribution_button = QPushButton("Previous")
         self.previous_distribution_button.clicked.connect(lambda: self._move_distribution_spine(-1))
@@ -5561,6 +5995,13 @@ class MainWindow(QMainWindow):
         self.morphology_display_tabs.addTab(
             self.morphology_cluster_score_panel, "Cluster-count scores"
         )
+        self.morphology_correlation_panel = CorrelationMatrixPanel()
+        self.morphology_correlation_panel.settings_changed.connect(
+            self._save_morphology_correlation_settings
+        )
+        self.morphology_display_tabs.addTab(
+            self.morphology_correlation_panel, "Feature correlations"
+        )
         output_layout.addWidget(self.morphology_display_tabs, 1)
         splitter.addWidget(output)
         splitter.setSizes([420, 980])
@@ -5853,6 +6294,13 @@ class MainWindow(QMainWindow):
         self.advanced_cluster_score_panel = ClusterCountScorePanel()
         self.advanced_display_tabs.addTab(
             self.advanced_cluster_score_panel, "Cluster-count scores"
+        )
+        self.advanced_correlation_panel = CorrelationMatrixPanel()
+        self.advanced_correlation_panel.settings_changed.connect(
+            self._save_advanced_correlation_settings
+        )
+        self.advanced_display_tabs.addTab(
+            self.advanced_correlation_panel, "Feature correlations"
         )
         output_layout.addWidget(self.advanced_display_tabs, 1)
         splitter.addWidget(output)
@@ -7266,6 +7714,39 @@ class MainWindow(QMainWindow):
             self.advanced_cluster_score_panel.show_run(
                 self._active_advanced_run
             )
+            self.advanced_correlation_panel.show_run(
+                self._active_advanced_run
+            )
+
+    def _save_advanced_correlation_settings(
+        self, correlation_settings: dict[str, object]
+    ) -> None:
+        if self._active_advanced_run is None:
+            return
+        style = {
+            **DEFAULT_PLOT_STYLE,
+            **dict(self._active_advanced_run.get("plot_style", {})),
+            **dict(correlation_settings),
+        }
+        self._active_advanced_run["plot_style"] = style
+        try:
+            run_id = str(self._active_advanced_run.get("run_id", ""))
+            known = bool(
+                self.manifest
+                and any(
+                    str(record.get("run_id", "")) == run_id
+                    for record in self.manifest.get("morphology_analysis", {}).get("runs", [])
+                )
+            )
+            if known and self.manifest is not None and self.project_path is not None:
+                self._active_advanced_run = update_run_plot_style(
+                    self.manifest, self.project_path, run_id, style
+                )
+            self.advanced_correlation_panel.show_run(self._active_advanced_run)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(
+                self, "Cannot save correlation settings", str(exc)
+            )
 
     def _change_advanced_colors(self) -> None:
         if self._active_advanced_run is None:
@@ -7709,6 +8190,41 @@ class MainWindow(QMainWindow):
             self.morphology_cluster_score_panel.show_run(
                 self._active_morphology_run
             )
+            self.morphology_correlation_panel.show_run(
+                self._active_morphology_run
+            )
+
+    def _save_morphology_correlation_settings(
+        self, correlation_settings: dict[str, object]
+    ) -> None:
+        if self._active_morphology_run is None:
+            return
+        style = {
+            **DEFAULT_PLOT_STYLE,
+            **dict(self._active_morphology_run.get("plot_style", {})),
+            **dict(correlation_settings),
+        }
+        self._active_morphology_run["plot_style"] = style
+        try:
+            run_id = str(self._active_morphology_run.get("run_id", ""))
+            known = bool(
+                self.manifest
+                and any(
+                    str(record.get("run_id", "")) == run_id
+                    for record in self.manifest.get("morphology_analysis", {}).get("runs", [])
+                )
+            )
+            if known and self.manifest is not None and self.project_path is not None:
+                self._active_morphology_run = update_run_plot_style(
+                    self.manifest, self.project_path, run_id, style
+                )
+            self.morphology_correlation_panel.show_run(
+                self._active_morphology_run
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(
+                self, "Cannot save correlation settings", str(exc)
+            )
 
     def _morphology_plot_mode_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
         self.morphology_feature_plot_row.setVisible(
@@ -7849,6 +8365,8 @@ class MainWindow(QMainWindow):
         if self._active_morphology_run is None:
             return
         style = {
+            **DEFAULT_PLOT_STYLE,
+            **dict(self._active_morphology_run.get("plot_style", {})),
             "axes_color": self.morphology_axes_color.name(),
             "axes_alpha": self.morphology_axes_alpha.value(),
             "background_color": self.morphology_background_color.name(),
@@ -8029,6 +8547,8 @@ class MainWindow(QMainWindow):
         self._refresh_distribution_groups()
         if reviewed:
             self._measurement_specimen_changed()
+        else:
+            self._sync_distribution_bulk_acceptance()
 
     def _save_measurement_settings(self) -> None:
         if self.manifest is None or self.project_path is None:
@@ -8113,6 +8633,7 @@ class MainWindow(QMainWindow):
             )
             self.measurement_table.setRowCount(0)
             self.measurement_table.setColumnCount(0)
+            self._sync_distribution_bulk_acceptance()
             return
         try:
             raw_result = load_measurement_result(self.manifest, specimen_index)
@@ -8140,6 +8661,7 @@ class MainWindow(QMainWindow):
         self._populate_measurement_table()
         if self.distribution_spine.count():
             self._distribution_spine_changed()
+        self._sync_distribution_bulk_acceptance()
 
     def _current_spine_review_mode(self) -> str:
         return str(
@@ -8693,6 +9215,85 @@ class MainWindow(QMainWindow):
                 if review_mode == "cluster_positive"
                 else "Optional cluster-less spine review is complete for this specimen."
             )
+
+    def _distribution_bulk_acceptance_state(self) -> tuple[int, int]:
+        if self.manifest is None:
+            return 0, 0
+        eligible = 0
+        accepted = 0
+        usable_statuses = {"ok", "insufficient_axis_resolution"}
+        for specimen_index, specimen in enumerate(self.manifest.get("specimens", [])):
+            checkpoint = specimen.get("checkpoints", {}).get("measurements", {})
+            if checkpoint.get("state") != "complete":
+                continue
+            try:
+                result, _audit = filtered_measurement_result(
+                    self.manifest, specimen_index
+                )
+            except (OSError, ValueError, KeyError):
+                continue
+            for row in result.get("distribution_rows", []):
+                if (
+                    bool(row.get("volume_filter_excluded", False))
+                    or not bool(row.get("spine_valid", True))
+                    or str(row.get("distribution_axis_status", ""))
+                    not in usable_statuses
+                ):
+                    continue
+                eligible += 1
+                if bool(row.get("distribution_reviewed", False)) and bool(
+                    row.get("distribution_included", False)
+                ):
+                    accepted += 1
+        return eligible, accepted
+
+    def _sync_distribution_bulk_acceptance(self) -> None:
+        eligible, accepted = self._distribution_bulk_acceptance_state()
+        self._distribution_bulk_remaining = max(0, eligible - accepted)
+        self.accept_all_distribution_spines.blockSignals(True)
+        self.accept_all_distribution_spines.setChecked(
+            eligible > 0 and accepted == eligible
+        )
+        self.accept_all_distribution_spines.blockSignals(False)
+        self.accept_all_distribution_spines.setEnabled(
+            self._job_worker is None and self._distribution_bulk_remaining > 0
+        )
+        self.accept_all_distribution_spines.setToolTip(
+            "Marks every non-invalidated, non-volume-filtered spine with a usable "
+            "distribution path as reviewed and included. Existing review notes are preserved. "
+            f"Current status: {accepted} of {eligible} eligible spines accepted."
+        )
+
+    def _accept_all_distribution_spines(self, checked: bool) -> None:
+        if not checked or self.manifest is None or self.project_path is None:
+            return
+        try:
+            counts = accept_all_eligible_distribution_spines(
+                self.manifest, self.project_path
+            )
+        except (OSError, ValueError, KeyError) as exc:
+            self.accept_all_distribution_spines.blockSignals(True)
+            self.accept_all_distribution_spines.setChecked(False)
+            self.accept_all_distribution_spines.blockSignals(False)
+            QMessageBox.warning(
+                self, "Cannot accept distribution spines", str(exc)
+            )
+            return
+        self._refresh_distribution_groups()
+        self._measurement_specimen_changed()
+        self._prepare_morphology_tab()
+        self._sync_distribution_bulk_acceptance()
+        newly_accepted = (
+            counts["accepted_count"] - counts["already_accepted_count"]
+        )
+        self.measurement_status.setText(
+            f"Accepted {counts['accepted_count']} eligible distribution spine(s) "
+            f"across {counts['measured_specimen_count']} measured specimen(s) "
+            f"({newly_accepted} newly checkpointed). Skipped "
+            f"{counts['invalid_count']} invalid, "
+            f"{counts['volume_filtered_count']} volume-filtered, and "
+            f"{counts['unusable_path_count']} without a usable path."
+        )
 
     def _save_volume_filter_controls(self, *_args) -> None:  # type: ignore[no-untyped-def]
         if self.manifest is None or self.project_path is None:
@@ -10962,6 +11563,11 @@ class MainWindow(QMainWindow):
                 running and self._job_kind == "measurements"
             )
             self.save_distribution_review_button.setEnabled(not running)
+            self.accept_all_distribution_spines.setEnabled(
+                not running
+                and self.manifest is not None
+                and getattr(self, "_distribution_bulk_remaining", 0) > 0
+            )
             self.export_measurements_button.setEnabled(not running and measured)
             self.volume_filter_enabled.setEnabled(not running and self.manifest is not None)
             self.volume_filter_cutoff.setEnabled(not running and self.manifest is not None)
@@ -11002,6 +11608,8 @@ class MainWindow(QMainWindow):
             self.morphology_custom_y.setEnabled(not running and self._active_morphology_run is not None)
             self.morphology_pca_show_points.setEnabled(not running and self._active_morphology_run is not None)
             self.morphology_pca_point_alpha.setEnabled(not running and self._active_morphology_run is not None)
+            self.morphology_correlation_panel.setEnabled(not running and self._active_morphology_run is not None)
+            self.advanced_correlation_panel.setEnabled(not running and self._active_advanced_run is not None)
             self.morphology_reviewed_only.setEnabled(not running and measured)
             self.export_morphology_button.setEnabled(not running and self._active_morphology_run is not None)
             self.morphology_geometry_group.setEnabled(not running and measured)

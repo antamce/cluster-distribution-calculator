@@ -212,6 +212,11 @@ Clicking either cropped channel view opens the full-specimen projection with the
 
 Cluster-less spine review is optional and never blocks export. Marking a spine invalid excludes it from all subsequent metrics, including spine density and the protein-inclusion percentage denominator, while preserving an auditable decision row.
 
+Stage 5 also provides **Accept all eligible spines in all measured specimens**.
+This bulk checkpoint includes every valid, non-volume-filtered spine with a usable
+distribution path, preserves existing notes and invalidations, and reports skipped
+filtered or pathless spines.
+
 ## Results
 
 Partial export is allowed: only pairs with completed measurement checkpoints are
@@ -271,6 +276,21 @@ overrides the automatic method.
 The standard and advanced clustering tabs also provide a cluster-count score panel
 with an annotated score curve and exact-value table for all three methods. Rejected
 small-cluster candidates and the solution selected for the saved run are identified.
+
+Each clustering tab also has a **Feature correlations** panel for detecting
+redundant morphology inputs before interpreting clusters. Users independently
+select metrics, then inspect a listwise-complete Pearson heatmap across included
+spines. Experimental-group identity is ignored by the pooled calculation, while an
+optional group selector can restrict the same feature-to-feature calculation to one
+group. Strong absolute correlations and metrics derived from the same underlying
+measurement are flagged separately. Clicking a matrix cell displays its two-feature
+scatter plot.
+
+Correlation figures offer preset or custom negative/zero/positive colors, alpha,
+and optional hierarchical feature ordering. They export directly as SVG, PDF, or
+300/600/1200-DPI PNG. Full analysis exports include exact matrix, pairwise warning,
+sample-count, and settings tables plus 600-DPI/vector figures, with optional separate
+matrices for every experimental group.
 
 A **Cluster geometry-reviewed spines only** checkbox switches between all otherwise
 valid spines and only those explicitly marked **Geometry checked**. The selection
