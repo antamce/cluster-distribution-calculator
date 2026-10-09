@@ -216,7 +216,15 @@ Stage 5 also provides **Accept all eligible spines in all measured specimens**.
 This bulk checkpoint includes every valid, non-volume-filtered spine with calculated
 distribution values, including bridged, ambiguous, or otherwise review-flagged
 automatic centerlines. It preserves existing notes and invalidations and reports
-filtered or genuinely pathless spines as skipped.
+filtered or genuinely pathless spines as skipped. The control remains available
+when only part of the batch has already been reviewed, and existing review
+decisions are preserved while the remaining eligible spines are accepted.
+
+Measurements live in the project `.synpo-cache`; the JSON stores checkpoint
+metadata. When reopening a project, Synpo safely restores lost or interrupted
+checkpoint metadata only if the cached result exactly matches the current
+algorithm, settings, calibration, and masks. A missing cache is reported with its
+expected path and can be restored directly or through a full transfer ZIP.
 
 ## Results
 

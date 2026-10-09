@@ -21,7 +21,7 @@ validation procedure, and remaining work as of 2026-10-09.
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
 - Current public beta commit: `e51eddc91316b91f375a6d1e8eae9dfce08fd569`
   (`Fix bulk distribution acceptance eligibility`).
-- Current full Windows result: 105 passed and 1 platform-specific test skipped.
+- Current full Windows result: 106 passed and 1 platform-specific test skipped.
   PowerShell and Bash syntax checks, Windows runtime resolution, Python 3.10 syntax
   parsing, and the offscreen application construction smoke test also passed.
   Conda dry-run resolution passed for Catalina `osx-64`, macOS 11 `osx-arm64`,
@@ -211,7 +211,7 @@ $env:PYTHONPATH = (Resolve-Path "src").Path
 conda run -n synpo-microscopy python -m pytest -q
 ```
 
-Current Windows baseline: `105 passed, 1 skipped` (the macOS Bash execution test is
+Current Windows baseline: `106 passed, 1 skipped` (the macOS Bash execution test is
 the expected skip). Also perform an offscreen application
 construction smoke test after material UI changes. The application title should
 contain `Synpo Microscopy Processor - Beta 0.8.0` (typographic dash may differ).
@@ -376,7 +376,7 @@ and optional registered flag follow them.
 - `src/synpo/exporting.py`: verified Excel/CSV exports and optional validation/audit
   PDF generation.
 - `src/synpo/cli.py`: non-GUI scan/inspection command.
-- `tests/`: 106-test development suite, including importer, project, preprocessing,
+- `tests/`: 107-test development suite, including importer, project, preprocessing,
   detection, diagnostics, review, measurement, 3D rendering, and beta UI regression
   coverage.
 
@@ -632,7 +632,14 @@ laptop. Treat these as historical guidance, not guaranteed performance.
   checkpoints all valid, non-volume-filtered spines with calculated profile values,
   including bridged/ambiguous/review-flagged automatic centerlines. It preserves
   review notes/manual invalidations and reports invalid, filtered, and genuinely
-  pathless skips separately.
+  pathless skips separately. Partial review never disables the control; existing
+  Include/Exclude decisions are preserved and only unreviewed eligible rows are
+  bulk accepted.
+- Measurement results remain in `.synpo-cache`, separate from JSON checkpoint
+  metadata. Project open reconciles an interrupted/lost checkpoint only when the
+  cached result exactly matches algorithm version, settings, calibration, and the
+  current mask signature. Missing caches report their expected absolute path and
+  are never silently replaced or treated as compatible.
 - Project exports omit volume-filtered spines from all primary/link tables and PDFs,
   recompute ROI/dendrite/specimen/group/profile statistics, and keep manual invalid
   and volume-filter-only audit rows separate. `Spine_Volume_Distribution` uses

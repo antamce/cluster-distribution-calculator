@@ -131,6 +131,7 @@ from .measurements import (
     load_measurement_result,
     load_morphology_preview,
     measure_project,
+    recover_compatible_measurement_checkpoints,
     set_centerline_endpoint_hint,
     set_distribution_review,
     set_spine_quality_review,
@@ -9221,7 +9222,7 @@ class MainWindow(QMainWindow):
         if self.manifest is None:
             return 0, 0
         eligible = 0
-        accepted = 0
+        reviewed = 0
         for specimen_index, specimen in enumerate(self.manifest.get("specimens", [])):
             checkpoint = specimen.get("checkpoints", {}).get("measurements", {})
             if checkpoint.get("state") != "complete":
@@ -9240,31 +9241,33 @@ class MainWindow(QMainWindow):
                 ):
                     continue
                 eligible += 1
-                if bool(row.get("distribution_reviewed", False)) and bool(
-                    row.get("distribution_included", False)
-                ):
-                    accepted += 1
-        return eligible, accepted
+                if bool(row.get("distribution_reviewed", False)):
+                    reviewed += 1
+        return eligible, reviewed
 
     def _sync_distribution_bulk_acceptance(self) -> None:
-        eligible, accepted = self._distribution_bulk_acceptance_state()
-        self._distribution_bulk_remaining = max(0, eligible - accepted)
+        eligible, reviewed = self._distribution_bulk_acceptance_state()
+        self._distribution_bulk_eligible = eligible
+        self._distribution_bulk_remaining = max(0, eligible - reviewed)
         self.accept_all_distribution_spines.blockSignals(True)
         self.accept_all_distribution_spines.setChecked(
-            eligible > 0 and accepted == eligible
+            eligible > 0 and reviewed == eligible
         )
         self.accept_all_distribution_spines.blockSignals(False)
         self.accept_all_distribution_spines.setEnabled(
-            self._job_worker is None and self._distribution_bulk_remaining > 0
+            self._job_worker is None and self._distribution_bulk_eligible > 0
         )
         self.accept_all_distribution_spines.setToolTip(
             "Marks every non-invalidated, non-volume-filtered spine with a usable "
             "distribution path as reviewed and included. Existing review notes are preserved. "
-            f"Current status: {accepted} of {eligible} eligible spines accepted."
+            f"Current status: {reviewed} of {eligible} eligible spines reviewed."
         )
 
     def _accept_all_distribution_spines(self, checked: bool) -> None:
-        if not checked or self.manifest is None or self.project_path is None:
+        if not checked:
+            QTimer.singleShot(0, self._sync_distribution_bulk_acceptance)
+            return
+        if self.manifest is None or self.project_path is None:
             return
         try:
             counts = accept_all_eligible_distribution_spines(
@@ -9282,13 +9285,10 @@ class MainWindow(QMainWindow):
         self._measurement_specimen_changed()
         self._prepare_morphology_tab()
         self._sync_distribution_bulk_acceptance()
-        newly_accepted = (
-            counts["accepted_count"] - counts["already_accepted_count"]
-        )
         self.measurement_status.setText(
-            f"Accepted {counts['accepted_count']} eligible distribution spine(s) "
+            f"Accepted {counts['accepted_count']} previously unreviewed distribution spine(s) "
             f"across {counts['measured_specimen_count']} measured specimen(s) "
-            f"({newly_accepted} newly checkpointed). Skipped "
+            f"and preserved {counts['already_reviewed_count']} existing review decision(s). Skipped "
             f"{counts['invalid_count']} invalid, "
             f"{counts['volume_filtered_count']} volume-filtered, and "
             f"{counts['unusable_path_count']} without a usable path."
@@ -11124,6 +11124,15 @@ class MainWindow(QMainWindow):
     def _activate_project(self, selected: Path) -> None:
         try:
             manifest = load_project(selected)
+            recovered_measurements = recover_compatible_measurement_checkpoints(
+                manifest
+            )
+            recovery_save_error = ""
+            if recovered_measurements:
+                try:
+                    save_project(selected, manifest)
+                except OSError as exc:
+                    recovery_save_error = str(exc)
             quick_results = verify_project_sources(manifest, full_checksums=False)
         except ValueError as exc:
             QMessageBox.critical(self, "Cannot open project", str(exc))
@@ -11157,6 +11166,17 @@ class MainWindow(QMainWindow):
                 "Project opened. Source filenames and sizes match; use Verify sources "
                 "for full SHA-256 verification."
             )
+        if recovered_measurements:
+            recovery_text = (
+                f" Recovered {len(recovered_measurements)} exact compatible "
+                "measurement checkpoint(s) from the existing cache."
+            )
+            if recovery_save_error:
+                recovery_text += (
+                    " The recovery is active for this session but could not be saved: "
+                    f"{recovery_save_error}"
+                )
+            self.summary_label.setText(self.summary_label.text() + recovery_text)
         self.setWindowTitle(f"Synpo Microscopy Processor — {self.project_path.name}")
 
     def _create_transfer_zip(self) -> None:
@@ -11565,7 +11585,7 @@ class MainWindow(QMainWindow):
             self.accept_all_distribution_spines.setEnabled(
                 not running
                 and self.manifest is not None
-                and getattr(self, "_distribution_bulk_remaining", 0) > 0
+                and getattr(self, "_distribution_bulk_eligible", 0) > 0
             )
             self.export_measurements_button.setEnabled(not running and measured)
             self.volume_filter_enabled.setEnabled(not running and self.manifest is not None)

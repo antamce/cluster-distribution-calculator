@@ -356,9 +356,77 @@ def load_measurement_result(
 ) -> dict[str, object]:
     path = measurement_result_path(manifest, specimen_index)
     if not path.is_file():
-        raise ValueError("This specimen has no saved measurement result.")
+        raise ValueError(
+            "The saved measurement cache is missing at "
+            f"{path}. The project JSON contains checkpoints, not the measurement "
+            "tables; restore the project's .synpo-cache folder or import a full "
+            "transfer ZIP."
+        )
     with gzip.open(path, "rt", encoding="utf-8") as stream:
         return json.load(stream)
+
+
+def recover_compatible_measurement_checkpoints(
+    manifest: dict[str, object],
+) -> list[int]:
+    """Restore lost checkpoint metadata only for exact compatible cached results."""
+    settings = MeasurementSettings.from_dict(manifest["measurements"]["settings"])
+    recovered: list[int] = []
+    for specimen_index, specimen in enumerate(manifest.get("specimens", [])):
+        result_path = measurement_result_path(manifest, specimen_index)
+        if not result_path.is_file():
+            continue
+        try:
+            result = load_measurement_result(manifest, specimen_index)
+            current_signature = measurement_signature(
+                manifest, specimen_index, settings
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            continue
+        if int(result.get("algorithm_version", 0) or 0) != ALGORITHM_VERSION:
+            continue
+        if dict(result.get("settings", {})) != settings.to_dict():
+            continue
+        if str(result.get("settings_signature", "")) != current_signature:
+            continue
+        checkpoint = specimen.setdefault("checkpoints", {}).setdefault(
+            "measurements", {}
+        )
+        if (
+            checkpoint.get("state") == "complete"
+            and str(checkpoint.get("settings_signature", "")) == current_signature
+        ):
+            continue
+        specimen_rows = list(result.get("specimen_rows", []))
+        if not specimen_rows:
+            continue
+        specimen_row = specimen_rows[0]
+        timestamp = time.time()
+        checkpoint.update(
+            {
+                "state": "complete",
+                "updated_at": checkpoint.get("updated_at") or timestamp,
+                "settings_signature": current_signature,
+                "summary": {
+                    "specimen_index": specimen_index,
+                    "spine_count": int(specimen_row.get("spine_count") or 0),
+                    "included_cluster_count": int(
+                        specimen_row.get("included_cluster_count") or 0
+                    ),
+                    "dendrite_count": int(specimen_row.get("dendrite_count") or 0),
+                    "corrected_masks": bool(result.get("corrected_masks", False)),
+                    "elapsed_seconds": 0.0,
+                    "skipped": True,
+                },
+                "recovered_at": timestamp,
+                "reason": (
+                    "Recovered an exact compatible saved measurement result "
+                    "while opening the project."
+                ),
+            }
+        )
+        recovered.append(specimen_index)
+    return recovered
 
 
 def spine_volume_filter_settings(
@@ -707,6 +775,7 @@ def accept_all_eligible_distribution_spines(
         "measured_specimen_count": 0,
         "eligible_count": 0,
         "accepted_count": 0,
+        "already_reviewed_count": 0,
         "already_accepted_count": 0,
         "invalid_count": 0,
         "volume_filtered_count": 0,
@@ -740,12 +809,13 @@ def accept_all_eligible_distribution_spines(
                 counts["unusable_path_count"] += 1
                 continue
             counts["eligible_count"] += 1
-            eligible_ids.add(spine_id)
             raw = raw_rows.get(spine_id)
-            if raw is not None and bool(raw.get("distribution_reviewed", False)) and bool(
-                raw.get("distribution_included", False)
-            ):
-                counts["already_accepted_count"] += 1
+            if raw is not None and bool(raw.get("distribution_reviewed", False)):
+                counts["already_reviewed_count"] += 1
+                if bool(raw.get("distribution_included", False)):
+                    counts["already_accepted_count"] += 1
+                continue
+            eligible_ids.add(spine_id)
 
         if not eligible_ids:
             continue

@@ -136,6 +136,15 @@ class Stage7AUiTests(unittest.TestCase):
                             "distribution_reviewed": False,
                             "distribution_included": False,
                             "bin_01_ratio": 0.25,
+                        },
+                        {
+                            "spine_id": 2,
+                            "spine_valid": True,
+                            "volume_filter_excluded": False,
+                            "distribution_axis_status": "ok",
+                            "distribution_reviewed": True,
+                            "distribution_included": True,
+                            "bin_01_ratio": 0.5,
                         }
                     ]
                 },

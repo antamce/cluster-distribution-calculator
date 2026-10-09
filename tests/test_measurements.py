@@ -25,6 +25,7 @@ from synpo.measurements import (
     measurement_result_path,
     measure_project,
     redo_morphology_review,
+    recover_compatible_measurement_checkpoints,
     set_centerline_endpoint_hint,
     set_distribution_review,
     set_spine_quality_review,
@@ -32,7 +33,7 @@ from synpo.measurements import (
 )
 from synpo.distribution import calculate_spine_distribution
 from synpo.exporting import collect_export_tables, export_measurements
-from synpo.project import migrate_manifest, save_project
+from synpo.project import load_project, migrate_manifest, save_project
 
 
 @contextlib.contextmanager
@@ -329,6 +330,25 @@ class MeasurementTests(unittest.TestCase):
                 0,
                 1,
                 distribution_included=False,
+                invalid_spine=False,
+                note="keep this manual exclusion",
+            )
+            preserved = accept_all_eligible_distribution_spines(
+                manifest, project_path
+            )
+            self.assertEqual(preserved["accepted_count"], 0)
+            self.assertEqual(preserved["already_reviewed_count"], 1)
+            preserved_row = load_measurement_result(manifest, 0)[
+                "distribution_rows"
+            ][0]
+            self.assertFalse(preserved_row["distribution_included"])
+
+            set_distribution_review(
+                manifest,
+                project_path,
+                0,
+                1,
+                distribution_included=False,
                 invalid_spine=True,
                 note="manual invalidation",
             )
@@ -369,6 +389,33 @@ class MeasurementTests(unittest.TestCase):
             kept_row = load_measurement_result(manifest, 0)["distribution_rows"][0]
             self.assertTrue(kept_row["distribution_reviewed"])
             self.assertTrue(kept_row["distribution_included"])
+
+    def test_reopen_recovers_only_exact_compatible_measurement_checkpoint(self) -> None:
+        with workspace_directory() as root:
+            manifest, project_path = self.make_project(root)
+            measure_project(manifest, project_path)
+            manifest["specimens"][0]["checkpoints"]["measurements"].update(
+                {"state": "in_progress", "settings_signature": ""}
+            )
+            save_project(project_path, manifest)
+
+            reopened = load_project(project_path)
+            self.assertEqual(
+                recover_compatible_measurement_checkpoints(reopened), [0]
+            )
+            checkpoint = reopened["specimens"][0]["checkpoints"]["measurements"]
+            self.assertEqual(checkpoint["state"], "complete")
+            self.assertIn("Recovered", checkpoint["reason"])
+
+            reopened["measurements"]["settings"][
+                "maximum_centerline_gap_um"
+            ] = 2.0
+            reopened["specimens"][0]["checkpoints"]["measurements"][
+                "state"
+            ] = "not_started"
+            self.assertEqual(
+                recover_compatible_measurement_checkpoints(reopened), []
+            )
 
     def test_fixed_and_adaptive_end_trimming(self) -> None:
         areas = np.zeros((8, 2), dtype=np.int64)

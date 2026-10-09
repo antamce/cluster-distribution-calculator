@@ -390,6 +390,15 @@ valid, non-volume-filtered spine with calculated distribution values at once.
 Bridged, ambiguous, or otherwise review-flagged automatic centerlines are eligible
 when their numerical profile exists; manual invalidations and review notes are
 preserved, while filtered or genuinely pathless spines are reported as skipped.
+The control remains available for a partially reviewed batch and accepts the
+remaining eligible spines without changing prior Include/Exclude decisions.
+
+Measurement tables are stored in the project's `.synpo-cache`, while the JSON keeps
+their checkpoint metadata. On opening a project, Synpo restores a lost or interrupted
+checkpoint only when the cached result exactly matches the current algorithm,
+measurement settings, calibration, and masks. If the cache itself is missing, the
+Measurements panel reports its expected path; restore the cache or use a full
+transfer ZIP.
 
 The cropped spine viewer normally remains an XY maximum projection and requires no
 manual correction. If the automatic distal endpoint is wrong, press **Centerline
