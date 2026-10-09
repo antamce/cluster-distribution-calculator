@@ -16,20 +16,20 @@ validation procedure, and remaining work as of 2026-10-09.
 - Dedicated Conda environment: `synpo-microscopy`. Never modify the user's separate
   environment named `synpo`.
 - Current development branch: `lsh`.
-- Current development feature commit: `22cf4d2`, titled `Fix bulk distribution
-  acceptance eligibility`.
+- Current development feature commit: `1faa377`, titled `Preserve measurement
+  results across project reopen`.
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
-- Current public beta commit: `e51eddc91316b91f375a6d1e8eae9dfce08fd569`
-  (`Fix bulk distribution acceptance eligibility`).
+- Current public beta commit: `649a9b7f10cc684537d1ea06f650f10fcf3fa8d9`
+  (`Preserve measurement results across project reopen`).
 - Current full Windows result: 106 passed and 1 platform-specific test skipped.
   PowerShell and Bash syntax checks, Windows runtime resolution, Python 3.10 syntax
   parsing, and the offscreen application construction smoke test also passed.
   Conda dry-run resolution passed for Catalina `osx-64`, macOS 11 `osx-arm64`,
   and macOS 12 on both `osx-64` and `osx-arm64`.
-- Current user status: the bulk distribution-acceptance eligibility fix was
-  published to public `main` as `e51eddc` on 2026-10-09. An actual approximately
-  `80 x 2048 x 2048` stack on a 4 GB device and a Catalina launch remain preferred
-  field tests.
+- Current user status: partial-review-safe bulk distribution acceptance and exact
+  compatible measurement-checkpoint recovery were published to public `main` as
+  `649a9b7` on 2026-10-09. An actual approximately `80 x 2048 x 2048` stack on a
+  4 GB device and a Catalina launch remain preferred field tests.
 - This release adds an Advanced-menu diagnostic mode for an
   intermittent work-PC correction slowdown. Full-session capture is the default
   level, diagnostics remain opt-in per launch, and a standalone bundled PDF gives
@@ -145,6 +145,10 @@ the same publishing target.
   as curated commit `e51eddc`, based on `4b872d8`. Its exact 32-file public tree
   passed the same complete 106-test suite, Python compilation, and offscreen
   seven-tab application smoke test.
+- The partial-review acceptance and measurement-checkpoint recovery fix was
+  published on 2026-10-09 as curated commit `649a9b7`, based on `e51eddc`. Its
+  exact public source passed the complete 107-test suite (106 passed, 1
+  platform-specific launcher skip) before publication.
 - The public tree contains user-facing source, both environment files, Windows and
   macOS launcher files, launcher helpers, icons, package metadata, and README. It
   intentionally excludes `HANDOFF.md`, `tests/`, `PUBLIC_README.md`, development
@@ -761,25 +765,25 @@ For a material change:
   bar-chart alternative.
 - Statistics remain external to Synpo.
 
-## State after the 2026-10-09 public release
+## State after the 2026-10-09 measurement-persistence public release
 
-- Development implementation: `lsh` commit `22cf4d2`, titled `Fix bulk
-  distribution acceptance eligibility`; push it only to development `origin/lsh`.
+- Development implementation: `lsh` commit `1faa377`, titled `Preserve measurement
+  results across project reopen`; push it only to development `origin/lsh`.
 - Public repository: `antamce/cluster-distribution`, branch `main`, verified remote
-  commit `e51eddc91316b91f375a6d1e8eae9dfce08fd569`.
+  commit `649a9b7f10cc684537d1ea06f650f10fcf3fa8d9`.
 - The public commit contains 32 distributable files. It excludes tests,
   `HANDOFF.md`, `PUBLIC_README.md`, microscopy data, caches, and pytest-only
   dependencies/configuration. The public `README.md` came from `PUBLIC_README.md`
   and documents volume filtering, all-spine geometry review, PCA/UMAP/PCUMAP,
   cluster-count scoring, feature-vector visibility, feature-correlation matrices,
-  bulk distribution acceptance, and all earlier workflows.
+  partial-review-safe bulk distribution acceptance, exact compatible measurement
+  recovery, and all earlier workflows.
 - Validation immediately before publication: the development tree and exact
-  curated public source both passed all 106 tests (105 passed, 1 platform-specific
-  launcher skip). The curated public application also passed Python compilation
-  and offscreen construction with all seven tabs.
+  curated public source both passed all 107 tests (106 passed, 1 platform-specific
+  launcher skip).
 - Public push was verified with `git ls-remote`. The exact temporary checkout
   `C:\Users\user\Documents\code2\Synpo\.public-release-work` was confirmed clean at
-  `e51eddc` and then deleted. The development worktree should be clean after this
+  `649a9b7` and then deleted. The development worktree should be clean after this
   handoff record is committed.
 - Next expected activity is user testing, particularly on the Intel Catalina
   device. Do not describe macOS as field-validated until those results arrive.
