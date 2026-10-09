@@ -213,9 +213,10 @@ Clicking either cropped channel view opens the full-specimen projection with the
 Cluster-less spine review is optional and never blocks export. Marking a spine invalid excludes it from all subsequent metrics, including spine density and the protein-inclusion percentage denominator, while preserving an auditable decision row.
 
 Stage 5 also provides **Accept all eligible spines in all measured specimens**.
-This bulk checkpoint includes every valid, non-volume-filtered spine with a usable
-distribution path, preserves existing notes and invalidations, and reports skipped
-filtered or pathless spines.
+This bulk checkpoint includes every valid, non-volume-filtered spine with calculated
+distribution values, including bridged, ambiguous, or otherwise review-flagged
+automatic centerlines. It preserves existing notes and invalidations and reports
+filtered or genuinely pathless spines as skipped.
 
 ## Results
 

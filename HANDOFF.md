@@ -625,9 +625,10 @@ laptop. Treat these as historical guidance, not guaranteed performance.
   decisions. They override only the volume rule; manual invalidity always wins.
   Changing the cutoff/overrides refreshes in-app summaries without remeasurement.
 - Stage 5 has a project-wide bulk acceptance checkbox for distribution review. It
-  checkpoints all valid, non-volume-filtered spines with usable paths, preserves
-  review notes/manual invalidations, and reports invalid, filtered, and pathless
-  skips separately.
+  checkpoints all valid, non-volume-filtered spines with calculated profile values,
+  including bridged/ambiguous/review-flagged automatic centerlines. It preserves
+  review notes/manual invalidations and reports invalid, filtered, and genuinely
+  pathless skips separately.
 - Project exports omit volume-filtered spines from all primary/link tables and PDFs,
   recompute ROI/dendrite/specimen/group/profile statistics, and keep manual invalid
   and volume-filter-only audit rows separate. `Spine_Volume_Distribution` uses

@@ -16,11 +16,13 @@ from synpo.measurements import (
     accept_all_eligible_distribution_spines,
     apply_morphology_review_edit,
     _cluster_keep_lookup,
+    _write_result,
     clear_centerline_endpoint_hint,
     cluster_end_comparison_rows,
     load_measurement_result,
     load_morphology_preview,
     load_spine_review_preview,
+    measurement_result_path,
     measure_project,
     redo_morphology_review,
     set_centerline_endpoint_hint,
@@ -305,6 +307,12 @@ class MeasurementTests(unittest.TestCase):
         with workspace_directory() as root:
             manifest, project_path = self.make_project(root)
             measure_project(manifest, project_path)
+
+            flagged = load_measurement_result(manifest, 0)
+            flagged["distribution_rows"][0][
+                "distribution_axis_status"
+            ] = "bridged_gap"
+            _write_result(measurement_result_path(manifest, 0), flagged)
 
             accepted = accept_all_eligible_distribution_spines(
                 manifest, project_path

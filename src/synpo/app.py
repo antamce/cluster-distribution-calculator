@@ -122,6 +122,7 @@ from .measurements import (
     apply_morphology_review_edit,
     cluster_end_comparison_rows,
     clear_centerline_endpoint_hint,
+    distribution_profile_available,
     distribution_summary_rows,
     filtered_measurement_result,
     load_cluster_trim_preview,
@@ -9221,7 +9222,6 @@ class MainWindow(QMainWindow):
             return 0, 0
         eligible = 0
         accepted = 0
-        usable_statuses = {"ok", "insufficient_axis_resolution"}
         for specimen_index, specimen in enumerate(self.manifest.get("specimens", [])):
             checkpoint = specimen.get("checkpoints", {}).get("measurements", {})
             if checkpoint.get("state") != "complete":
@@ -9236,8 +9236,7 @@ class MainWindow(QMainWindow):
                 if (
                     bool(row.get("volume_filter_excluded", False))
                     or not bool(row.get("spine_valid", True))
-                    or str(row.get("distribution_axis_status", ""))
-                    not in usable_statuses
+                    or not distribution_profile_available(row)
                 ):
                     continue
                 eligible += 1

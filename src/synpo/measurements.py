@@ -685,6 +685,14 @@ def set_distribution_review(
     return result
 
 
+def distribution_profile_available(row: dict[str, object]) -> bool:
+    """Return whether a distribution row contains any calculated profile data."""
+    return any(
+        row.get(f"bin_{index:02d}_ratio") is not None
+        for index in range(1, 11)
+    )
+
+
 def accept_all_eligible_distribution_spines(
     manifest: dict[str, object],
     project_path: str | Path,
@@ -705,7 +713,6 @@ def accept_all_eligible_distribution_spines(
         "unusable_path_count": 0,
     }
     changed = False
-    usable_statuses = {"ok", "insufficient_axis_resolution"}
     for specimen_index, specimen in enumerate(manifest.get("specimens", [])):
         checkpoint = specimen.get("checkpoints", {}).get("measurements", {})
         if checkpoint.get("state") != "complete":
@@ -729,7 +736,7 @@ def accept_all_eligible_distribution_spines(
             if not bool(row.get("spine_valid", True)):
                 counts["invalid_count"] += 1
                 continue
-            if str(row.get("distribution_axis_status", "")) not in usable_statuses:
+            if not distribution_profile_available(row):
                 counts["unusable_path_count"] += 1
                 continue
             counts["eligible_count"] += 1

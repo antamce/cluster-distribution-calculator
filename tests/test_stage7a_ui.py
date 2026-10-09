@@ -117,6 +117,34 @@ class Stage7AUiTests(unittest.TestCase):
             "all eligible spines",
             window.accept_all_distribution_spines.text().lower(),
         )
+        window.manifest = {
+            "specimens": [
+                {"checkpoints": {"measurements": {"state": "complete"}}}
+            ]
+        }
+        window.tabs.setTabEnabled(4, True)
+        with patch(
+            "synpo.app.filtered_measurement_result",
+            return_value=(
+                {
+                    "distribution_rows": [
+                        {
+                            "spine_id": 1,
+                            "spine_valid": True,
+                            "volume_filter_excluded": False,
+                            "distribution_axis_status": "bridged_gap",
+                            "distribution_reviewed": False,
+                            "distribution_included": False,
+                            "bin_01_ratio": 0.25,
+                        }
+                    ]
+                },
+                [],
+            ),
+        ):
+            window._sync_distribution_bulk_acceptance()
+        self.assertTrue(window.accept_all_distribution_spines.isEnabled())
+        self.assertFalse(window.accept_all_distribution_spines.isChecked())
         self.assertIn("numbered spine map", window.open_spine_map_button.text().lower())
         view = SpineMapView()
         view.resize(500, 400)

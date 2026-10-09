@@ -386,9 +386,10 @@ the screen shows SEM across specimen means. Line profiles are the default, with 
 bar-chart switch and automatic or fixed 0–1 scaling.
 
 Check **Accept all eligible spines in all measured specimens** to checkpoint every
-valid, non-volume-filtered spine with a usable distribution path at once. Manual
-invalidations and review notes are preserved; filtered or pathless spines are
-reported as skipped.
+valid, non-volume-filtered spine with calculated distribution values at once.
+Bridged, ambiguous, or otherwise review-flagged automatic centerlines are eligible
+when their numerical profile exists; manual invalidations and review notes are
+preserved, while filtered or genuinely pathless spines are reported as skipped.
 
 The cropped spine viewer normally remains an XY maximum projection and requires no
 manual correction. If the automatic distal endpoint is wrong, press **Centerline
