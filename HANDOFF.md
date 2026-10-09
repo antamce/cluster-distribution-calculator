@@ -16,18 +16,18 @@ validation procedure, and remaining work as of 2026-10-09.
 - Dedicated Conda environment: `synpo-microscopy`. Never modify the user's separate
   environment named `synpo`.
 - Current development branch: `lsh`.
-- Current development release: `lsh` HEAD, titled `Add feature correlation and
-  bulk distribution review`.
+- Current development feature commit: `38ad078`, titled `Add feature correlation
+  and bulk distribution review`.
 - Public user repository: <https://github.com/antamce/cluster-distribution>.
-- Current public beta commit: `aef5ce8e3324f6b8900289cfb62b0e4074e4ff4b`
-  (`Add morphology analysis and spine filtering`).
+- Current public beta commit: `4b872d815411a7231e6305e0f9f37714864019c6`
+  (`Add feature correlation and bulk distribution review`).
 - Current full Windows result: 105 passed and 1 platform-specific test skipped.
   PowerShell and Bash syntax checks, Windows runtime resolution, Python 3.10 syntax
   parsing, and the offscreen application construction smoke test also passed.
   Conda dry-run resolution passed for Catalina `osx-64`, macOS 11 `osx-arm64`,
   and macOS 12 on both `osx-64` and `osx-arm64`.
-- Current user status: the complete approved morphology-analysis and volume-filter
-  update was published to public `main` as `aef5ce8` on 2026-10-06. An actual approximately
+- Current user status: the feature-correlation and project-wide bulk distribution-
+  review update was published to public `main` as `4b872d8` on 2026-10-09. An actual approximately
   `80 x 2048 x 2048` stack on a 4 GB device and a Catalina launch remain preferred
   field tests.
 - This release adds an Advanced-menu diagnostic mode for an
@@ -136,6 +136,10 @@ the same publishing target.
 - The morphology-analysis and spine-volume-filter update was published on
   2026-10-06 as curated commit `aef5ce8`, based on `a7991f5`. Its exact 32-file
   public tree passed the complete 103-test suite (102 passed, 1 platform skip),
+  Python compilation, and an offscreen seven-tab application smoke test.
+- The feature-correlation and bulk distribution-review update was published on
+  2026-10-09 as curated commit `4b872d8`, based on `aef5ce8`. Its exact 32-file
+  public tree passed the complete 106-test suite (105 passed, 1 platform skip),
   Python compilation, and an offscreen seven-tab application smoke test.
 - The public tree contains user-facing source, both environment files, Windows and
   macOS launcher files, launcher helpers, icons, package metadata, and README. It
@@ -745,24 +749,26 @@ For a material change:
   bar-chart alternative.
 - Statistics remain external to Synpo.
 
-## State after the 2026-10-06 public release
+## State after the 2026-10-09 public release
 
-- Development implementation: `lsh` HEAD, titled `Add morphology analysis and
-  volume-filter workflows`; push it only to development `origin/lsh`.
+- Development implementation: `lsh` commit `38ad078`, titled `Add feature
+  correlation and bulk distribution review`; push it only to development
+  `origin/lsh`.
 - Public repository: `antamce/cluster-distribution`, branch `main`, verified remote
-  commit `aef5ce8e3324f6b8900289cfb62b0e4074e4ff4b`.
+  commit `4b872d815411a7231e6305e0f9f37714864019c6`.
 - The public commit contains 32 distributable files. It excludes tests,
   `HANDOFF.md`, `PUBLIC_README.md`, microscopy data, caches, and pytest-only
   dependencies/configuration. The public `README.md` came from `PUBLIC_README.md`
   and documents volume filtering, all-spine geometry review, PCA/UMAP/PCUMAP,
-  cluster-count scoring, feature-vector visibility, and all earlier workflows.
+  cluster-count scoring, feature-vector visibility, feature-correlation matrices,
+  bulk distribution acceptance, and all earlier workflows.
 - Validation immediately before publication: the development tree and exact
-  curated public source both passed all 103 tests (102 passed, 1 platform-specific
+  curated public source both passed all 106 tests (105 passed, 1 platform-specific
   launcher skip). The curated public application also passed Python compilation
   and offscreen construction with all seven tabs.
 - Public push was verified with `git ls-remote`. The exact temporary checkout
   `C:\Users\user\Documents\code2\Synpo\.public-release-work` was confirmed clean at
-  `aef5ce8` and then deleted. The development worktree should be clean after this
+  `4b872d8` and then deleted. The development worktree should be clean after this
   handoff record is committed.
 - Next expected activity is user testing, particularly on the Intel Catalina
   device. Do not describe macOS as field-validated until those results arrive.
